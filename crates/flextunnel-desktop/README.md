@@ -42,8 +42,9 @@ its own **server-direct port forwards**. Connecting is always manual.
 - **Live logs** — an in-app Logs pane; every session's log lines (core internals
   included) are attributed to their profile.
 - **Export / import** — move profiles between machines via native save/open
-  dialogs. (Auth tokens are re-entered on import — they are never written to the
-  export file.)
+  dialogs. (Secrets are re-entered on import: neither the auth token nor the
+  custom-relay auth token is written to the export file. Importing over an
+  existing profile — matched by server id — keeps that profile's secrets.)
 - **Auto-reconnect** — sessions re-establish the tunnel when the path drops.
 
 ## Where settings live
