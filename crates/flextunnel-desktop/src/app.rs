@@ -152,8 +152,9 @@ fn unique_name(profiles: &[Profile], desired: String, own_id: Option<&str>) -> S
 
 /// Merge an imported (already structurally validated) profile list into the
 /// current one. A matching server node id replaces that profile's settings
-/// and forwards but keeps its id and token; anything else is added as a new
-/// profile with a fresh id and no token. Colliding names get a " - N" suffix,
+/// and forwards but keeps its id and both secrets (auth token and relay auth
+/// token); anything else is added as a new profile with a fresh id and no
+/// secrets — imports never carry them. Colliding names get a " - N" suffix,
 /// and imported forwards get fresh ids so they stay globally unique. Returns
 /// `(added, replaced-profile ids)`.
 fn merge_imported(
@@ -173,6 +174,7 @@ fn merge_imported(
             Some(pos) => {
                 incoming.id = profiles[pos].id.clone();
                 incoming.auth_token = profiles[pos].auth_token.clone();
+                incoming.relay_auth_token = profiles[pos].relay_auth_token.clone();
                 incoming.name = unique_name(profiles, incoming.name, Some(&incoming.id));
                 profiles[pos] = incoming;
                 replaced.push(profiles[pos].id.clone());
@@ -180,6 +182,7 @@ fn merge_imported(
             None => {
                 incoming.id = Profile::new_id();
                 incoming.auth_token = String::new();
+                incoming.relay_auth_token = None;
                 incoming.name = unique_name(profiles, incoming.name, None);
                 profiles.push(incoming);
                 added += 1;
@@ -1322,14 +1325,19 @@ mod tests {
         ];
         current[1].server_node_id = "node-2".into();
         current[0].auth_token = "secret".into();
+        current[0].relay_auth_token = Some("relay-psk".into());
 
-        // Same server as p1: replaces settings/forwards, keeps id + token.
+        // Same server as p1: replaces settings/forwards, keeps id + secrets.
+        // A relay token on an incoming entry is never trusted (imports strip
+        // it); pretend a hand-edited one slipped through to prove that.
         let mut same_server = existing_profile("x", 2080, vec![existing_forward("f2", 6000)]);
         same_server.name = "renamed".into();
+        same_server.relay_auth_token = Some("imported-psk".into());
         // New server, but colliding with p2's name: gets " - 2".
         let mut name_clash = existing_profile("y", 3080, vec![]);
         name_clash.name = "profile-p2".into();
         name_clash.server_node_id = "node-3".into();
+        name_clash.relay_auth_token = Some("imported-psk".into());
 
         let (added, replaced) = merge_imported(&mut current, vec![same_server, name_clash]);
         assert_eq!(added, 1);
@@ -1338,6 +1346,11 @@ mod tests {
         let p1 = &current[0];
         assert_eq!(p1.id, "p1", "id kept");
         assert_eq!(p1.auth_token, "secret", "token kept");
+        assert_eq!(
+            p1.relay_auth_token.as_deref(),
+            Some("relay-psk"),
+            "existing relay token kept, not overwritten by the import"
+        );
         assert_eq!(p1.name, "renamed");
         assert_eq!(p1.socks_port, Some(2080));
         assert_eq!(p1.forwards.len(), 1);
@@ -1346,6 +1359,7 @@ mod tests {
         let new = &current[2];
         assert_eq!(new.name, "profile-p2 - 2");
         assert!(new.auth_token.is_empty(), "no secret in imports");
+        assert_eq!(new.relay_auth_token, None, "no relay secret in imports");
         assert_ne!(new.id, "y", "imported profile ids are fresh");
 
         // A second import of the same name-clashing profile bumps to " - 3"

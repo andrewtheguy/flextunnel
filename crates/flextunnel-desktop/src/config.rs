@@ -246,15 +246,21 @@ pub fn save_profiles(profiles: &[Profile]) -> Result<()> {
     }
 }
 
+/// Field holding the second secret. Unlike `auth_token` it has to serialize
+/// (it lives in `profiles.json`), so export/import strip it by hand instead.
+const RELAY_TOKEN_FIELD: &str = "relay_auth_token";
+
 /// Export all profiles to a user-chosen file. Non-secrets only, whatever the
-/// backend: `Profile`'s serialization always skips the token. Profile and
-/// forward ids are stripped too — they are app-local keys that the import
-/// regenerates, not part of the portable data.
+/// backend: `Profile`'s serialization always skips the auth token, and the
+/// relay auth token is removed here. Profile and forward ids are stripped too
+/// — they are app-local keys that the import regenerates, not part of the
+/// portable data.
 pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
     let mut values = serde_json::to_value(profiles)?;
     for entry in values.as_array_mut().into_iter().flatten() {
         if let Some(profile) = entry.as_object_mut() {
             profile.remove("id");
+            profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward.remove("id");
             }
@@ -267,8 +273,9 @@ pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
 /// load (malformed names and in-file duplicates are dropped with logs). The
 /// caller merges the result into the current profiles and assigns final ids;
 /// missing ids (the normal export shape) get placeholders here so the entries
-/// deserialize. Tokens are never in the file, so imported entries come back
-/// with empty tokens.
+/// deserialize. Neither secret is imported: the auth token is never in the
+/// file, and any relay auth token in a hand-written one is dropped, so
+/// imported entries come back with both empty.
 pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
     let mut values: serde_json::Value = read_json(path)?
         .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
@@ -277,6 +284,7 @@ pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
             profile
                 .entry("id")
                 .or_insert_with(|| Profile::new_id().into());
+            profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward
                     .entry("id")
@@ -394,7 +402,7 @@ mod tests {
             socks_port: Some(1085),
             http_port: Some(8081),
             relay_urls: vec!["https://relay.example".into()],
-            relay_auth_token: None,
+            relay_auth_token: Some("ftc-secret-relaypsk".into()),
             forwards: vec![PortForward {
                 id: "aaaa".into(),
                 label: "db".into(),
@@ -425,6 +433,13 @@ mod tests {
         assert!(!json.contains("ftc-secret-authtok"), "token leaked: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
+        // The relay token is a secret too, but it has no keychain home yet, so
+        // it must stay in this serialization (`profiles.json`). Export/import
+        // strip it explicitly — see `export_profiles`.
+        assert!(
+            json.contains("ftc-secret-relaypsk"),
+            "relay token must persist in profiles.json: {json}"
+        );
     }
 
     #[test]
@@ -471,17 +486,45 @@ mod tests {
             !raw.contains("ftc-secret-authtok"),
             "token leaked into the export: {raw}"
         );
+        assert!(
+            !raw.contains("ftc-secret-relaypsk") && !raw.contains("relay_auth_token"),
+            "relay auth token leaked into the export: {raw}"
+        );
+        // The non-secret relay setting it pairs with still travels.
+        assert!(raw.contains("https://relay.example"), "relay urls dropped: {raw}");
 
         let imported = import_profiles(&path).unwrap();
         assert_eq!(imported.len(), 1);
         let p = &imported[0];
         assert!(!p.id.is_empty(), "placeholder profile id assigned");
         assert!(p.auth_token.is_empty());
+        assert_eq!(p.relay_auth_token, None);
+        assert_eq!(p.relay_urls, profile().relay_urls);
         assert_eq!(p.name, profile().name);
         assert_eq!(p.socks_port, profile().socks_port);
         assert_eq!(p.forwards.len(), 1);
         assert!(!p.forwards[0].id.is_empty(), "placeholder forward id assigned");
         assert_eq!(p.forwards[0].local_port, profile().forwards[0].local_port);
+    }
+
+    /// Older exports (and hand-written files) can carry the relay token; it is
+    /// dropped rather than trusted, same as if it had never been written.
+    #[test]
+    fn import_drops_a_relay_token_present_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        std::fs::write(
+            &path,
+            r#"[{"name":"prod","server_node_id":"node",
+                 "relay_urls":["https://relay.example"],
+                 "relay_auth_token":"ftc-secret-relaypsk"}]"#,
+        )
+        .unwrap();
+
+        let imported = import_profiles(&path).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].relay_auth_token, None);
+        assert_eq!(imported[0].relay_urls, vec!["https://relay.example"]);
     }
 
     #[test]
