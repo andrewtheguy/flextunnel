@@ -1,9 +1,8 @@
 [workspace]
 members = ["crates/*"]
 resolver = "3"
-# A bare `cargo build` skips only the iOS staticlib (built explicitly via
-# build-ios.sh with `-p flextunnel-ffi`); `--workspace` still covers all four for
-# clippy/test.
+# A bare `cargo build` skips only flextunnel-desktop (macOS/Windows only);
+# `--workspace` still covers all four for clippy/test.
 default-members = [
     "crates/flextunnel-core",
     "crates/flextunnel-cli",

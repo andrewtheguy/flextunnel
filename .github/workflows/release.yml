@@ -185,34 +185,6 @@ jobs:
           name: release-desktop-macos-arm64
           path: target/release/flextunnel-desktop-macos-arm64.dmg
 
-  build-ios:
-    needs: setup
-    runs-on: macos-latest
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build iOS xcframework + header
-        # build-ios.sh installs the iOS Rust targets if missing, builds the
-        # device + Simulator slices, and stages the .xcframework and the C header
-        # into dist/ios. That zip becomes the release asset the iOS project's
-        # scripts/fetch-vendor.sh downloads by default.
-        run: ./build-ios.sh release
-
-      - name: Package xcframework + header
-        # Zip the bundle directory and ship the header alongside it so the vendor
-        # drop is one self-contained archive (the header is also embedded in each
-        # slice, but a top-level copy is convenient for the Xcode project).
-        run: |
-          cd dist/ios
-          zip -r libflextunnel-ios.xcframework.zip libflextunnel.xcframework flextunnel.h
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-ios
-          path: dist/ios/libflextunnel-ios.xcframework.zip
-
   build-windows:
     needs: setup
     if: needs.setup.outputs.is_prerelease == 'false'
@@ -265,8 +237,8 @@ jobs:
           path: target/release/flextunnel-desktop-windows-amd64.msi
 
   publish-release:
-    needs: [setup, build-linux, build-macos, build-ios, build-windows]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-windows]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

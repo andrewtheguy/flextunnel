@@ -3,8 +3,8 @@ name: CI
 # On-demand (and push/PR) verification across every host platform, mirroring
 # ezvpn's ci.yml. The point is to type-check and test the platform-gated code
 # that Linux CI never sees — flextunnel-desktop's macOS/Windows tray + keychain
-# backends and the iOS FFI staticlib — before a release. Nothing is published;
-# packaging (.dmg/.msi) and the iOS release zip belong to release.yml.
+# backends — before a release. Nothing is published; packaging (.dmg/.msi)
+# belongs to release.yml.
 on:
   push:
     branches: ["main"]
@@ -16,8 +16,7 @@ env:
 
 jobs:
   # flextunnel-desktop is macOS/Windows only (tray + keychain backends) and is
-  # excluded here; flextunnel-ffi (the iOS staticlib) still type-checks on the
-  # Linux host.
+  # excluded here.
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -39,17 +38,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
-
-  # Verify-only mirror of the release workflow's build-ios job: build the iOS
-  # device + Simulator xcframework slices (debug profile for speed). Nothing is
-  # published; this exists to catch FFI breakage before a release.
-  verify-ios-xcframework:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - name: Build iOS xcframework + header (debug)
-        run: ./build-ios.sh debug
 
   # The host clippy compiles flextunnel-desktop's Windows backend (tray +
   # keychain), which Linux CI never type-checks.

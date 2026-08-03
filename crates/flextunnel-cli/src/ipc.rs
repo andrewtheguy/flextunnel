@@ -50,7 +50,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum Request {
     Status,
     /// On-demand connection-path + custom-relay-health snapshot (mirrors the
-    /// desktop modal / iOS sheet). Kept off the polled `Status` because the
+    /// desktop modal). Kept off the polled `Status` because the
     /// custom-relay `/healthz` probe does on-demand HTTP.
     ConnPath,
     AddForward { forward: WireForward },

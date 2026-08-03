@@ -1,8 +1,8 @@
 //! Connection-path reporting (direct vs relay) and custom-relay health.
 //!
 //! A point-in-time [`connection_snapshot`] backs the on-demand status UIs (the
-//! desktop "connection path" CTA, the CLI status TUI, and the iOS
-//! `flextunnel_conn_path` sheet). [`watch_connection_paths`] logs the selected
+//! desktop "connection path" CTA and the CLI status TUI).
+//! [`watch_connection_paths`] logs the selected
 //! path and re-logs whenever it changes (e.g. relay -> direct).
 
 use crate::transport::endpoint::RelayConfig;
@@ -30,7 +30,7 @@ pub enum ConnPathKind {
 
 /// A single connection path snapshot for status display, decoupled from iroh's
 /// borrowed [`PathList`] so it can be stored and shown on demand (the desktop's
-/// "connection path" CTA and the iOS `flextunnel_conn_path` sheet).
+/// "connection path" CTA and the CLI status TUI).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnPath {
     pub kind: ConnPathKind,
@@ -100,7 +100,7 @@ fn connection_paths_from(paths: &PathList<'_>) -> Vec<ConnPath> {
 ///
 /// The path snapshot is synchronous; the relay health is an on-demand `/healthz`
 /// probe (async, all relays in parallel). This is only invoked when a status UI
-/// asks for it (the iOS/desktop connection-path sheet, the CLI status TUI), so
+/// asks for it (the desktop connection-path sheet, the CLI status TUI), so
 /// the HTTP checks never run on the tunnel's hot path.
 pub async fn connection_snapshot(
     conn: &Connection,

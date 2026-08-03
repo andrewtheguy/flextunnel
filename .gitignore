@@ -1,4 +1,4 @@
 /target
 tmp/
-# desktop and build-ios.sh staging output (libflextunnel.a + the copied flextunnel.h)
+# desktop packaging staging output
 dist/

@@ -71,9 +71,9 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 Prebuilt release assets are published on the
 [GitHub Releases](https://github.com/flexaccessdev/flextunnel/releases) page.
 Stable releases include `flextunnel` and `flextunnel-agent` for Linux
-amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
-Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
-iOS xcframework, but skip Windows. The install scripts download the latest
+amd64/arm64, macOS arm64, and Windows amd64.
+Automated prereleases currently include Linux amd64/arm64 and macOS arm64,
+but skip Windows. The install scripts download the latest
 binary and verify its SHA-256 checksum. On Linux/macOS this installs to a
 per-user location (`~/.local/bin`, no root required). On Windows this installs
 system-wide to `C:\Program Files\flextunnel` and updates the machine PATH,
@@ -197,7 +197,7 @@ cargo build --release
 
 Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
 uses the workspace's default members and builds the CLI and the agent, but not
-the iOS static library. To cross-build the CLI for Linux amd64 + arm64 via
+the desktop app (macOS/Windows only). To cross-build the CLI for Linux amd64 + arm64 via
 Docker, use `./build-linux.sh`; the script does not build the agent.
 
 ## Quick start
@@ -558,7 +558,7 @@ The routed set (the **tunnel set**) is a VPN-style split-tunnel "included routes
 list that decides which destinations traverse the tunnel. Targets not on it are
 **not** rejected — the client falls back to a direct connection for them. It is
 useful when a client must send *all* its traffic to the local SOCKS5 proxy (e.g.
-an iOS WebView, whose proxy config is global) but only some hosts should actually
+an app whose proxy setting is system-wide) but only some hosts should actually
 be tunneled. It is **required** and configured on the **server only** (config-file
 only — there is no CLI flag); the client configures nothing:
 
@@ -613,13 +613,12 @@ tunnels those hostnames but direct-connects every bare-IP target, and
 
 - **Client blocking mode.** Today the client **always direct-connects** every
   off-list target (split-tunneling), and this is
-  the same for the desktop and iOS clients (they share the same core). A future
+  the same for the CLI and desktop clients (they share the same core). A future
   client option — likely `routed_mode = "block" | "direct"` (default
   `"direct"`) — will let a client instead **refuse** an off-list connection,
   returning a SOCKS5 error to the local app rather than falling back to a direct
   connection. This is aimed mainly at the desktop client, where blocking off-list
-  traffic can be preferable to letting it leak out directly; the iOS client keeps
-  defaulting to direct-connect. (The server's `0x02` rejection above is a
+  traffic can be preferable to letting it leak out directly. (The server's `0x02` rejection above is a
   separate, server-side control and is unaffected.)
 - **Richer agent routes.** Reverse routing is loopback-only in v1: every
   `[agent_routes]` entry dials `127.0.0.1` on the agent. A follow-up will let one

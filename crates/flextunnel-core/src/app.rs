@@ -1,5 +1,5 @@
-//! Small process/runtime helpers shared by the binaries (server, client, agent)
-//! and the iOS FFI: logger init, a multi-thread Tokio runtime, a version banner,
+//! Small process/runtime helpers shared by the binaries (server, client, agent,
+//! desktop): logger init, a multi-thread Tokio runtime, a version banner,
 //! and a graceful-shutdown signal future. These are pure boilerplate that every
 //! entry point needs; keeping one copy here avoids drift between crates.
 
@@ -7,12 +7,12 @@ use anyhow::{Context, Result};
 
 /// Default `env_logger` filter for the binaries: flextunnel's own crates at
 /// `info`, the noisy transport deps (iroh and its tracing bridge) at `warn`.
-/// Overridable at runtime via `RUST_LOG`. The FFI passes its own filter instead.
+/// Overridable at runtime via `RUST_LOG`; callers may pass their own filter.
 pub const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,tracing=warn";
 
 /// Initialize `env_logger` with `default_filter` unless `RUST_LOG` overrides it.
-/// Uses `try_init` so it is idempotent and safe to call more than once (the FFI
-/// entry point may be invoked repeatedly).
+/// Uses `try_init` so it is idempotent and safe to call more than once (an
+/// embedding entry point may be invoked repeatedly).
 pub fn init_logger(default_filter: &str) {
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(default_filter),
@@ -21,7 +21,7 @@ pub fn init_logger(default_filter: &str) {
 }
 
 /// Raise this process's soft `RLIMIT_NOFILE` to its hard limit (on
-/// macOS/iOS, capped at `kern.maxfilesperproc` as Darwin's `setrlimit`
+/// macOS, capped at `kern.maxfilesperproc` as Darwin's `setrlimit`
 /// requires).
 ///
 /// Strictly per-process: only the calling process's own soft limit moves, and
@@ -46,12 +46,12 @@ pub fn raise_fd_limit() {
     // Darwin rejects a soft limit above `kern.maxfilesperproc` even when the
     // hard limit reports RLIM_INFINITY (`libc` exposes no `OPEN_MAX` on
     // Darwin, and the sysctl is the value the kernel actually enforces).
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "macos")]
     let target = match darwin_maxfilesperproc() {
         Some(max) => lim.rlim_max.min(max),
         None => return, // can't learn the cap; leave the soft limit untouched
     };
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(target_os = "macos"))]
     let target = lim.rlim_max;
     if lim.rlim_cur >= target {
         return; // already at the highest value we may request
@@ -74,7 +74,7 @@ pub fn raise_fd_limit() {
 /// Read `kern.maxfilesperproc`, the ceiling Darwin's `setrlimit` enforces on
 /// the `RLIMIT_NOFILE` soft limit. Returns `None` if the sysctl fails or
 /// reports a non-positive value.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "macos")]
 fn darwin_maxfilesperproc() -> Option<libc::rlim_t> {
     let mut mib = [libc::CTL_KERN, libc::KERN_MAXFILESPERPROC];
     let mut maxfiles: libc::c_int = 0;
@@ -159,11 +159,11 @@ mod tests {
             rlim_max: 0,
         };
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(target_os = "macos")]
         let target = lim
             .rlim_max
             .min(super::darwin_maxfilesperproc().expect("kern.maxfilesperproc must be readable"));
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        #[cfg(not(target_os = "macos"))]
         let target = lim.rlim_max;
         assert!(
             lim.rlim_cur >= target,

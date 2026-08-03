@@ -73,7 +73,7 @@ struct ForwardTask {
 /// Owns and reconciles server-direct listener tasks.
 ///
 /// The runtime handle makes [`apply`](Self::apply) safe to call from a foreign
-/// thread (the iOS FFI does this from Swift's main actor).
+/// thread (e.g. a GUI's main thread).
 pub struct ForwardManager {
     runtime: Handle,
     forwarder: ServerForwarder,

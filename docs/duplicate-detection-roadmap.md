@@ -70,7 +70,7 @@ work:
 - **Persist the observation** across client restarts (a small state file), so a
   client that has seen a duplicate server can refuse or warn immediately on the
   next launch instead of re-deriving it from scratch.
-- **Surface a user-visible flag** through the CLI and the FFI/iOS layer (a status
+- **Surface a user-visible flag** through the CLI and the desktop app (a status
   field alongside `TunnelRoutes`), so the app can show "duplicate server id
   detected" to the operator.
 - **Client-side acknowledgement** of a duplicate *client* id, which only becomes

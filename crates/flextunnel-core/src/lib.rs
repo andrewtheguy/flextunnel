@@ -8,8 +8,8 @@
 //! encryption. Neither side needs admin/root (no TUN device).
 //!
 //! This is the reusable core library, consumed by the `flextunnel` CLI binary
-//! (`flextunnel-cli`), the `flextunnel-agent` binary, and the iOS C FFI staticlib
-//! (`flextunnel-ffi`).
+//! (`flextunnel-cli`), the `flextunnel-agent` binary, and the desktop app
+//! (`flextunnel-desktop`).
 
 // Re-exported so downstream crates (CLI, desktop) can name iroh types (e.g.
 // `EndpointId`) without declaring their own iroh dependency, which would risk

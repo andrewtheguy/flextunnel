@@ -196,7 +196,7 @@ fn conn_path_lines(snapshot: &WireConnSnapshot) -> Vec<Line<'static>> {
 }
 
 /// The on-demand connection-path overlay (r refresh · Esc close), captured when
-/// opened — mirrors the desktop connection-path modal and the iOS sheet.
+/// opened — mirrors the desktop connection-path modal.
 fn draw_conn_path(frame: &mut Frame, snapshot: &WireConnSnapshot) {
     let lines = conn_path_lines(snapshot);
     let height = (lines.len() as u16 + 2).clamp(3, frame.area().height.max(3));

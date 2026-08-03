@@ -74,7 +74,7 @@ enum Mode {
     ConfirmDelete { id: String, name: String },
     /// On-demand connection-path overlay: a point-in-time snapshot (paths +
     /// custom-relay health) captured when opened, refreshable, not polled —
-    /// mirrors the desktop modal / iOS sheet.
+    /// mirrors the desktop modal.
     ConnPath(WireConnSnapshot),
 }
 

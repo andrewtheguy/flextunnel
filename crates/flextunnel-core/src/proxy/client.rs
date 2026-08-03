@@ -187,7 +187,7 @@ pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
 
 /// Snapshot of what the tunnel currently forwards: the split-tunnel set the
 /// server pushed on the last successful handshake, plus whether a connection is
-/// live right now. Shared with the FFI so the app can display the routed
+/// live right now. Shared with embedders so the app can display the routed
 /// domains/CIDRs. An empty set while `connected` is true means the server runs
 /// no routed set and everything is tunneled.
 #[derive(Clone, Default)]
@@ -252,7 +252,7 @@ pub enum AgentConnState {
 }
 
 impl AgentConnState {
-    /// Lowercase wire/JSON token, for status UIs (FFI, iOS).
+    /// Lowercase wire/JSON token, for status UIs.
     pub fn as_str(self) -> &'static str {
         match self {
             AgentConnState::Connected => "connected",
@@ -370,7 +370,7 @@ impl ProxyClient {
         newly_flagged
     }
 
-    /// Shared handle to the live tunnel set, for callers (the FFI) that want to
+    /// Shared handle to the live tunnel set, for callers (status UIs) that want to
     /// display what is routed. Refreshed on every (re)connect.
     pub fn routes(&self) -> Arc<Mutex<TunnelRoutes>> {
         self.routes.clone()
@@ -452,8 +452,8 @@ impl ProxyClient {
     }
 
     /// Serve on an already-bound SOCKS5 listener (see [`run`](Self::run) for the
-    /// reconnect policy). Callers that need the actual bound address — e.g. the
-    /// FFI binding to an ephemeral `127.0.0.1:0` and reporting the chosen port —
+    /// reconnect policy). Callers that need the actual bound address — e.g. an
+    /// embedder binding to an ephemeral `127.0.0.1:0` and reporting the chosen port —
     /// bind the [`TcpListener`] themselves, read `local_addr()`, then hand it
     /// here. `run` is the thin convenience wrapper that binds `socks_listen`.
     /// This path never enables the HTTP front-end.
@@ -504,10 +504,10 @@ impl ProxyClient {
     }
 
     /// Like [`run_with_listeners`](Self::run_with_listeners) but also serves a
-    /// SOCKS5 front-end on an optional **Unix domain socket** listener. The iOS
-    /// embedder uses this to expose the proxy over a socket file inside the app's
-    /// sandbox container (reachable only by this app) instead of a loopback TCP
-    /// port (reachable by any process on the device). Both front-ends speak the
+    /// SOCKS5 front-end on an optional **Unix domain socket** listener. An
+    /// embedder can use this to expose the proxy over a socket file with
+    /// filesystem permissions (reachable only by the owning user/app) instead of
+    /// a loopback TCP port (reachable by any local process). Both front-ends speak the
     /// same SOCKS5 protocol and share the one live tunnel + route policy.
     ///
     /// The extra Unix-domain listener is Unix-only; there is no Windows
@@ -659,7 +659,7 @@ impl ProxyClient {
 
             // Keep the connection alive until it drops, then reconnect (or exit).
             let maintained = self.maintain(&connection, ctrl_send, ctrl_recv).await;
-            // The connection is no longer live; clear the FFI-visible flag and the
+            // The connection is no longer live; clear the externally visible flag and the
             // shared handle so on-list targets fail cleanly during the gap.
             self.set_connected(false);
             *current.lock().expect("connection lock") = None;
@@ -834,7 +834,7 @@ impl ProxyClient {
             response.routed_cidrs.len()
         );
 
-        // Publish the live tunnel set so the FFI/app can show what's forwarded.
+        // Publish the live tunnel set so status UIs can show what's forwarded.
         // Agent routes carry a connected flag seeded from the handshake's
         // `connected_agents` subset; the heartbeat loop keeps it fresh.
         if let Ok(mut routes) = self.routes.lock() {

@@ -4,7 +4,7 @@ The native desktop GUI for the [flextunnel](../..) client — a system-tray app
 for **macOS and Windows** that manages connection profiles and runs one tunnel
 session per profile without ever opening a terminal.
 
-It embeds [`flextunnel-core`](../flextunnel-core) directly (no FFI layer) and is
+It embeds [`flextunnel-core`](../flextunnel-core) directly and is
 built on [iced](https://iced.rs/)'s daemon runtime: the process lives in the
 menu bar / system tray and keeps running with no window open, so closing the
 window loses nothing — the tray owns the lifecycle and re-opens it on demand.
