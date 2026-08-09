@@ -2,7 +2,7 @@
 //!
 //! `flextunnel.internal` and every `*.flextunnel.internal` subdomain are
 //! reserved by flextunnel itself: the operator may not use them as
-//! `[host_aliases]`/`[agent_routes]` names (rejected at config resolution), the
+//! `[host_aliases]` names (rejected at config resolution), the
 //! client always tunnels them to the server rather than split-tunneling, and the
 //! server intercepts them before the routed-set whitelist. `flextunnel.internal`
 //! serves a read-only server status page (see [`super::status_page`]); other

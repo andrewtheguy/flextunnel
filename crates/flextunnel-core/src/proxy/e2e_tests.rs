@@ -19,7 +19,7 @@ use crate::blocklist::BlockList;
 use crate::proxy::signaling::{self, Hello, HelloResponse, Target};
 use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
-    dial, BridgeUpstream, BridgeUpstreamConfig, ForwardManager, ForwardSpec, ProxyServer,
+    BridgeUpstream, BridgeUpstreamConfig, ForwardManager, ForwardSpec, ProxyServer,
     ProxyServerParams, RoutedSet, ServerForwarder,
 };
 use crate::transport::{ALPN, build_quic_transport_config};
@@ -34,10 +34,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const TOKEN: &str = "test-token";
-/// A distinct agent-token string (the server checks pool membership, not the
+/// A distinct bridge-token string (the server checks pool membership, not the
 /// prefix, so any string works as long as the pools differ).
-const AGENT_TOKEN: &str = "test-agent-token";
-/// A distinct bridge-token string (same reasoning as [`AGENT_TOKEN`]).
 const BRIDGE_TOKEN: &str = "test-bridge-token";
 
 /// Bind a hermetic loopback endpoint: relay off, no discovery, `127.0.0.1:0`.
@@ -88,49 +86,28 @@ async fn with_timeout<F: std::future::Future>(f: F) -> F::Output {
 }
 
 /// Spawn a `ProxyServer` on `endpoint` with a single client token, an empty
-/// routed set, no agents, and the given blocklist path. Returns the server's own
-/// id.
+/// routed set, and the given blocklist path. Returns the server's own id.
 fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh::EndpointId {
-    spawn_server_full(
-        endpoint,
-        blocklist_path,
-        HashSet::new(),
-        HashMap::new(),
-        HashMap::new(),
-        Vec::new(),
-    )
+    spawn_server_full(endpoint, blocklist_path, HashMap::new(), Vec::new())
 }
 
-/// Spawn a `ProxyServer` with configurable agent tokens + reverse routes. Client
-/// token is always [`TOKEN`]; `routed_domains` seeds the routed set (empty = deny
-/// all). Returns the server's own id.
+/// Spawn a `ProxyServer` with configurable host aliases. Client token is always
+/// [`TOKEN`]; `routed_domains` seeds the routed set (empty = deny all). Returns
+/// the server's own id.
 fn spawn_server_full(
     endpoint: Endpoint,
     blocklist_path: std::path::PathBuf,
-    agent_valid_tokens: HashSet<String>,
-    agent_routes: HashMap<String, String>,
     host_aliases: HashMap<String, String>,
     routed_domains: Vec<String>,
 ) -> iroh::EndpointId {
-    spawn_server_dns(
-        endpoint,
-        blocklist_path,
-        agent_valid_tokens,
-        agent_routes,
-        host_aliases,
-        routed_domains,
-        HashMap::new(),
-    )
+    spawn_server_dns(endpoint, blocklist_path, host_aliases, routed_domains, HashMap::new())
 }
 
 /// Like [`spawn_server_full`] but also seeds the conditional DNS-forwarding
 /// table (`[dns_forwards]`), exercised by the status-page test.
-#[allow(clippy::too_many_arguments)]
 fn spawn_server_dns(
     endpoint: Endpoint,
     blocklist_path: std::path::PathBuf,
-    agent_valid_tokens: HashSet<String>,
-    agent_routes: HashMap<String, String>,
     host_aliases: HashMap<String, String>,
     routed_domains: Vec<String>,
     dns_forwards: HashMap<String, Vec<String>>,
@@ -143,10 +120,8 @@ fn spawn_server_dns(
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         valid_tokens: tokens,
-        agent_valid_tokens,
         bridge_valid_tokens: HashSet::new(),
         allowed_bridge_servers: HashSet::new(),
-        agent_routes,
         host_aliases,
         routed_set: RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
         routed_domains,
@@ -174,10 +149,8 @@ fn base_params(own_id: iroh::EndpointId, blocklist_path: std::path::PathBuf) -> 
     ProxyServerParams {
         own_id,
         valid_tokens: HashSet::from([TOKEN.to_string()]),
-        agent_valid_tokens: HashSet::new(),
         bridge_valid_tokens: HashSet::new(),
         allowed_bridge_servers: HashSet::new(),
-        agent_routes: HashMap::new(),
         host_aliases: HashMap::new(),
         routed_set: RoutedSet::default(),
         routed_domains: Vec::new(),
@@ -270,31 +243,6 @@ async fn client_handshake(
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
     let mut hello = Hello::new(TOKEN, nonce);
     hello.duplicate_server_observed = duplicate_server_observed;
-    signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let data = with_timeout(signaling::read_message(
-        &mut recv,
-        signaling::MAX_HANDSHAKE_SIZE,
-    ))
-    .await
-    .unwrap();
-    let resp = signaling::decode_hello_response(&data).unwrap();
-    (conn, send, recv, resp)
-}
-
-/// Perform the agent side of the auth handshake (`role = Agent` + machine id)
-/// and return the open control stream + the server's response.
-async fn agent_handshake(
-    ep: &Endpoint,
-    server_addr: EndpointAddr,
-    machine_id: &str,
-    nonce: u128,
-) -> (Connection, SendStream, RecvStream, HelloResponse) {
-    let conn = with_timeout(ep.connect(server_addr, ALPN)).await.unwrap();
-    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    let hello = Hello::new_agent(AGENT_TOKEN, nonce, machine_id);
     signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
         .await
         .unwrap();
@@ -510,98 +458,11 @@ async fn server_self_blocks_on_duplicate_advisory() {
     let _ = std::fs::remove_file(&bl_path);
 }
 
-/// End-to-end reverse routing: a client requests a hostname reserved in
-/// `[agent_routes]`; the server forwards the stream over the connected agent's
-/// live connection, the agent dials its own loopback, and bytes round-trip.
-#[tokio::test]
-async fn agent_reverse_route_pipes_to_agent_loopback() {
-    // A tiny echo server on the agent's loopback: greets "HELLO", then echoes.
-    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let echo_port = echo.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        while let Ok((mut sock, _)) = echo.accept().await {
-            tokio::spawn(async move {
-                let _ = sock.write_all(b"HELLO").await;
-                let mut buf = [0u8; 256];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    let machine_id = "reverse-route-machine-id";
-    let alias = "web.internal";
-    let routes = HashMap::from([(alias.to_string(), machine_id.to_string())]);
-    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
-
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    // "*" routed set so the reserved alias passes the whitelist gate.
-    spawn_server_full(
-        server_ep,
-        temp_blocklist("agentroute"),
-        agent_tokens,
-        routes,
-        HashMap::new(),
-        vec!["*".to_string()],
-    );
-
-    // Agent connects and serves each server-opened stream by dialing its loopback
-    // (the shared exit-point body, exactly as `proxy::agent` does).
-    let agent_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (agent_conn, _asend, _arecv, aresp) =
-        agent_handshake(&agent_ep, server_addr.clone(), machine_id, 1).await;
-    assert!(aresp.accepted, "agent should be accepted");
-    let serve_conn = agent_conn.clone();
-    tokio::spawn(async move {
-        while let Ok((send, mut recv)) = serve_conn.accept_bi().await {
-            tokio::spawn(async move {
-                if let Ok(target) = signaling::read_request(&mut recv).await {
-                    let _ = dial::connect_and_pipe(send, recv, &target, None).await;
-                }
-            });
-        }
-    });
-
-    // Client requests the reserved alias at the echo port → routed to the agent.
-    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (client_conn, _cs, _cr, cresp) =
-        client_handshake(&client_ep, server_addr, 2, false).await;
-    assert!(cresp.accepted, "client should be accepted");
-
-    let (mut send, mut recv) = with_timeout(client_conn.open_bi()).await.unwrap();
-    signaling::write_request(&mut send, &Target::Domain(alias.to_string(), echo_port))
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let rep = with_timeout(signaling::read_reply(&mut recv)).await.unwrap();
-    assert_eq!(rep, signaling::REP_SUCCESS, "reverse route should connect");
-
-    // Round-trip through the agent: read the greeting, then our echoed bytes.
-    send.write_all(b"ping").await.unwrap();
-    send.flush().await.unwrap();
-    let mut buf = [0u8; 9]; // "HELLO" + "ping"
-    with_timeout(recv.read_exact(&mut buf)).await.unwrap();
-    assert_eq!(&buf, b"HELLOping");
-
-    // Keep the agent connection alive until the assertions complete.
-    drop(agent_conn);
-}
-
 /// The routed-set whitelist is enforced on the *requested* hostname before any
-/// alias/route resolution, so a `*.web.internal` host alias whose subdomain was
+/// alias resolution, so a `*.web.internal` host alias whose subdomain was
 /// never added to the routed set does NOT smuggle an off-list host past the
 /// gate. The same request, once the wildcard is on the routed set, resolves
-/// through the alias to the server's loopback and pipes bytes. (The whitelist is
-/// a single gate shared with `[agent_routes]`, so this covers both alias paths.)
+/// through the alias to the server's loopback and pipes bytes.
 #[tokio::test]
 async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     // The alias rewrites to loopback; this echo server is the on-list dial target.
@@ -614,8 +475,6 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     spawn_server_full(
         server_ep,
         temp_blocklist("wildcard-alias-offlist"),
-        HashSet::new(),
-        HashMap::new(),
         host_aliases.clone(),
         // Covers a different name — `*.web.internal` is deliberately absent.
         vec!["allowed.example.com".to_string()],
@@ -644,8 +503,6 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
     spawn_server_full(
         server_ep2,
         temp_blocklist("wildcard-alias-onlist"),
-        HashSet::new(),
-        HashMap::new(),
         host_aliases,
         vec!["*.web.internal".to_string()],
     );
@@ -684,12 +541,8 @@ async fn wildcard_host_alias_still_requires_routed_set_coverage() {
 async fn reserved_internal_serves_status_page_and_subdomain_404() {
     let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    // A distinctive routed domain and agent route we expect to see rendered on
-    // the status page. `flextunnel.internal` is deliberately NOT on the routed set.
-    let machine_id = "status-machine-id";
-    let agent_alias = "agent-status.internal";
-    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
-    let agent_routes = HashMap::from([(agent_alias.to_string(), machine_id.to_string())]);
+    // A distinctive routed domain we expect to see rendered on the status page.
+    // `flextunnel.internal` is deliberately NOT on the routed set.
     let host_aliases =
         HashMap::from([("nas.internal".to_string(), "192.168.1.9".to_string())]);
     // Two conditional DNS forwards we expect rendered on the status page and
@@ -711,17 +564,10 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     spawn_server_dns(
         server_ep,
         temp_blocklist("reserved"),
-        agent_tokens,
-        agent_routes,
         host_aliases,
         vec!["marker.example.com".to_string(), "corp.example.com".to_string()],
         dns_forwards,
     );
-
-    let agent_ep = loopback_endpoint(SecretKey::generate(), false).await;
-    let (agent_conn, _as, _ar, aresp) =
-        agent_handshake(&agent_ep, server_addr.clone(), machine_id, 7).await;
-    assert!(aresp.accepted, "agent should be accepted");
 
     let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
     let (client_conn, _cs, _cr, cresp) =
@@ -731,11 +577,6 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         cresp.host_aliases,
         vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
         "handshake should push the configured host aliases for client status UIs"
-    );
-    assert_eq!(
-        cresp.agent_aliases,
-        vec![agent_alias.to_string()],
-        "handshake should push the configured agent-route aliases for client status UIs"
     );
     assert_eq!(
         cresp.dns_forwards,
@@ -760,18 +601,6 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "status page should list the configured routed domain"
     );
     assert!(
-        body.contains(agent_alias),
-        "status page should list the configured agent route"
-    );
-    assert!(
-        body.contains(machine_id),
-        "status page should list the configured agent machine id"
-    );
-    assert!(
-        body.contains(r#"class="ok">connected"#),
-        "status page should show the connected agent state"
-    );
-    assert!(
         body.contains("10.9.9.9:5353"),
         "status page should list the configured DNS forward server"
     );
@@ -793,10 +622,6 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     assert!(
         body.contains("flextunnel server status"),
         "text status should include a plain heading"
-    );
-    assert!(
-        body.contains("  - agent-status.internal -> status-machine-id (connected)"),
-        "text status should show the connected agent route"
     );
     assert!(
         body.contains("  - nas.internal -> 192.168.1.9"),
@@ -839,11 +664,6 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
         "json status should list the configured host alias"
     );
     assert_eq!(
-        status["agent_routes"],
-        serde_json::json!([{"name": agent_alias, "machine_id": machine_id, "connected": true}]),
-        "json status should show the connected agent route"
-    );
-    assert_eq!(
         status["dns_forwards"],
         serde_json::json!([
             {"suffix": "corp.example.com", "servers": ["10.1.0.11", "10.1.0.10:5353"]},
@@ -870,7 +690,6 @@ async fn reserved_internal_serves_status_page_and_subdomain_404() {
     assert!(body.starts_with("HTTP/1.1 404"), "reserved subdomain should be 404: {body:.40}");
 
     drop(client_conn);
-    drop(agent_conn);
 }
 
 /// Open a tunnel stream for `host:80`, send a minimal HTTP request, and return
@@ -912,94 +731,6 @@ async fn fetch_reserved_request(
     let _ = send.finish();
     let bytes = with_timeout(recv.read_to_end(64 * 1024)).await.unwrap();
     String::from_utf8(bytes).unwrap()
-}
-
-/// Two agents presenting the *same* machine id concurrently (distinct ephemeral
-/// node ids) are a duplicate: the second is rejected and the machine id is
-/// blocklisted.
-#[tokio::test]
-async fn duplicate_agent_machine_id_is_detected_and_blocklisted() {
-    let bl_path = temp_blocklist("dupagent");
-    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
-
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    spawn_server_full(
-        server_ep,
-        bl_path.clone(),
-        agent_tokens,
-        HashMap::new(),
-        HashMap::new(),
-        Vec::new(),
-    );
-
-    let machine_id = "dup-machine-id";
-
-    // First agent authenticates and stays live (held in scope).
-    let ep1 = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_c1, _s1, _r1, resp1) = agent_handshake(&ep1, server_addr.clone(), machine_id, 1).await;
-    assert!(resp1.accepted, "first agent should be accepted");
-
-    // Second agent: a different (ephemeral) node id but the same machine id.
-    let ep2 = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_c2, _s2, _r2, resp2) = agent_handshake(&ep2, server_addr, machine_id, 2).await;
-    assert!(!resp2.accepted, "duplicate agent must be rejected");
-    assert!(
-        resp2
-            .reject_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("duplicate"),
-        "reject reason should mention duplicate: {:?}",
-        resp2.reject_reason
-    );
-
-    // The server persisted the offending machine id to the blocklist.
-    wait_for_blocklist(&bl_path, |bl| bl.is_agent_blocked(machine_id)).await;
-
-    let _ = std::fs::remove_file(&bl_path);
-}
-
-/// A same-instance agent reconnect (same instance nonce) must NOT be treated as a
-/// duplicate: the stale connection is superseded and the machine id is never
-/// blocklisted, so a legitimate reconnect after a network blip keeps working.
-#[tokio::test]
-async fn agent_reconnect_same_nonce_is_not_blocklisted() {
-    let bl_path = temp_blocklist("agentreconnect");
-    let agent_tokens = HashSet::from([AGENT_TOKEN.to_string()]);
-
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    spawn_server_full(
-        server_ep,
-        bl_path.clone(),
-        agent_tokens,
-        HashMap::new(),
-        HashMap::new(),
-        Vec::new(),
-    );
-
-    let machine_id = "reconnect-machine-id";
-    let nonce = 42u128;
-
-    // First connection authenticates and stays live (held in scope, mimicking a
-    // stale connection not yet reaped when the agent reconnects).
-    let ep1 = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_c1, _s1, _r1, resp1) = agent_handshake(&ep1, server_addr.clone(), machine_id, nonce).await;
-    assert!(resp1.accepted, "first agent should be accepted");
-
-    // Reconnect: a fresh (ephemeral) node id but the SAME machine id and nonce.
-    let ep2 = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_c2, _s2, _r2, resp2) = agent_handshake(&ep2, server_addr, machine_id, nonce).await;
-    assert!(resp2.accepted, "same-instance reconnect must be accepted: {:?}", resp2.reject_reason);
-
-    // The machine id must NOT have been blocklisted.
-    assert!(
-        !BlockList::load(bl_path.clone()).unwrap().is_agent_blocked(machine_id),
-        "a same-instance reconnect must never blocklist the machine id"
-    );
-
-    let _ = std::fs::remove_file(&bl_path);
 }
 
 /// End-to-end bridge routing: a client stream whose target matches server A's

@@ -31,14 +31,6 @@ pub enum StatusFormat {
     Json,
 }
 
-/// One configured reverse route plus whether its agent is currently registered.
-#[derive(Serialize)]
-pub struct AgentRouteStatus {
-    pub name: String,
-    pub machine_id: String,
-    pub connected: bool,
-}
-
 /// One configured outbound bridge plus whether its upstream connection to the
 /// target server is live right now.
 #[derive(Serialize)]
@@ -68,8 +60,6 @@ pub struct ServerStatusTemplate {
     pub routed_cidrs: Vec<String>,
     /// `(alias, target)` pairs, sorted for stable output.
     pub host_aliases: Vec<(String, String)>,
-    /// Configured agent routes, sorted by alias for stable output.
-    pub agent_routes: Vec<AgentRouteStatus>,
     /// Conditional DNS forwards as `(suffix, upstream servers)` pairs, sorted by
     /// suffix for stable output.
     pub dns_forwards: Vec<(String, Vec<String>)>,
@@ -80,7 +70,6 @@ pub struct ServerStatusTemplate {
     pub inbound_bridges: Vec<BridgeInboundStatus>,
     pub blocklist_path: String,
     pub blocked_client_count: usize,
-    pub blocked_agent_count: usize,
     pub conflicted_server_count: usize,
 }
 
@@ -102,7 +91,6 @@ struct ServerStatusJson<'a> {
     routed_domains: &'a [String],
     routed_cidrs: &'a [String],
     host_aliases: Vec<HostAliasJson<'a>>,
-    agent_routes: &'a [AgentRouteStatus],
     dns_forwards: Vec<DnsForwardJson<'a>>,
     bridges: &'a [BridgeUpstreamStatus],
     inbound_bridges: &'a [BridgeInboundStatus],
@@ -125,7 +113,6 @@ struct DnsForwardJson<'a> {
 struct DuplicateIdBlocklistJson<'a> {
     file: &'a str,
     blocked_clients: usize,
-    blocked_agents: usize,
     conflicted_servers: usize,
 }
 
@@ -200,14 +187,12 @@ fn render_status_json(tpl: &ServerStatusTemplate) -> Result<String, serde_json::
         routed_domains: &tpl.routed_domains,
         routed_cidrs: &tpl.routed_cidrs,
         host_aliases,
-        agent_routes: &tpl.agent_routes,
         dns_forwards,
         bridges: &tpl.bridges,
         inbound_bridges: &tpl.inbound_bridges,
         duplicate_id_blocklist: DuplicateIdBlocklistJson {
             file: &tpl.blocklist_path,
             blocked_clients: tpl.blocked_client_count,
-            blocked_agents: tpl.blocked_agent_count,
             conflicted_servers: tpl.conflicted_server_count,
         },
     };

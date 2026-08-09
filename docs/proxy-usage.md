@@ -128,7 +128,7 @@ curl https://example.com
 `http://flextunnel.internal/` is the HTML status page; `/status.txt` is the
 script-friendly text form; `/status.json` is the structured JSON form. The JSON
 response includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, `agent_routes`, `bridges`,
+`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`,
 `inbound_bridges`, and duplicate-id blocklist counts under
 `duplicate_id_blocklist`. These names are reserved by flextunnel and are always
 tunneled, even when they are not in the server's routed set. If the client is

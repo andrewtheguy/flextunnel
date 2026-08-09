@@ -676,16 +676,10 @@ fn wire_conn_path(p: &ConnPath) -> WireConnPath {
 }
 
 fn wire_routes(routes: flextunnel_core::proxy::TunnelRoutes) -> WireRoutes {
-    let agent_routes = routes
-        .agent_states(Instant::now())
-        .into_iter()
-        .map(|(name, state)| (name, state.as_str().to_string()))
-        .collect();
     WireRoutes {
         domains: routes.domains,
         cidrs: routes.cidrs,
         host_aliases: routes.host_aliases,
-        agent_routes,
         dns_forwards: routes.dns_forwards,
         bridges: routes
             .bridges

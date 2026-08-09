@@ -17,16 +17,16 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             # flextunnel-desktop is macOS/Windows only (tray + keychain backends).
-            packages: -p flextunnel-cli -p flextunnel-agent
+            packages: -p flextunnel-cli
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            packages: -p flextunnel-cli -p flextunnel-agent
+            packages: -p flextunnel-cli
           - os: macos-latest
             target: aarch64-apple-darwin
-            packages: -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
+            packages: -p flextunnel-cli -p flextunnel-desktop
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            packages: -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
+            packages: -p flextunnel-cli -p flextunnel-desktop
     runs-on: ${{ matrix.os }}
 
     steps:

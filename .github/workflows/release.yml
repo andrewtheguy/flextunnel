@@ -107,16 +107,15 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release -p flextunnel-cli -p flextunnel-agent --target ${{ matrix.target }}
+          cargo build --release -p flextunnel-cli --target ${{ matrix.target }}
 
       - name: Test Release
         run: |
-          cargo test --release -p flextunnel-cli -p flextunnel-agent --target ${{ matrix.target }}
+          cargo test --release -p flextunnel-cli --target ${{ matrix.target }}
 
       - name: Rename Binaries
         run: |
           mv target/${{ matrix.target }}/release/flextunnel target/release/flextunnel-${{ matrix.suffix }}
-          mv target/${{ matrix.target }}/release/flextunnel-agent target/release/flextunnel-agent-${{ matrix.suffix }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -127,11 +126,6 @@ jobs:
         with:
           name: release-${{ matrix.suffix }}
           path: target/release/flextunnel-${{ matrix.suffix }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-agent-${{ matrix.suffix }}
-          path: target/release/flextunnel-agent-${{ matrix.suffix }}
 
   build-macos:
     needs: setup
@@ -146,16 +140,15 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release -p flextunnel-cli -p flextunnel-agent --target aarch64-apple-darwin
+          cargo build --release -p flextunnel-cli --target aarch64-apple-darwin
 
       - name: Test Release
         run: |
-          cargo test --release -p flextunnel-cli -p flextunnel-agent --target aarch64-apple-darwin
+          cargo test --release -p flextunnel-cli --target aarch64-apple-darwin
 
       - name: Rename Binaries
         run: |
           mv target/aarch64-apple-darwin/release/flextunnel target/release/flextunnel-macos-arm64
-          mv target/aarch64-apple-darwin/release/flextunnel-agent target/release/flextunnel-agent-macos-arm64
 
       - uses: cargo-bins/cargo-binstall@main
 
@@ -174,11 +167,6 @@ jobs:
         with:
           name: release-macos-arm64
           path: target/release/flextunnel-macos-arm64
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-agent-macos-arm64
-          path: target/release/flextunnel-agent-macos-arm64
 
       - uses: actions/upload-artifact@v4
         with:
@@ -227,16 +215,15 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release -p flextunnel-cli -p flextunnel-agent --target x86_64-pc-windows-msvc
+          cargo build --release -p flextunnel-cli --target x86_64-pc-windows-msvc
 
       - name: Test Release
         run: |
-          cargo test --release -p flextunnel-cli -p flextunnel-agent --target x86_64-pc-windows-msvc
+          cargo test --release -p flextunnel-cli --target x86_64-pc-windows-msvc
 
       - name: Rename Binaries
         run: |
           move target\x86_64-pc-windows-msvc\release\flextunnel.exe target\release\flextunnel-windows-amd64.exe
-          move target\x86_64-pc-windows-msvc\release\flextunnel-agent.exe target\release\flextunnel-agent-windows-amd64.exe
 
       - uses: cargo-bins/cargo-binstall@main
 
@@ -253,11 +240,6 @@ jobs:
         with:
           name: release-windows-amd64
           path: target/release/flextunnel-windows-amd64.exe
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-agent-windows-amd64
-          path: target/release/flextunnel-agent-windows-amd64.exe
 
       - uses: actions/upload-artifact@v4
         with:

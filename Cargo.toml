@@ -2,16 +2,15 @@
 members = ["crates/*"]
 resolver = "3"
 # A bare `cargo build` skips only the iOS staticlib (built explicitly via
-# build-ios.sh with `-p flextunnel-ffi`); `--workspace` still covers all four for
-# clippy/test.
+# build-ios.sh with `-p flextunnel-ffi`); `--workspace` still covers everything
+# for clippy/test.
 default-members = [
     "crates/flextunnel-core",
     "crates/flextunnel-cli",
-    "crates/flextunnel-agent",
 ]
 
 [workspace.package]
-version = "0.0.60"
+version = "0.0.61"
 edition = "2024"
 description = "SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P"
 

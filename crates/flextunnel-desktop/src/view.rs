@@ -11,7 +11,7 @@ use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
 use flextunnel_core::proxy::signaling::Target;
-use flextunnel_core::proxy::{reserved, AgentConnState, RoutedSet, TunnelRoutes};
+use flextunnel_core::proxy::{reserved, RoutedSet, TunnelRoutes};
 use flextunnel_core::transport::paths::{ConnPathKind, ConnectionSnapshot, CustomRelayStatus};
 use iced::widget::{
     button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
@@ -19,7 +19,6 @@ use iced::widget::{
 };
 use iced::{Center, Color, Element, Fill, Font};
 use std::net::SocketAddr;
-use std::time::Instant;
 
 /// Advisory-badge cache: the `RoutedSet` rebuilt only when the pushed
 /// domains/CIDRs change (`None` inside means the set failed to parse).
@@ -844,24 +843,6 @@ fn routes_section(snapshot: &Snapshot) -> Element<'_, Message> {
             }
         }
     }
-    if !routes.agent_aliases.is_empty() {
-        col = col.push(space().height(8));
-        col = col.push(
-            text(format!(
-                "Agent routes — {} via agents:",
-                routes.agent_aliases.len()
-            ))
-            .size(12),
-        );
-        for (alias, state) in routes.agent_states(Instant::now()) {
-            let (label, color) = match state {
-                AgentConnState::Connected => ("connected", GREEN),
-                AgentConnState::Disconnected => ("disconnected", RED),
-                AgentConnState::Unknown => ("unknown", GRAY),
-            };
-            col = col.push(route_row(alias, Some(pill(label.to_string(), color))));
-        }
-    }
     // The reserved status host is always tunneled to the server, regardless of
     // the routed set — surface it so it's discoverable (and copyable).
     col = col.push(space().height(8));
@@ -1091,7 +1072,7 @@ fn indented_item<'a>(value: &str) -> Element<'a, Message> {
 }
 
 /// A monospace routing entry with a right-aligned Copy button. `trailing` is an
-/// optional badge (e.g. an agent's connection pill) shown before the button.
+/// optional badge shown before the button.
 fn route_row<'a>(value: String, trailing: Option<Element<'a, Message>>) -> Element<'a, Message> {
     let mut r = row![mono(value.clone())].spacing(8).align_y(Center);
     if let Some(trailing) = trailing {
@@ -1149,7 +1130,7 @@ fn mono<'a>(fragment: impl text::IntoFragment<'a>) -> Element<'a, Message> {
     text(fragment).size(12).font(Font::MONOSPACE).into()
 }
 
-/// Small tinted pill badge (forward state, phase, agent states).
+/// Small tinted pill badge (forward state, phase).
 fn pill(label: impl Into<String>, color: Color) -> Element<'static, Message> {
     container(text(label.into()).size(11).font(semibold()).color(color))
         .padding([2, 8])

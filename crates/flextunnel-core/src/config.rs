@@ -15,30 +15,15 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-/// One `[agent_routes]` reservation: an alias that resolves, server-side, to a
-/// connected **agent** (by its stable machine id) rather than to a host on the
-/// server's own network. When a client requests the alias, the server forwards
-/// the stream over the agent's live connection and the agent dials
-/// `127.0.0.1:<requested port>` on *its* network. Reverse routing is
-/// **loopback-only** in v1. See `proxy::agent` and `proxy::server`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRoute {
-    /// The agent's derived **network id** (`ftm1…`) — a one-way hash of its raw
-    /// OS machine id, matched as an opaque string. Get it by running
-    /// `flextunnel-agent machine-id` on the agent host. See [`crate::machine_id`].
-    pub machine_id: String,
-}
-
 /// One `[bridges.<name>]` entry: a split-tunnel route forwarding matching
 /// targets to **another flextunnel server** over a persistent server-to-server
 /// connection. The map key is a friendly label used in logs and status
 /// displays. Matched targets are forwarded verbatim — the target server
-/// applies its own routed set, host aliases, agent routes, and DNS forwards,
-/// and resolves domain targets on its side. Bridge rules must be covered by
-/// this server's routed set (validated at startup), since off-list targets are
-/// rejected before routing. Single hop: a stream that arrived over a bridge is
-/// never bridged again.
+/// applies its own routed set, host aliases, and DNS forwards, and resolves
+/// domain targets on its side. Bridge rules must be covered by this server's
+/// routed set (validated at startup), since off-list targets are rejected
+/// before routing. Single hop: a stream that arrived over a bridge is never
+/// bridged again.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
@@ -70,20 +55,6 @@ pub struct ServerConfig {
     pub auth_tokens: Option<Vec<String>>,
     /// File of accepted client auth tokens (one per line).
     pub auth_tokens_file: Option<PathBuf>,
-    /// Accepted agent auth tokens (inline list) — a separate pool from
-    /// `auth_tokens`, using the `fta` prefix.
-    pub agent_auth_tokens: Option<Vec<String>>,
-    /// File of accepted agent auth tokens (one per line).
-    pub agent_auth_tokens_file: Option<PathBuf>,
-    /// Reverse-routing reservations: an alias resolved to a connected **agent**
-    /// (by its derived network id) instead of to a host on the server's own
-    /// network. A requested hostname matching a key is forwarded over the agent's
-    /// live connection; the agent dials `127.0.0.1` on its own network, keeping
-    /// the requested port. A key is an exact host or a `*.suffix` wildcard
-    /// (subdomains only), the same syntax as `routed_domains`; an exact key beats
-    /// a wildcard and the most specific wildcard wins. Checked *before*
-    /// `host_aliases`; a name should appear in only one. See [`AgentRoute`].
-    pub agent_routes: Option<HashMap<String, AgentRoute>>,
     /// Custom relay URL(s) for failover.
     pub relay_urls: Option<Vec<String>>,
     /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
@@ -124,7 +95,7 @@ pub struct ServerConfig {
     /// valid `ftb` token from `bridge_auth_tokens`.
     pub allowed_bridge_servers: Option<Vec<String>>,
     /// Accepted bridge auth tokens (inline list) — a separate pool from client
-    /// and agent tokens, using the `ftb` prefix.
+    /// tokens, using the `ftb` prefix.
     pub bridge_auth_tokens: Option<Vec<String>>,
     /// File of accepted bridge auth tokens (one per line).
     pub bridge_auth_tokens_file: Option<PathBuf>,
@@ -165,29 +136,6 @@ pub struct ClientConfig {
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
 
-/// Agent config file schema. Every field is optional; CLI flags override these.
-/// Like the client but with no local listener (the agent serves reverse-routed
-/// streams the server opens back to it), so there is no `socks_port`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentConfig {
-    /// EndpointId of the server to connect to.
-    pub server_node_id: Option<String>,
-    /// Agent auth token to send to the server (an `fta` token).
-    pub auth_token: Option<String>,
-    /// File containing the agent auth token.
-    pub auth_token_file: Option<PathBuf>,
-    /// Custom relay URL(s) for failover.
-    pub relay_urls: Option<Vec<String>>,
-    /// Shared bearer token sent to every custom relay's WebSocket upgrade. Only
-    /// valid with custom `relay_urls`; rejected with the default iroh relays.
-    pub relay_auth_token: Option<String>,
-    /// Reconnect with backoff on a transient drop (default true).
-    pub auto_reconnect: Option<bool>,
-    /// Cap on reconnect attempts between successful connections.
-    pub max_reconnect_attempts: Option<NonZeroU32>,
-}
-
 /// Fully-resolved server settings (CLI > file > default), paths tilde-expanded.
 #[derive(Debug)]
 pub struct ResolvedServer {
@@ -195,11 +143,6 @@ pub struct ResolvedServer {
     pub secret: Option<String>,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
-    pub agent_auth_tokens: Vec<String>,
-    pub agent_auth_tokens_file: Option<PathBuf>,
-    /// Reverse-routing reservations, keys lowercased for case-insensitive
-    /// matching, mapping an alias to an agent's machine id. See [`AgentRoute`].
-    pub agent_routes: HashMap<String, String>,
     pub relay_urls: Vec<String>,
     /// Shared bearer token for custom relays (custom relays only).
     pub relay_auth_token: Option<String>,
@@ -233,18 +176,6 @@ pub struct ResolvedClient {
     pub name: Option<String>,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
-    pub auth_token: Option<String>,
-    pub auth_token_file: Option<PathBuf>,
-    pub relay_urls: Vec<String>,
-    /// Shared bearer token for custom relays (custom relays only).
-    pub relay_auth_token: Option<String>,
-    pub auto_reconnect: bool,
-    pub max_reconnect_attempts: Option<NonZeroU32>,
-}
-
-/// Fully-resolved agent settings (CLI > file > default), paths tilde-expanded.
-pub struct ResolvedAgent {
-    pub server_node_id: Option<String>,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
@@ -324,14 +255,6 @@ pub fn load_client_config(path: Option<&Path>) -> Result<Option<ClientConfig>> {
     }
 }
 
-/// Load the agent config file (explicit path or `--default-config`), or `None`.
-pub fn load_agent_config(path: Option<&Path>, default_config: bool) -> Result<Option<AgentConfig>> {
-    match resolve_config_path(path, default_config, "agent.toml")? {
-        Some(p) => Ok(Some(load_config(&p)?)),
-        None => Ok(None),
-    }
-}
-
 /// Merge CLI-provided values over file values over defaults for the server.
 ///
 /// `cli` carries the CLI flags as a `ServerConfig` (a field is `Some`/non-empty
@@ -355,12 +278,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
     } else {
         (file.auth_tokens, file.auth_tokens_file)
     };
-    let (agent_auth_tokens, agent_auth_tokens_file) =
-        if cli.agent_auth_tokens.is_some() || cli.agent_auth_tokens_file.is_some() {
-            (cli.agent_auth_tokens, cli.agent_auth_tokens_file)
-        } else {
-            (file.agent_auth_tokens, file.agent_auth_tokens_file)
-        };
     let (bridge_auth_tokens, bridge_auth_tokens_file) =
         if cli.bridge_auth_tokens.is_some() || cli.bridge_auth_tokens_file.is_some() {
             (cli.bridge_auth_tokens, cli.bridge_auth_tokens_file)
@@ -368,18 +285,10 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             (file.bridge_auth_tokens, file.bridge_auth_tokens_file)
         };
 
-    // File-only (no CLI flag). Lowercase keys so matching is case-insensitive
-    // against a lowercased requested host. Reject entries that collide only by
-    // case — silently dropping one would shadow a distinct reservation.
-    let agent_routes = collect_lowercased(
-        cli.agent_routes
-            .or(file.agent_routes)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, v.machine_id)),
-        "agent_routes",
-    )?;
-    // Same treatment for host aliases (DNS hostnames are case-insensitive).
+    // Host aliases are file-only (no CLI flag). Lowercase keys so matching is
+    // case-insensitive against a lowercased requested host (DNS hostnames are
+    // case-insensitive). Reject entries that collide only by case — silently
+    // dropping one would shadow a distinct alias.
     let host_aliases = collect_lowercased(
         cli.host_aliases.or(file.host_aliases).unwrap_or_default(),
         "host_aliases",
@@ -392,29 +301,16 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
     )?;
     // Alias keys are either an exact host or a `*.suffix` wildcard (same syntax
     // as the routed set); reject malformed patterns loudly at startup.
-    for key in agent_routes.keys() {
-        validate_alias_key(key, "agent_routes")?;
-    }
     for key in host_aliases.keys() {
         validate_alias_key(key, "host_aliases")?;
     }
-    // A name must not appear in both: agent_routes is checked first at request
-    // time, so an overlap would silently shadow the host alias.
-    for key in agent_routes.keys() {
-        if host_aliases.contains_key(key) {
-            anyhow::bail!(
-                "alias '{key}' is defined in both [agent_routes] and [host_aliases]; \
-                 a name may appear in only one"
-            );
-        }
-    }
     // The `flextunnel.internal` namespace is reserved by flextunnel itself (the
     // server serves a status page there); it can't be used as an alias name.
-    for key in agent_routes.keys().chain(host_aliases.keys()) {
+    for key in host_aliases.keys() {
         if crate::proxy::reserved::is_reserved_host(key) {
             anyhow::bail!(
                 "alias '{key}' uses the reserved flextunnel.internal namespace and \
-                 cannot be used as a [host_aliases] or [agent_routes] name"
+                 cannot be used as a [host_aliases] name"
             );
         }
     }
@@ -463,9 +359,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
         secret,
         auth_tokens: auth_tokens.unwrap_or_default(),
         auth_tokens_file: auth_tokens_file.map(|p| expand_tilde(&p)),
-        agent_auth_tokens: agent_auth_tokens.unwrap_or_default(),
-        agent_auth_tokens_file: agent_auth_tokens_file.map(|p| expand_tilde(&p)),
-        agent_routes,
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
         relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
         host_aliases,
@@ -490,13 +383,13 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
 /// normalize (ASCII-lowercase) to the same key. Aliases are matched
 /// case-insensitively, so a case-only duplicate would otherwise let one entry
 /// silently shadow the other.
-/// Validate one `[host_aliases]`/`[agent_routes]` key. A key is either an exact
-/// hostname or a `*.suffix` wildcard matching subdomains of `suffix` (the same
-/// syntax as `routed_domains`; resolved by `proxy::server::resolve_alias`). A
-/// bare `*` is rejected — an alias catch-all mapping every host to one target is
-/// almost certainly a misconfiguration — as are malformed patterns like
-/// `*.*.x`, `*..x`, or a `*` anywhere but a leading `*.`. Keys are already
-/// lowercased by [`collect_lowercased`].
+/// Validate one `[host_aliases]` key. A key is either an exact hostname or a
+/// `*.suffix` wildcard matching subdomains of `suffix` (the same syntax as
+/// `routed_domains`; resolved by `proxy::server::resolve_alias`). A bare `*` is
+/// rejected — an alias catch-all mapping every host to one target is almost
+/// certainly a misconfiguration — as are malformed patterns like `*.*.x`,
+/// `*..x`, or a `*` anywhere but a leading `*.`. Keys are already lowercased by
+/// [`collect_lowercased`].
 fn validate_alias_key(key: &str, what: &str) -> Result<()> {
     if let Some(suffix) = key.strip_prefix("*.") {
         if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
@@ -545,28 +438,6 @@ pub fn resolve_client(cli: ClientConfig, file: Option<ClientConfig>) -> Resolved
         // No defaults: each proxy front-end is off unless explicitly configured.
         socks_port: cli.socks_port.or(file.socks_port),
         http_port: cli.http_port.or(file.http_port),
-        auth_token,
-        auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
-        relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
-        relay_auth_token: cli.relay_auth_token.or(file.relay_auth_token),
-        auto_reconnect: cli.auto_reconnect.or(file.auto_reconnect).unwrap_or(true),
-        max_reconnect_attempts: cli.max_reconnect_attempts.or(file.max_reconnect_attempts),
-    }
-}
-
-/// Merge CLI-provided values over file values over defaults for the agent.
-pub fn resolve_agent(cli: AgentConfig, file: Option<AgentConfig>) -> ResolvedAgent {
-    let file = file.unwrap_or_default();
-
-    // Token group merged as a unit per source (see `resolve_server`).
-    let (auth_token, auth_token_file) = if cli.auth_token.is_some() || cli.auth_token_file.is_some() {
-        (cli.auth_token, cli.auth_token_file)
-    } else {
-        (file.auth_token, file.auth_token_file)
-    };
-
-    ResolvedAgent {
-        server_node_id: cli.server_node_id.or(file.server_node_id),
         auth_token,
         auth_token_file: auth_token_file.map(|p| expand_tilde(&p)),
         relay_urls: cli.relay_urls.or(file.relay_urls).unwrap_or_default(),
@@ -650,36 +521,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_routes_parsed_and_lowercased() {
-        let toml = r#"
-            agent_auth_tokens = ["ftaAAA"]
-
-            [agent_routes]
-            "Web.Internal" = { machine_id = "abc123def" }
-            "nas.internal" = { machine_id = "999888777" }
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
-        // Keys lowercased for case-insensitive matching; values are machine ids.
-        assert_eq!(r.agent_routes.get("web.internal").map(String::as_str), Some("abc123def"));
-        assert_eq!(r.agent_routes.get("nas.internal").map(String::as_str), Some("999888777"));
-        assert!(!r.agent_routes.contains_key("Web.Internal"));
-        assert_eq!(r.agent_auth_tokens, vec!["ftaAAA".to_string()]);
-    }
-
-    #[test]
-    fn agent_routes_case_only_duplicate_is_rejected() {
-        let toml = r#"
-            [agent_routes]
-            "Web.Internal" = { machine_id = "abc" }
-            "web.internal" = { machine_id = "def" }
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("agent_routes"), "{err}");
-    }
-
-    #[test]
     fn host_aliases_case_only_duplicate_is_rejected() {
         let toml = r#"
             [host_aliases]
@@ -700,10 +541,6 @@ mod tests {
             let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
             assert!(err.to_string().contains("reserved"), "{err}");
         }
-        let toml = "[agent_routes]\n\"flextunnel.internal\" = { machine_id = \"abc\" }\n";
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     #[test]
@@ -711,15 +548,11 @@ mod tests {
         let toml = r#"
             [host_aliases]
             "*.Web.Internal" = "10.0.0.1"
-
-            [agent_routes]
-            "*.Svc.Internal" = { machine_id = "abc" }
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         // The `*.` prefix survives lowercasing of the rest of the key.
         assert_eq!(r.host_aliases.get("*.web.internal").map(String::as_str), Some("10.0.0.1"));
-        assert_eq!(r.agent_routes.get("*.svc.internal").map(String::as_str), Some("abc"));
     }
 
     #[test]
@@ -737,11 +570,6 @@ mod tests {
             let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
             assert!(err.to_string().contains(table), "key {key:?}: {err}");
         }
-        // Same for agent_routes (value shape differs).
-        let toml = "[agent_routes]\n\"*.*.internal\" = { machine_id = \"abc\" }\n";
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("agent_routes"), "{err}");
     }
 
     #[test]
@@ -751,20 +579,6 @@ mod tests {
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err}");
-    }
-
-    #[test]
-    fn agent_route_and_host_alias_overlap_is_rejected() {
-        let toml = r#"
-            [agent_routes]
-            "shared.internal" = { machine_id = "abc" }
-
-            [host_aliases]
-            "Shared.Internal" = "127.0.0.1"
-        "#;
-        let file: ServerConfig = toml::from_str(toml).unwrap();
-        let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-        assert!(err.to_string().contains("both"), "{err}");
     }
 
     #[test]
@@ -934,8 +748,6 @@ mod tests {
             secret = "<base64 key>"
             auth_tokens = ["ftcAAA"]
             auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
-            agent_auth_tokens = ["ftaAAA"]
-            agent_auth_tokens_file = "/etc/flextunnel/agent_auth_tokens.txt"
             relay_urls = ["https://relay.example"]
             allowed_bridge_servers = ["<endpoint id>"]
             bridge_auth_tokens = ["ftbAAA"]
@@ -945,9 +757,6 @@ mod tests {
 
             [host_aliases]
             "server.internal" = "127.0.0.1"
-
-            [agent_routes]
-            "web.internal" = { machine_id = "ftm1x" }
 
             [dns_forwards]
             "corp.example.com" = ["10.1.0.10:5353"]

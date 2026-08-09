@@ -118,12 +118,6 @@ enum ServerAction {
         /// File of accepted client auth tokens (one per line).
         #[arg(long)]
         auth_tokens_file: Option<PathBuf>,
-        /// Accepted agent auth token (repeatable). Separate pool from clients.
-        #[arg(long = "agent-auth-token")]
-        agent_auth_tokens: Vec<String>,
-        /// File of accepted agent auth tokens (one per line).
-        #[arg(long)]
-        agent_auth_tokens_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -136,7 +130,7 @@ enum ServerAction {
         #[arg(
             long,
             conflicts_with_all = ["config", "default_config", "secret_file", "auth_tokens",
-                "auth_tokens_file", "agent_auth_tokens", "agent_auth_tokens_file"]
+                "auth_tokens_file"]
         )]
         quick: bool,
     },
@@ -458,8 +452,6 @@ async fn run_async(command: Command) -> Result<()> {
                     secret_file,
                     auth_tokens,
                     auth_tokens_file,
-                    agent_auth_tokens,
-                    agent_auth_tokens_file,
                     relay_urls,
                     relay_auth_token,
                     quick,
@@ -482,9 +474,6 @@ async fn run_async(command: Command) -> Result<()> {
                 secret: None, // no inline-secret CLI flag; config file only
                 auth_tokens: (!auth_tokens.is_empty()).then_some(auth_tokens),
                 auth_tokens_file,
-                agent_auth_tokens: (!agent_auth_tokens.is_empty()).then_some(agent_auth_tokens),
-                agent_auth_tokens_file,
-                agent_routes: None, // config-file only; no CLI flag
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
                 host_aliases: None, // config-file only; no CLI flag
@@ -649,34 +638,6 @@ async fn run_server(
     }
     log::info!("Loaded {} client authentication token(s)", valid_tokens.len());
 
-    // Agent tokens are optional (a server may run no reverse routes). Loaded from
-    // a separate pool with the `fta` prefix so a client token can't act as an agent.
-    let agent_valid_tokens = auth::load_auth_tokens(
-        &r.agent_auth_tokens,
-        r.agent_auth_tokens_file.as_deref(),
-        auth::AGENT_TOKEN_PREFIX,
-    )
-    .context("Failed to load agent authentication tokens")?;
-    if !agent_valid_tokens.is_empty() {
-        log::info!("Loaded {} agent authentication token(s)", agent_valid_tokens.len());
-    }
-    if !r.agent_routes.is_empty() {
-        // Reverse routes forward to agents, which must authenticate with an agent
-        // token. Routes with no agent token are unusable dead config — fail loudly
-        // rather than start with reverse routes no agent can ever serve.
-        if agent_valid_tokens.is_empty() {
-            anyhow::bail!(
-                "{} agent route(s) are configured but no agent authentication token was \
-                 provided, so no agent can connect to serve them.\n\
-                 Add at least one agent token (--agent-auth-token <TOKEN>, \
-                 --agent-auth-tokens-file <FILE>, or agent_auth_tokens/agent_auth_tokens_file \
-                 in the config), or remove the agent_routes.",
-                r.agent_routes.len()
-            );
-        }
-        log::info!("Loaded {} agent route(s)", r.agent_routes.len());
-    }
-
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
     let own_id = secret_to_endpoint_id(&secret_key);
 
@@ -718,7 +679,7 @@ async fn run_server(
 
     // Inbound bridging: parse the allowlist and load the `ftb` token pool. Both
     // gates are required for a bridge to connect, so either half alone is dead
-    // config — fail loudly (pattern of the agent-routes guard above).
+    // config — fail loudly.
     let bridge_valid_tokens = auth::load_auth_tokens(
         &r.bridge_auth_tokens,
         r.bridge_auth_tokens_file.as_deref(),
@@ -848,10 +809,8 @@ async fn run_server(
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         valid_tokens,
-        agent_valid_tokens,
         bridge_valid_tokens,
         allowed_bridge_servers,
-        agent_routes: r.agent_routes,
         host_aliases: r.host_aliases,
         routed_set,
         routed_domains: r.routed_domains,

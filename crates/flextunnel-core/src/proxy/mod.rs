@@ -1,7 +1,6 @@
-//! The proxy over QUIC: signaling, SOCKS5 and HTTP front-ends, client, server,
-//! and agent.
+//! The proxy over QUIC: signaling, SOCKS5 and HTTP front-ends, client, and
+//! server.
 
-pub mod agent;
 pub mod bridge;
 pub mod client;
 pub mod dial;
@@ -18,9 +17,8 @@ pub mod status_page;
 #[cfg(test)]
 mod e2e_tests;
 
-pub use agent::{AgentConfig, ProxyAgent};
 pub use bridge::{BridgeUpstream, BridgeUpstreamConfig};
-pub use client::{AgentAlias, AgentConnState, ClientConfig, ProxyClient, ServerForwarder, TunnelRoutes};
+pub use client::{ClientConfig, ProxyClient, ServerForwarder, TunnelRoutes};
 pub use dns_forward::DnsForwarder;
 pub use forward::{ForwardManager, ForwardSpec, ForwardState, ForwardStatus};
 pub use routed_set::RoutedSet;

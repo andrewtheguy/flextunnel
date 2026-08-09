@@ -26,7 +26,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --exclude flextunnel-desktop --all-targets -- -D warnings
       - name: Test
-        run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-agent
+        run: cargo test -p flextunnel-core -p flextunnel-cli
 
   # The host clippy compiles flextunnel-desktop's macOS backend (tray + keychain),
   # which Linux CI never type-checks.
@@ -38,7 +38,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
+        run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop
 
   # Verify-only mirror of the release workflow's build-ios job: build the iOS
   # device + Simulator xcframework slices (debug profile for speed). Nothing is
@@ -61,4 +61,4 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-agent -p flextunnel-desktop
+        run: cargo test -p flextunnel-core -p flextunnel-cli -p flextunnel-desktop

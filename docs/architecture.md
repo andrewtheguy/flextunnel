@@ -39,8 +39,8 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`), agent (`fta`), and bridge (`ftb`) prefixes |
-| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids, duplicate agent machine ids, + the server's own conflicted id |
+| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`) and bridge (`ftb`) prefixes |
+| `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
@@ -51,15 +51,14 @@ server.
 | `proxy/client.rs` | connect + auth + SOCKS5/HTTP listeners + split-tunnel routing + reconnect loop |
 | `proxy/http.rs` | client-side HTTP proxy front-end: `CONNECT` tunneling + absolute-URI plain-HTTP forwarding |
 | `proxy/routed_set.rs` | parsed tunnel set: client split-tunnel decision + server whitelist enforcement |
-| `proxy/server.rs` | accept + auth + routed-set whitelist + per-stream DNS/connect/pipe; status page; agent registry + reverse routing |
-| `proxy/agent.rs` | reverse-routing exit point: dial + auth (`role=Agent`, derived network id) + accept server-opened streams + dial loopback |
+| `proxy/server.rs` | accept + auth + routed-set whitelist + per-stream DNS/connect/pipe; status page |
 | `proxy/bridge.rs` | outbound server-to-server bridge: persistent upstream connection (`role=Bridge`, `ftb` token) with retry-forever reconnect; matching streams splice over it |
-| `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the shared server/agent exit-point body) |
+| `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the server's exit-point body) |
 
 **Bridges** split-tunnel *across servers*: a `[bridges.<name>]` entry on server A
 forwards targets matching its domain/CIDR rules verbatim over a persistent
 connection to server B, which re-enforces its own routed set, applies its own
-aliases/agent routes/DNS forwards, and dials from its network. A dials out on its
+aliases/DNS forwards, and dials from its network. A dials out on its
 own server endpoint, so the TLS-authenticated id it presents is its persistent
 server id — which B must list in `allowed_bridge_servers` in addition to
 validating the `ftb` token (both gates required; empty allowlist = inbound
@@ -67,21 +66,6 @@ bridging disabled). Bridged-in streams are served like client streams but are
 never re-bridged (single hop, so mutual bridges cannot loop). Bridge rules must
 be reachable through A's routed set (validated at startup, like `dns_forwards`
 coverage).
-
-The reverse-routing agent ships as a **separate binary crate** (`flextunnel-agent`,
-Linux/macOS/Windows, not in the module map above): it reads the OS-native machine
-id (via the `machine-uid` crate — `/etc/machine-id`, `IOPlatformUUID`, or
-`MachineGuid`), derives a one-way, versioned **network id** from it
-(`machine_id::network_machine_id` → `ftm1…`) so the raw id never leaves the host,
-holds a machine-wide single-instance lock, and drives `proxy::agent::ProxyAgent`
-over an ephemeral `create_client_endpoint`. `flextunnel-agent machine-id` prints
-the raw id and its derived network id locally.
-
-The agent's one-per-machine guarantee is a **loopback-UDP singleton**
-(`udp_lock::UdpInstanceLock`): it exclusively binds a fixed `127.0.0.1` UDP port,
-which is machine-wide by nature and needs no filesystem and no root, working
-identically on Linux/macOS/Windows. This contrasts with the per-user server,
-whose single-instance guarantee is a file lock under `~/.config/flextunnel/`.
 
 ## Connection lifecycle
 
@@ -92,18 +76,16 @@ secret: both peers must offer the same ALPN or negotiation fails. Access control
 is enforced by the auth handshake below, not by the ALPN.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 8`. On the first bi-stream the
+The protocol version is `PROTOCOL_VERSION = 9`. On the first bi-stream the
 connecting peer sends
-`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role, machine_id }`
+`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role }`
 and the server replies
-`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, agent_aliases, connected_agents, dns_forwards, bridges }`,
+`HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, dns_forwards, bridges }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
-checks the token against the role's accepted set (`ftc` client, `fta` agent, or
-`ftb` bridge tokens). Clients send `role = Client` with no machine id; agents send
-`role = Agent` plus their derived network id (`ftm1…`, the hashed machine id — the
-raw id never goes on the wire); bridging servers send `role = Bridge` with no
-machine id (their persistent iroh id is TLS-authenticated and checked against the
+checks the token against the role's accepted set (`ftc` client or `ftb` bridge
+tokens). Clients send `role = Client`; bridging servers send `role = Bridge`
+(their persistent iroh id is TLS-authenticated and checked against the
 `allowed_bridge_servers` allowlist). On rejection it closes the
 connection gracefully (with a short drain) carrying the reason. `Hello`'s
 `Debug` impl redacts `auth_token`.
@@ -139,8 +121,8 @@ length; domains ≤ 255 bytes).
 
 ### 4. Server-side resolve + connect
 The server reads the requested `Target`, enforces the routed-set whitelist on
-that requested target, handles reserved `flextunnel.internal` status routes and
-agent routes, then (bounded by `CONNECT_TIMEOUT` = 10s in `proxy/dial.rs`) either
+that requested target, handles reserved `flextunnel.internal` status routes,
+then (bounded by `CONNECT_TIMEOUT` = 10s in `proxy/dial.rs`) either
 `TcpStream::connect`s a literal address or, for a domain, calls
 `tokio::net::lookup_host` and connects to the first address that accepts.
 **DNS happens on the server** for tunneled domain targets, which is what lets
@@ -185,20 +167,6 @@ nonce and is ignored). On confirmation the server tears down the offending
 connections and records the node id in the persisted blocklist (`blocklist.rs`);
 a blocklisted node id is rejected up-front. Because ephemeral ids never recur,
 the persisted client entry is largely an audit record.
-
-**Duplicate agent (server-side).** An agent's iroh id is ephemeral and irrelevant
-to its identity — it is identified by its stable **network id** (`ftm1…`), a
-one-way, versioned hash of its OS-native machine id (`/etc/machine-id` on Linux,
-`IOPlatformUUID` on macOS, `MachineGuid` on Windows) that the agent derives so the
-raw id never reaches the server. The `flextunnel-agent` binary's loopback-UDP
-singleton already guarantees one agent *process* per machine. The server tracks
-one active connection per network id and uses the agent's instance nonce to
-distinguish a benign same-process reconnect (same nonce, supersedes the stale
-connection) from a genuine duplicate (different nonce, e.g. a cloned VM image
-whose machine id was never regenerated). On that collision the server tears both
-down and records the network id in the blocklist (`blocked_agents`). Because the
-network id is stable (unlike an ephemeral client id), that block keeps rejecting
-the id until the operator fixes the duplicate and clears the entry.
 
 **Duplicate server (self-block).** Server identity is persistent, so two servers
 sharing one secret key is a plausible misconfiguration — but only observable when
@@ -269,7 +237,7 @@ servers started with the same identity, blocking the conflicted id and refusing 
 self-blocked server's restart. These are guard rails for operators, not adversary
 defenses.
 
-- **Bearer tokens:** client (`ftc`), agent (`fta`), and bridge (`ftb`) auth
+- **Bearer tokens:** client (`ftc`) and bridge (`ftb`) auth
   tokens are separate CRC16-checksummed Base64URL credential pools checked in the
   handshake. The QUIC ALPN (`flextunnel/1`) is a fixed protocol identifier, not
   a credential. All payload is encrypted by QUIC/TLS 1.3.
@@ -293,17 +261,17 @@ defenses.
 | `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
 | `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
-| `CONNECT_TIMEOUT` (client/agent server connect) | 30s | `proxy/client.rs` |
-| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/agent.rs` |
+| `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
+| `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/bridge.rs` |
 | `LOCAL_HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs` |
 | `TUNNEL_OPEN_TIMEOUT` | 30s | `proxy/client.rs` |
-| `CONNECT_TIMEOUT` (server/agent dial) | 10s | `proxy/dial.rs` |
+| `CONNECT_TIMEOUT` (server dial) | 10s | `proxy/dial.rs` |
 | `MAX_CONCURRENT_CONNECTIONS` | 1024 | `proxy/server.rs` |
 | reconnect backoff | 1s → 60s + ≤500ms jitter | `proxy/client.rs` |
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
-| `PROTOCOL_VERSION` | 8 | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 9 | `proxy/signaling.rs` |
 | auth token length | 49 chars | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 
@@ -319,12 +287,6 @@ secret-key identity, but replaces the IP-over-QUIC-datagrams + TUN data path
 HTTP proxy support is implemented on the client side; the wire protocol and
 server remain front-end-agnostic. See
 [`http-proxy-roadmap.md`](./http-proxy-roadmap.md).
-
-Reverse routing is loopback-only in v1. A follow-up will let one agent (machine
-id) expose several hostnames each mapped to a chosen host/IP on the agent's own
-network (an `agent_ip` target, default `127.0.0.1`); the server already rewrites
-the routed target before opening the agent stream, so this is a server-side
-config + rewrite change with no agent-side protocol change.
 
 Future work on duplicate-id detection — non-ephemeral client ids and their
 pitfalls, the signaling-server path for prompt server-dup detection, and

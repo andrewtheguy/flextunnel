@@ -1984,20 +1984,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "flextunnel-agent"
-version = "0.0.60"
-dependencies = [
- "anyhow",
- "clap",
- "flextunnel-core",
- "log",
- "machine-uid",
- "tokio",
-]
-
-[[package]]
 name = "flextunnel-cli"
-version = "0.0.60"
+version = "0.0.61"
 dependencies = [
  "anyhow",
  "clap",
@@ -2013,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.60"
+version = "0.0.61"
 dependencies = [
  "anyhow",
  "askama",
@@ -2043,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.60"
+version = "0.0.61"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -2070,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.60"
+version = "0.0.61"
 dependencies = [
  "flextunnel-core",
  "iroh",
@@ -4009,17 +3997,6 @@ checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
  "nix",
  "winapi",
-]
-
-[[package]]
-name = "machine-uid"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe0d6336d341b10ae80e099b8f3c59f34bf8aef66ef25e83aa98bf2955c0ae7"
-dependencies = [
- "libc",
- "windows-registry",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
