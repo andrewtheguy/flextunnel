@@ -3,19 +3,13 @@
 //! The blocklist is a small JSON file (default
 //! `~/.config/flextunnel/blocklist.json`) that records identities involved in a
 //! **duplicate-id conflict** — a guard rail against accidental misconfiguration
-//! (see `docs/architecture.md`, "Security model"). It holds three kinds of entry:
+//! (see `docs/architecture.md`, "Security model"). It holds two kinds of entry:
 //!
 //! * **`blocked_clients`** — iroh node ids the server saw as a *confirmed
 //!   duplicate client* (two live processes presenting the same node id). Because
 //!   client ids are ephemeral (a fresh key per process), such an id never
 //!   recurs, so these entries are mostly an **audit record**; they are still
 //!   rejected up-front if seen again.
-//! * **`blocked_agents`** — agent **network ids** (`ftm1…`, the hashed machine
-//!   id — see [`crate::machine_id`]) the server saw as a *confirmed duplicate
-//!   agent* (two concurrent connections presenting the same network id — e.g. a
-//!   cloned VM image whose underlying machine id was never regenerated). Unlike
-//!   client ids it is **stable**, so a listed id keeps being rejected up-front
-//!   until the operator fixes the duplicate machine id and clears the entry.
 //! * **`conflicted_server_ids`** — the server's *own* `EndpointId` when it
 //!   detects it is a duplicate of another server sharing its secret key. On the
 //!   next launch the server refuses to start if its id is listed here, forcing an
@@ -33,8 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// One blocklist entry: an identity plus why/when it was recorded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockEntry {
-    /// Canonical identifier: an iroh `EndpointId` for clients/servers, or an
-    /// `ftm1…` network id for agents.
+    /// Canonical identifier: an iroh `EndpointId`.
     pub id: String,
     /// Human-readable reason the id was blocked (for the operator).
     pub reason: String,
@@ -47,7 +40,6 @@ pub struct BlockEntry {
 #[serde(default)]
 struct BlockListData {
     blocked_clients: Vec<BlockEntry>,
-    blocked_agents: Vec<BlockEntry>,
     conflicted_server_ids: Vec<BlockEntry>,
 }
 
@@ -110,11 +102,6 @@ impl BlockList {
         self.data.blocked_clients.len()
     }
 
-    /// Number of blocked agent ids.
-    pub fn blocked_agent_count(&self) -> usize {
-        self.data.blocked_agents.len()
-    }
-
     /// Number of recorded conflicted (self-blocked) server ids.
     pub fn conflicted_server_count(&self) -> usize {
         self.data.conflicted_server_ids.len()
@@ -123,11 +110,6 @@ impl BlockList {
     /// Whether a client node id is blocked.
     pub fn is_client_blocked(&self, id: &str) -> bool {
         self.data.blocked_clients.iter().any(|e| e.id == id)
-    }
-
-    /// Whether an agent machine id is blocked.
-    pub fn is_agent_blocked(&self, id: &str) -> bool {
-        self.data.blocked_agents.iter().any(|e| e.id == id)
     }
 
     /// Whether a server id is recorded as conflicted (self-block on startup).
@@ -142,20 +124,6 @@ impl BlockList {
             return false;
         }
         self.data.blocked_clients.push(BlockEntry {
-            id: id.to_string(),
-            reason: reason.into(),
-            detected_at_ms: now_ms(),
-        });
-        true
-    }
-
-    /// Record a confirmed duplicate agent machine id. Returns `true` if newly
-    /// added (a caller should persist only when something changed).
-    pub fn add_blocked_agent(&mut self, id: &str, reason: impl Into<String>) -> bool {
-        if self.is_agent_blocked(id) {
-            return false;
-        }
-        self.data.blocked_agents.push(BlockEntry {
             id: id.to_string(),
             reason: reason.into(),
             detected_at_ms: now_ms(),
@@ -232,7 +200,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let bl = BlockList::load(path).unwrap();
         assert!(!bl.is_client_blocked("anything"));
-        assert!(!bl.is_agent_blocked("anything"));
         assert!(!bl.is_server_conflicted("anything"));
     }
 
@@ -243,21 +210,15 @@ mod tests {
 
         let mut bl = BlockList::load(path.clone()).unwrap();
         assert!(bl.add_blocked_client("client-node-id", "duplicate client"));
-        assert!(bl.add_blocked_agent("agent-machine-id", "duplicate agent"));
         assert!(bl.add_conflicted_server("server-endpoint-id", "duplicate server"));
         // Idempotent: a repeat is not re-added.
         assert!(!bl.add_blocked_client("client-node-id", "again"));
-        assert!(!bl.add_blocked_agent("agent-machine-id", "again"));
         write_atomic(bl.path(), &bl.to_json().unwrap()).unwrap();
 
         let reloaded = BlockList::load(path.clone()).unwrap();
         assert!(reloaded.is_client_blocked("client-node-id"));
-        assert!(reloaded.is_agent_blocked("agent-machine-id"));
         assert!(reloaded.is_server_conflicted("server-endpoint-id"));
         assert!(!reloaded.is_client_blocked("other"));
-        // Agent and client pools are independent.
-        assert!(!reloaded.is_agent_blocked("client-node-id"));
-        assert!(!reloaded.is_client_blocked("agent-machine-id"));
 
         let _ = std::fs::remove_file(&path);
     }

@@ -18,10 +18,6 @@ dns_forwards:
 {% if tpl.dns_forwards.is_empty() %}  none configured
 {% else %}{% for (suffix, servers) in tpl.dns_forwards %}  - {{ suffix }} (+ subdomains) -> {{ servers|join(", ") }}
 {% endfor %}{% endif %}
-agent_routes:
-{% if tpl.agent_routes.is_empty() %}  none configured
-{% else %}{% for route in tpl.agent_routes %}  - {{ route.name }} -> {{ route.machine_id }} ({% if route.connected %}connected{% else %}disconnected{% endif %})
-{% endfor %}{% endif %}
 bridges:
 {% if tpl.bridges.is_empty() %}  none configured
 {% else %}{% for bridge in tpl.bridges %}  {{ bridge.name }}:
@@ -39,5 +35,4 @@ allowed_bridge_servers:
 duplicate_id_blocklist:
   file: {{ tpl.blocklist_path }}
   blocked_clients: {{ tpl.blocked_client_count }}
-  blocked_agents: {{ tpl.blocked_agent_count }}
   conflicted_servers: {{ tpl.conflicted_server_count }}{{ "\n" }}

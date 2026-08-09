@@ -5,7 +5,7 @@
 //! persistent server id — exactly what the target server's
 //! `allowed_bridge_servers` allowlist matches, alongside the `ftb` token.
 //!
-//! The connect/auth/heartbeat machinery mirrors [`super::agent`], with one
+//! The connect/auth/heartbeat machinery mirrors [`super::client`], with one
 //! deliberate difference in reconnect policy: a bridge retries **forever** (no
 //! fail-fast first connect, no attempt cap). The peer server may simply not be
 //! up yet, and a server daemon must not exit — or stop serving its other
@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-/// Deadline for the target server's handshake response (mirrors client/agent).
+/// Deadline for the target server's handshake response (mirrors the client's).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolved config for one outbound bridge (from a `[bridges.<name>]` entry),
@@ -144,7 +144,7 @@ impl BridgeUpstream {
             // Log the selected path (relay/direct) and any later switch for the
             // lifetime of this connection.
             let _path_watcher = crate::transport::paths::watch_connection_paths(&connection);
-            let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv, None);
+            let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv);
             let ended: ProxyResult<()> = tokio::select! {
                 r = heartbeat => r,
                 reason = connection.closed() => {

@@ -105,7 +105,6 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * Snapshot the tunnel's current forwarding set as JSON into out_buf:
  *   {"connected":true,"domains":["*.example.com"],"cidrs":["10.0.0.0/8"],
  *    "host_aliases":[["nas.internal","192.168.1.9"]],
- *    "agent_aliases":[{"name":"workstation.internal","status":"connected"}],
  *    "dns_forwards":[{"suffix":"corp.example.com","servers":["10.1.0.10:5353"]}],
  *    "bridges":[{"name":"lab","endpoint_id":"…","domains":["*.svc"],"cidrs":["fd34::/64"]}]}
  * This is the split-tunnel set the server pushes during the handshake — the
@@ -116,12 +115,8 @@ int flextunnel_health(const FlextunnelHandle *handle);
  * not need to enforce the split itself. Before the first successful handshake,
  * connected is false and the lists are empty. The set becomes available shortly
  * after start once the handshake completes, so poll it. host_aliases ([alias,
- * target] pairs) and
- * agent_aliases are informational, for display only — the server resolves both
- * itself. Each agent_aliases entry is {"name","status"} where status is
- * "connected", "disconnected", or "unknown"; it rides the heartbeat control
- * stream (refreshed every ~10s) and reads "unknown" before the first update,
- * while the tunnel is down, or when the view has gone stale. dns_forwards is the
+ * target] pairs) is informational, for display only — the server resolves the
+ * aliases itself. dns_forwards is the
  * server's conditional DNS-forwarding table, also informational: each entry is
  * {"suffix","servers"} — names under suffix resolve via servers instead of the
  * server's system resolver. Empty when none are configured. bridges is the

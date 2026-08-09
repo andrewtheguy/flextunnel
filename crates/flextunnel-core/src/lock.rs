@@ -1,4 +1,4 @@
-//! Advisory single-instance file lock, shared by the server and agent binaries.
+//! Advisory single-instance file lock for the server binary.
 //!
 //! Uses std's native advisory file locking ([`std::fs::File::try_lock`], stable
 //! since Rust 1.89) — no external crate. The lock is held for the process
@@ -6,10 +6,8 @@
 //! (the OS drops the advisory lock when the fd closes), so a stale lock file
 //! never wedges a restart.
 //!
-//! This module owns only the mechanics; each binary chooses the *scope* by
+//! This module owns only the mechanics; the caller chooses the *scope* by
 //! passing the lock path. The server uses a per-user path (one server per user).
-//! (The agent's one-per-machine guarantee instead uses a loopback-UDP singleton —
-//! see [`crate::udp_lock`] — so it needs no root-writable lock path.)
 //!
 //! # Alternative mechanisms (if the file lock ever becomes inconvenient)
 //!
@@ -24,14 +22,14 @@
 //!
 //! | OS          | Cleanest native choice                                    |
 //! |-------------|-----------------------------------------------------------|
-//! | Linux       | abstract-namespace Unix socket (`\0flextunnel-agent`) —   |
+//! | Linux       | abstract-namespace Unix socket (`\0flextunnel`) —         |
 //! |             | no filesystem entry, no stale socket file, machine-wide.  |
 //! | macOS / BSD | loopback UDP port (`127.0.0.1:N`); UDP dodges TCP         |
 //! |             | `TIME_WAIT`. Or, for a launchd-managed daemon, rely on    |
 //! |             | launchd's own single-instance-per-job guarantee and skip  |
 //! |             | the lock entirely. (No abstract UDS on macOS; a Mach       |
 //! |             | bootstrap port is the true analog but needs Mach FFI.)    |
-//! | Windows     | named mutex (`Global\flextunnel-agent`) or loopback UDP.  |
+//! | Windows     | named mutex (`Global\flextunnel`) or loopback UDP.        |
 //!
 //! A single portable option across all three is **loopback UDP on a fixed high
 //! port**: no filesystem at all, machine-wide by nature, auto-released. Its only

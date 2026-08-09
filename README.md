@@ -70,7 +70,7 @@ All payload is end-to-end encrypted by QUIC/TLS 1.3.
 
 Prebuilt release assets are published on the
 [GitHub Releases](https://github.com/flexaccessdev/flextunnel/releases) page.
-Stable releases include `flextunnel` and `flextunnel-agent` for Linux
+Stable releases include `flextunnel` for Linux
 amd64/arm64, macOS arm64, and Windows amd64, plus the iOS xcframework asset.
 Automated prereleases currently include Linux amd64/arm64, macOS arm64, and the
 iOS xcframework, but skip Windows. The install scripts download the latest
@@ -90,18 +90,6 @@ curl -sSL https://flexaccessdev.github.io/flextunnel/install.sh | bash
 
 ```powershell
 irm https://flexaccessdev.github.io/flextunnel/install.ps1 | iex
-```
-
-**`flextunnel-agent` (reverse-routing agent) — Linux / macOS:**
-
-```sh
-curl -sSL https://flexaccessdev.github.io/flextunnel/install-agent.sh | bash
-```
-
-**`flextunnel-agent` (reverse-routing agent) — Windows (PowerShell):**
-
-```powershell
-irm https://flexaccessdev.github.io/flextunnel/install-agent.ps1 | iex
 ```
 
 Options: append `-s -- --prerelease` (bash) for the latest prerelease, a release
@@ -192,13 +180,13 @@ Properties → **Unblock**). Otherwise click **More info → Run anyway**.
 
 ```sh
 cargo build --release
-# binaries: target/release/flextunnel, target/release/flextunnel-agent
+# binary: target/release/flextunnel
 ```
 
 Requires a recent Rust toolchain (edition 2024). A bare `cargo build --release`
-uses the workspace's default members and builds the CLI and the agent, but not
+uses the workspace's default members and builds the CLI, but not
 the iOS static library. To cross-build the CLI for Linux amd64 + arm64 via
-Docker, use `./build-linux.sh`; the script does not build the agent.
+Docker, use `./build-linux.sh`.
 
 ## Quick start
 
@@ -314,7 +302,7 @@ curl -sS -x http://127.0.0.1:8081 http://flextunnel.internal/status.json
 ```
 
 The JSON response includes `version`, `server_node_id`, `routed_domains`,
-`routed_cidrs`, `host_aliases`, `dns_forwards`, `agent_routes`, `bridges`,
+`routed_cidrs`, `host_aliases`, `dns_forwards`, `bridges`,
 `inbound_bridges`, and duplicate-id blocklist counts under
 `duplicate_id_blocklist`.
 
@@ -360,10 +348,6 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
 | `generate-bridge-token [-c N]` | Generate N bridge auth tokens (prefix `ftb`). |
 
-The reverse-routing **agent** is a separate binary, `flextunnel-agent`
-(subcommands `run`, `generate-token`, and `machine-id`) — see
-[Reverse-routing agent](#reverse-routing-agent) below.
-
 ### `server start`
 
 | Flag | Description |
@@ -373,9 +357,7 @@ The reverse-routing **agent** is a separate binary, `flextunnel-agent`
 | `--secret-file <FILE>` | Server identity key. |
 | `--auth-token <TOKEN>` | Accepted client token (repeatable). |
 | `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
-| `--agent-auth-token <TOKEN>` | Accepted agent token (repeatable). Separate pool from clients. |
-| `--agent-auth-tokens-file <FILE>` | File of accepted agent tokens, one per line. |
-| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients and agents reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
+| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
 
@@ -428,8 +410,8 @@ Attaches a terminal control panel to the **running** client for a profile,
 over its control socket (`~/.config/flextunnel/client-<server id prefix>.sock`;
 a named pipe on Windows). It shows live status — connection phase and uptime,
 server/client node ids, connection paths (direct/relay), and the server-pushed
-routing breakdown (split-tunnel rules, host aliases, DNS forwards, bridge and
-agent routes) — plus an editable **port forwards** table: add/edit/delete
+routing breakdown (split-tunnel rules, host aliases, DNS forwards, and bridge
+routes) — plus an editable **port forwards** table: add/edit/delete
 forwards and toggle them on/off (`space`), live.
 
 Forwards open server-direct streams on the authenticated connection (the
@@ -472,7 +454,7 @@ auth_token     = "ftc…"        # or: auth_token_file = "~/.config/flextunnel/t
 Secrets may be inline (as above) or kept in separate files via the `*_file`
 keys. CLI flags still work and override any of these.
 
-Server-only routing keys include `host_aliases`, `agent_routes`,
+Server-only routing keys include `host_aliases`,
 `dns_forwards`, outbound `[bridges.<name>]`, inbound `allowed_bridge_servers`,
 and `bridge_auth_tokens` / `bridge_auth_tokens_file`; these are config-file only
 because they describe the server's routing policy.
@@ -499,58 +481,6 @@ This is also the clean way around Firefox refusing to proxy literal
 browse to `http://server.internal:8000/`. Use `socks5h://` (or set Firefox's
 `network.proxy.socks_remote_dns = true`) so the name is resolved by the server,
 not locally.
-
-## Reverse-routing agent
-
-Where a `[host_aliases]` entry resolves to a host on the **server's** network, an
-`[agent_routes]` entry resolves to a connected **agent** — a `flextunnel-agent`
-process on some other machine. The agent dials the server (like a client) but runs
-no SOCKS5 listener; instead it accepts the streams the server opens back to it and
-connects each to `127.0.0.1` on its own machine. This lets a client reach a service
-behind NAT that the server cannot dial directly: the agent makes the outbound
-connection, and the server pushes streams back over it. Reverse routing is
-**loopback-only** in v1.
-
-The agent is a **separate binary** (`flextunnel-agent`, for Linux, macOS, and
-Windows) and identifies itself by a stable **network id** (`ftm1…`) — a one-way
-hash, with a version prefix, of its OS-native machine id (`/etc/machine-id` on
-Linux, `IOPlatformUUID` on macOS, `MachineGuid` on Windows; no elevation needed).
-The raw machine id never leaves the host; only the network id is sent. Its iroh
-node id is ephemeral, so there is no key file to manage. Only one agent runs per
-machine (enforced by a machine-wide loopback-UDP singleton lock, so no elevated
-privileges are needed). It authenticates with its **own** token pool
-(prefix `fta`, separate from client `ftc` tokens).
-
-```sh
-# On the agent host: get this agent's network id to reserve on the server.
-flextunnel-agent machine-id              # -> shows the raw id + derived ftm1… id
-# On the server host: generate an agent token (add to agent_auth_tokens).
-flextunnel-agent generate-token          # -> fta…
-```
-
-```toml
-# server.toml
-agent_auth_tokens = ["fta…"]
-routed_domains    = ["web.internal", "*.example.com"]   # the alias must be on the routed set
-
-[agent_routes]
-"web.internal" = { machine_id = "ftm1…" }   # from `flextunnel-agent machine-id`
-```
-
-```sh
-# On the agent host (Linux/macOS/Windows):
-flextunnel-agent run --server-node-id <server id> --auth-token fta…
-# then from a client: curl -x socks5h://127.0.0.1:1080 http://web.internal:8000/
-```
-
-A second agent presenting the **same** network id (e.g. a cloned VM image whose
-machine id was never regenerated) is rejected and the network id is recorded
-in the blocklist — fix the duplicate id and clear the entry to recover. See
-[`agent.toml.example`](agent.toml.example).
-
-To run the agent as a Windows service (starting at boot, before any
-interactive logon — e.g. to keep remote desktop access to the machine
-available), see [`docs/windows-service.md`](docs/windows-service.md).
 
 ## Routed-set split-tunneling
 
@@ -621,11 +551,6 @@ tunnels those hostnames but direct-connects every bare-IP target, and
   traffic can be preferable to letting it leak out directly; the iOS client keeps
   defaulting to direct-connect. (The server's `0x02` rejection above is a
   separate, server-side control and is unaffected.)
-- **Richer agent routes.** Reverse routing is loopback-only in v1: every
-  `[agent_routes]` entry dials `127.0.0.1` on the agent. A follow-up will let one
-  agent (one machine id) expose several hostnames, each mapped to a chosen host/IP
-  on the agent's own network (an `agent_ip` field, default `127.0.0.1`) — likely
-  either per-domain entries or a grouped `[[agent]]` array-of-tables.
 
 ## Reconnect behavior
 

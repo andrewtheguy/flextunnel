@@ -146,8 +146,6 @@ pub struct WireRoutes {
     pub cidrs: Vec<String>,
     /// alias → target, resolved server-side.
     pub host_aliases: Vec<(String, String)>,
-    /// agent name → "connected" | "disconnected" | "unknown".
-    pub agent_routes: Vec<(String, String)>,
     /// suffix → upstream servers.
     pub dns_forwards: Vec<(String, Vec<String>)>,
     pub bridges: Vec<WireBridge>,
@@ -632,7 +630,6 @@ mod tests {
                 domains: vec!["*.internal".into()],
                 cidrs: vec![],
                 host_aliases: vec![("nas.internal".into(), "10.0.0.7".into())],
-                agent_routes: vec![("workstation.internal".into(), "connected".into())],
                 dns_forwards: vec![("test.example".into(), vec!["10.22.33.10".into()])],
                 bridges: vec![WireBridge {
                     name: "kube1".into(),

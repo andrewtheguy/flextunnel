@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 
 /// Deadline for dialing a target (DNS resolution + TCP connect), so a slow or
 /// black-holed target can't tie up a task and its sockets indefinitely. Used by
-/// the server's exit path and by an agent dialing on its own network.
+/// the server's exit path.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connect to `target`: a loopback target tries both loopback families (see
@@ -24,7 +24,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// caller's system DNS) and tried address-by-address (see [`connect_resolved`]).
 ///
 /// `forwarder` is the server's conditional-DNS-forwarding table; the client's
-/// split-tunnel path and an agent dialing on its own network pass `None`.
+/// split-tunnel path passes `None`.
 pub async fn dial_target(target: &Target, forwarder: Option<&DnsForwarder>) -> io::Result<TcpStream> {
     if let Some(port) = loopback_port(target) {
         return connect_any(&loopback_addrs(port)).await;
@@ -118,12 +118,10 @@ pub async fn connect_resolved(
 /// [`CONNECT_TIMEOUT`]), write the SOCKS5-shaped reply byte, and — on success —
 /// pipe bytes bidirectionally until either side closes.
 ///
-/// This is the shared exit-point body: the **server** runs it for a normal
-/// tunneled target (dialing from its own network, optionally with a
-/// `forwarder` for conditional DNS), and an **agent** runs it for a stream the
-/// server routed to it (dialing on the agent's network, `forwarder` = `None`).
-/// Per-stream errors stay per-stream; the shared QUIC connection is never torn
-/// down here.
+/// This is the server's exit-point body, run for a normal tunneled target
+/// (dialing from its own network, optionally with a `forwarder` for
+/// conditional DNS). Per-stream errors stay per-stream; the shared QUIC
+/// connection is never torn down here.
 pub async fn connect_and_pipe(
     mut send: SendStream,
     recv: RecvStream,

@@ -10,7 +10,7 @@
 //! Resolution itself is purely server-side — it changes only which nameserver
 //! answers a name, not the wire protocol. The configured suffix→servers table is
 //! additionally pushed to clients (informationally) in the handshake so their
-//! status UIs can show it, exactly like host aliases and agent routes; see
+//! status UIs can show it, exactly like host aliases; see
 //! [`DnsForwarder::forwards`].
 //!
 //! Config shape (`[dns_forwards]` in the server file): each key is a bare domain

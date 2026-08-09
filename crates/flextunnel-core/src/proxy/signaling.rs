@@ -15,15 +15,14 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
 pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 
-/// Maximum size of a control-stream frame ([`ControlMsg`]). A `HeartbeatAck`
-/// carries the server's live connected-agent alias list, so the cap is generous
-/// enough for a large operator list while still bounding a misbehaving peer.
+/// Maximum size of a control-stream frame ([`ControlMsg`]). Generous for the
+/// small heartbeat frames while still bounding a misbehaving peer.
 pub const MAX_CONTROL_MSG_SIZE: usize = 16 * 1024;
 
 /// Per-stream request/reply header version byte.
@@ -48,18 +47,13 @@ pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
 /// Which kind of peer is connecting. A **client** runs local proxy listener(s)
-/// and *opens* tunnel streams to the server; an **agent** dials the server with
-/// an ephemeral identity, is identified by its `machine_id`, and *accepts* the
-/// streams the server opens back to it, connecting each to a target on the
-/// agent's own network (reverse routing — see `proxy::agent` and the server's
-/// `agent_routes`).
+/// and *opens* tunnel streams to the server; a **bridge** is another flextunnel
+/// server forwarding bridged streams.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerRole {
     /// Local proxy listener(s); opens tunnel streams to the server.
     #[default]
     Client,
-    /// Reverse-routing exit point; accepts server-opened streams.
-    Agent,
     /// Another flextunnel server forwarding bridged streams. Opens tunnel
     /// streams like a client but authenticates with an `ftb` token, and its
     /// TLS-authenticated iroh endpoint id must be on the receiving server's
@@ -67,7 +61,7 @@ pub enum PeerRole {
     Bridge,
 }
 
-/// Client/agent → server auth handshake (first bi-stream of the connection).
+/// Client → server auth handshake (first bi-stream of the connection).
 ///
 /// `Debug` is implemented manually to redact `auth_token` (a bearer credential)
 /// so it can never leak into logs or error context.
@@ -86,18 +80,11 @@ pub struct Hello {
     /// not a command; the server decides whether to self-block on it.
     #[serde(default)]
     pub duplicate_server_observed: bool,
-    /// Whether this peer is a client (local proxy listener), an agent (reverse
-    /// exit point), or a bridge. Drives the server's post-handshake handling and
-    /// which auth-token pool the token is checked against.
+    /// Whether this peer is a client (local proxy listener) or a bridge. Drives
+    /// the server's post-handshake handling and which auth-token pool the token
+    /// is checked against.
     #[serde(default)]
     pub role: PeerRole,
-    /// The agent's **derived network id** (`ftm1…`, see [`crate::machine_id`]),
-    /// sent only by agents (`role == Agent`). It is a one-way hash of the agent's
-    /// raw OS machine id — the raw id never travels on the wire. It is how the
-    /// server identifies and routes to an agent whose iroh node id is ephemeral.
-    /// `None` for clients.
-    #[serde(default)]
-    pub machine_id: Option<String>,
 }
 
 impl std::fmt::Debug for Hello {
@@ -108,7 +95,6 @@ impl std::fmt::Debug for Hello {
             .field("client_instance_nonce", &self.client_instance_nonce)
             .field("duplicate_server_observed", &self.duplicate_server_observed)
             .field("role", &self.role)
-            .field("machine_id", &self.machine_id)
             .finish()
     }
 }
@@ -118,8 +104,8 @@ impl std::fmt::Debug for Hello {
 /// On acceptance the server pushes its resolved routed set (the *tunnel set*) so
 /// the client can make the split-tunnel decision without configuring its own
 /// list — the server is the single source of truth. Clients reject an empty
-/// routed set; agents and bridges receive empty informational route lists
-/// because they do not make local split-tunnel decisions.
+/// routed set; bridges receive empty informational route lists because they do
+/// not make local split-tunnel decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub version: u16,
@@ -144,19 +130,6 @@ pub struct HelloResponse {
     /// same list); alias resolution itself stays server-side.
     #[serde(default)]
     pub host_aliases: Vec<(String, String)>,
-    /// Reverse-routing (agent) alias names, sorted — the full configured set,
-    /// whether or not each agent is currently connected. The agents' machine ids
-    /// stay server-side (never pushed). Live connected-state is not derivable
-    /// from this list alone; it rides [`Self::connected_agents`] here (the
-    /// initial seed) and is then refreshed by every
-    /// [`ControlMsg::HeartbeatAck`].
-    #[serde(default)]
-    pub agent_aliases: Vec<String>,
-    /// The subset of [`Self::agent_aliases`] whose backing agent is connected
-    /// *right now*, sorted. Seeds the client's status UI at handshake so it isn't
-    /// blank until the first heartbeat; the heartbeat ack then keeps it fresh.
-    #[serde(default)]
-    pub connected_agents: Vec<String>,
     /// Server-side conditional DNS forwards as `(suffix, upstream servers)`
     /// pairs, sorted by suffix. Purely informational for client UIs (the server
     /// status page shows the same list); the resolution itself stays
@@ -171,7 +144,7 @@ pub struct HelloResponse {
 }
 
 impl Hello {
-    /// A client `Hello` (`role = Client`, no machine id).
+    /// A client `Hello` (`role = Client`).
     pub fn new(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -179,28 +152,11 @@ impl Hello {
             client_instance_nonce,
             duplicate_server_observed: false,
             role: PeerRole::Client,
-            machine_id: None,
         }
     }
 
-    /// An agent `Hello` (`role = Agent`) carrying the agent's stable machine id.
-    /// Agents never emit the duplicate-server advisory (that detection is
-    /// client-side), so it stays `false`.
-    pub fn new_agent(
-        auth_token: impl Into<String>,
-        client_instance_nonce: u128,
-        machine_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            role: PeerRole::Agent,
-            machine_id: Some(machine_id.into()),
-            ..Self::new(auth_token, client_instance_nonce)
-        }
-    }
-
-    /// A bridge `Hello` (`role = Bridge`). No machine id — a bridge's identity
-    /// is its persistent iroh endpoint id, already TLS-authenticated by the
-    /// QUIC connection.
+    /// A bridge `Hello` (`role = Bridge`). A bridge's identity is its persistent
+    /// iroh endpoint id, already TLS-authenticated by the QUIC connection.
     pub fn new_bridge(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
         Self {
             role: PeerRole::Bridge,
@@ -227,8 +183,8 @@ pub struct BridgeSummary {
 /// The routing/status payload the server pushes to a peer on acceptance,
 /// grouped so the several same-typed lists can't be swapped positionally. Only
 /// the routed set (`routed_domains`/`routed_cidrs`) is enforced client-side; the
-/// rest is informational for status UIs. `Default` (all empty) is the agent
-/// case — an agent gets no routed set and no connected-agent list.
+/// rest is informational for status UIs. `Default` (all empty) is the bridge
+/// case — a bridge gets no routed set.
 #[derive(Debug, Clone, Default)]
 pub struct AcceptedRoutes {
     /// Domain rules the client should tunnel (exact or `*.` wildcard).
@@ -237,10 +193,6 @@ pub struct AcceptedRoutes {
     pub routed_cidrs: Vec<String>,
     /// Server-side host aliases as `(alias, target)` pairs, sorted by alias.
     pub host_aliases: Vec<(String, String)>,
-    /// Reverse-routing (agent) alias names, sorted.
-    pub agent_aliases: Vec<String>,
-    /// The subset of `agent_aliases` whose backing agent is connected right now.
-    pub connected_agents: Vec<String>,
     /// Conditional DNS forwards as `(suffix, upstream servers)` pairs.
     pub dns_forwards: Vec<(String, Vec<String>)>,
     /// Outbound bridge routes, sorted by name.
@@ -249,7 +201,7 @@ pub struct AcceptedRoutes {
 
 impl HelloResponse {
     /// Accept the peer and push its [`AcceptedRoutes`] (the *tunnel set* plus the
-    /// informational host-alias, agent-alias, and DNS-forward lists).
+    /// informational host-alias and DNS-forward lists).
     pub fn accepted(server_instance_nonce: u128, routes: AcceptedRoutes) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -259,8 +211,6 @@ impl HelloResponse {
             routed_domains: routes.routed_domains,
             routed_cidrs: routes.routed_cidrs,
             host_aliases: routes.host_aliases,
-            agent_aliases: routes.agent_aliases,
-            connected_agents: routes.connected_agents,
             dns_forwards: routes.dns_forwards,
             bridges: routes.bridges,
         }
@@ -275,8 +225,6 @@ impl HelloResponse {
             routed_domains: Vec::new(),
             routed_cidrs: Vec::new(),
             host_aliases: Vec::new(),
-            agent_aliases: Vec::new(),
-            connected_agents: Vec::new(),
             dns_forwards: Vec::new(),
             bridges: Vec::new(),
         }
@@ -290,23 +238,14 @@ impl HelloResponse {
 /// [`HEARTBEAT_INTERVAL`](crate::transport::HEARTBEAT_INTERVAL) and the server
 /// replies [`ControlMsg::HeartbeatAck`]. This is an app-level liveness signal
 /// (on top of QUIC keep-alive) that also drives the server's duplicate-client
-/// registry and piggybacks the server's live connected-agent list back to the
-/// client. Framed with [`write_message`]/[`read_message`], capped at
+/// registry. Framed with [`write_message`]/[`read_message`], capped at
 /// [`MAX_CONTROL_MSG_SIZE`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
     /// Client → server liveness ping, carrying a monotonically increasing seq.
     Heartbeat { seq: u64 },
-    /// Server → client reply echoing the heartbeat's seq. `connected_agents` is
-    /// the subset of the client's `agent_aliases` whose backing agent is
-    /// connected right now (sorted) — the server already knows this passively
-    /// from its agent registry, so shipping it on the ack costs no extra probing.
-    /// Empty for agent connections, which don't display it.
-    HeartbeatAck {
-        seq: u64,
-        #[serde(default)]
-        connected_agents: Vec<String>,
-    },
+    /// Server → client reply echoing the heartbeat's seq.
+    HeartbeatAck { seq: u64 },
 }
 
 /// Encode a [`ControlMsg`] to JSON bytes.
@@ -547,11 +486,6 @@ mod tests {
                 routed_domains: vec!["*.example.com".to_string(), "httpbin.org".to_string()],
                 routed_cidrs: vec!["10.0.0.0/8".to_string()],
                 host_aliases: vec![("nas.internal".to_string(), "192.168.1.9".to_string())],
-                agent_aliases: vec![
-                    "elitedesk.internal".to_string(),
-                    "workstation.internal".to_string(),
-                ],
-                connected_agents: vec!["workstation.internal".to_string()],
                 dns_forwards: vec![(
                     "corp.example.com".to_string(),
                     vec!["10.1.0.10:5353".to_string()],
@@ -575,11 +509,6 @@ mod tests {
             vec![("nas.internal".to_string(), "192.168.1.9".to_string())]
         );
         assert_eq!(
-            decoded.agent_aliases,
-            vec!["elitedesk.internal", "workstation.internal"]
-        );
-        assert_eq!(decoded.connected_agents, vec!["workstation.internal"]);
-        assert_eq!(
             decoded.dns_forwards,
             vec![("corp.example.com".to_string(), vec!["10.1.0.10:5353".to_string()])]
         );
@@ -602,8 +531,6 @@ mod tests {
         assert!(decoded.routed_domains.is_empty());
         assert!(decoded.routed_cidrs.is_empty());
         assert!(decoded.host_aliases.is_empty());
-        assert!(decoded.agent_aliases.is_empty());
-        assert!(decoded.connected_agents.is_empty());
         assert!(decoded.dns_forwards.is_empty());
         assert!(decoded.bridges.is_empty());
     }
@@ -615,7 +542,6 @@ mod tests {
         assert_eq!(decoded.role, PeerRole::Bridge);
         assert_eq!(decoded.auth_token, "token");
         assert_eq!(decoded.client_instance_nonce, 42);
-        assert_eq!(decoded.machine_id, None);
         assert!(!decoded.duplicate_server_observed);
     }
 
@@ -623,14 +549,7 @@ mod tests {
     fn control_msg_roundtrip() {
         for msg in [
             ControlMsg::Heartbeat { seq: 1 },
-            ControlMsg::HeartbeatAck {
-                seq: u64::MAX,
-                connected_agents: Vec::new(),
-            },
-            ControlMsg::HeartbeatAck {
-                seq: 7,
-                connected_agents: vec!["workstation.internal".to_string()],
-            },
+            ControlMsg::HeartbeatAck { seq: u64::MAX },
         ] {
             let decoded = decode_control(&encode_control(&msg).unwrap()).unwrap();
             assert_eq!(decoded, msg);

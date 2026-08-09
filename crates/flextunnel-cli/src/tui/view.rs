@@ -280,24 +280,6 @@ fn routing_lines(r: &WireRoutes, status_host: &str) -> Vec<Line<'static>> {
         }
     }
 
-    if !r.agent_routes.is_empty() {
-        lines.push(Line::default());
-        lines.push(section(format!(
-            "Agent routes — {} via agents:",
-            r.agent_routes.len()
-        )));
-        for (name, state) in &r.agent_routes {
-            let style = match state.as_str() {
-                "connected" => Style::new().fg(Color::Green),
-                "disconnected" => Style::new().fg(Color::Red),
-                _ => DIM,
-            };
-            lines.push(Line::from(vec![
-                Span::raw(format!("  {name}  ")),
-                Span::styled(format!("[{state}]"), style),
-            ]));
-        }
-    }
 
     lines.push(Line::default());
     lines.push(section("Server status page — always tunneled:".to_string()));

@@ -111,23 +111,6 @@
   </section>
 
   <section>
-    <h2>Agent routes</h2>
-    {% if agent_routes.is_empty() %}
-      <p class="empty">none configured</p>
-    {% else %}
-      <table>
-      {% for route in agent_routes %}
-        <tr>
-          <td class="mono">{{ route.name }}</td>
-          <td class="mono">&rarr; {{ route.machine_id }}</td>
-          <td>{% if route.connected %}<span class="ok">connected</span>{% else %}<span class="warn">disconnected</span>{% endif %}</td>
-        </tr>
-      {% endfor %}
-      </table>
-    {% endif %}
-  </section>
-
-  <section>
     <h2>Bridge routes (outbound)</h2>
     {% if bridges.is_empty() %}
       <p class="empty">none configured</p>
@@ -170,7 +153,6 @@
     <table class="counts">
       <tr><td>File</td><td class="mono">{{ blocklist_path }}</td></tr>
       <tr><td>Blocked clients</td><td>{{ blocked_client_count }}</td></tr>
-      <tr><td>Blocked agents</td><td>{{ blocked_agent_count }}</td></tr>
       <tr><td>Conflicted servers</td><td>{{ conflicted_server_count }}</td></tr>
     </table>
   </section>

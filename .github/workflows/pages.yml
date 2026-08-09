@@ -6,8 +6,6 @@ on:
     paths:
       - 'install.sh'
       - 'install.ps1'
-      - 'install-agent.sh'
-      - 'install-agent.ps1'
   workflow_dispatch:
 
 permissions:
@@ -32,8 +30,6 @@ jobs:
           mkdir -p _pages
           cp install.sh _pages/
           cp install.ps1 _pages/
-          cp install-agent.sh _pages/
-          cp install-agent.ps1 _pages/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

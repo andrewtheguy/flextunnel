@@ -1,4 +1,4 @@
-//! Small process/runtime helpers shared by the binaries (server, client, agent)
+//! Small process/runtime helpers shared by the binaries (server, client)
 //! and the iOS FFI: logger init, a multi-thread Tokio runtime, a version banner,
 //! and a graceful-shutdown signal future. These are pure boilerplate that every
 //! entry point needs; keeping one copy here avoids drift between crates.

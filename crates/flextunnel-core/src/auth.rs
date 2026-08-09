@@ -4,8 +4,8 @@
 //!
 //! ## Token Format
 //! - Exactly 49 characters
-//! - Starts with a 3-char role prefix: `ftc` (client), `fta` (agent), or `ftb`
-//!   (bridge — a server connecting to another server)
+//! - Starts with a 3-char role prefix: `ftc` (client) or `ftb` (bridge — a
+//!   server connecting to another server)
 //! - Remaining 46 characters are Base64URL (no padding)
 //! - Decoded payload is exactly 34 bytes:
 //!   - First 32 bytes: random entropy
@@ -15,9 +15,8 @@
 //! one role can never authenticate as another — the server validates each
 //! against the prefix for the connecting peer's role.
 //!
-//! Generate client tokens with `flextunnel generate-auth-token`, agent tokens
-//! with `flextunnel-agent generate-token`, bridge tokens with
-//! `flextunnel generate-bridge-token`.
+//! Generate client tokens with `flextunnel generate-auth-token`, bridge tokens
+//! with `flextunnel generate-bridge-token`.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -30,9 +29,6 @@ pub const TOKEN_LENGTH: usize = 49;
 
 /// Required prefix for client tokens.
 pub const CLIENT_TOKEN_PREFIX: &str = "ftc";
-
-/// Required prefix for agent tokens.
-pub const AGENT_TOKEN_PREFIX: &str = "fta";
 
 /// Required prefix for bridge tokens (server-to-server).
 pub const BRIDGE_TOKEN_PREFIX: &str = "ftb";
@@ -76,11 +72,6 @@ pub fn generate_client_token() -> String {
     generate_token_with_prefix(CLIENT_TOKEN_PREFIX)
 }
 
-/// Generate a new agent authentication token (prefix `fta`).
-pub fn generate_agent_token() -> String {
-    generate_token_with_prefix(AGENT_TOKEN_PREFIX)
-}
-
 /// Generate a new bridge authentication token (prefix `ftb`).
 pub fn generate_bridge_token() -> String {
     generate_token_with_prefix(BRIDGE_TOKEN_PREFIX)
@@ -106,11 +97,6 @@ pub fn generate_token_with_prefix(prefix: &str) -> String {
 /// Validate a client token (prefix `ftc`).
 pub fn validate_client_token(token: &str) -> Result<()> {
     validate_token_with_prefix(token, CLIENT_TOKEN_PREFIX)
-}
-
-/// Validate an agent token (prefix `fta`).
-pub fn validate_agent_token(token: &str) -> Result<()> {
-    validate_token_with_prefix(token, AGENT_TOKEN_PREFIX)
 }
 
 /// Validate a bridge token (prefix `ftb`).
@@ -169,7 +155,7 @@ pub fn validate_token_with_prefix(token: &str, prefix: &str) -> Result<()> {
 }
 
 /// Load auth tokens from CLI arguments and/or a file, validating each against
-/// the given role `prefix` (`ftc` for clients, `fta` for agents).
+/// the given role `prefix` (`ftc` for clients, `ftb` for bridges).
 ///
 /// # Arguments
 /// * `cli_tokens` - Tokens specified via CLI `--auth-tokens` flags
@@ -505,21 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_token_format_and_prefix_isolation() {
-        // Agent tokens are well-formed with the `fta` prefix...
-        let agent = generate_agent_token();
-        assert_eq!(agent.len(), TOKEN_LENGTH);
-        assert!(agent.starts_with(AGENT_TOKEN_PREFIX));
-        assert!(validate_agent_token(&agent).is_ok());
-
-        // ...and the two pools are mutually exclusive: an agent token is not a
-        // valid client token, and a client token is not a valid agent token.
-        assert!(validate_client_token(&agent).is_err());
-        let client = generate_client_token();
-        assert!(validate_agent_token(&client).is_err());
-    }
-
-    #[test]
     fn test_bridge_token_format_and_prefix_isolation() {
         // Bridge tokens are well-formed with the `ftb` prefix...
         let bridge = generate_bridge_token();
@@ -527,21 +498,18 @@ mod tests {
         assert!(bridge.starts_with(BRIDGE_TOKEN_PREFIX));
         assert!(validate_bridge_token(&bridge).is_ok());
 
-        // ...and the three pools are mutually exclusive: a bridge token is not
-        // a valid client or agent token, and neither of those is a valid
-        // bridge token.
+        // ...and the two pools are mutually exclusive: a bridge token is not a
+        // valid client token, and a client token is not a valid bridge token.
         assert!(validate_client_token(&bridge).is_err());
-        assert!(validate_agent_token(&bridge).is_err());
         assert!(validate_bridge_token(&generate_client_token()).is_err());
-        assert!(validate_bridge_token(&generate_agent_token()).is_err());
     }
 
     #[test]
-    fn test_load_agent_tokens_rejects_client_prefix() {
-        // A client token in an agent-token file must fail prefix validation.
+    fn test_load_bridge_tokens_rejects_client_prefix() {
+        // A client token in a bridge-token file must fail prefix validation.
         let client = generate_client_token();
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "{}", client).unwrap();
-        assert!(load_auth_tokens_from_file(file.path(), AGENT_TOKEN_PREFIX).is_err());
+        assert!(load_auth_tokens_from_file(file.path(), BRIDGE_TOKEN_PREFIX).is_err());
     }
 }

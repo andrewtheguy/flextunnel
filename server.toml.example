@@ -14,12 +14,6 @@ secret_file = "./server.key"
 auth_tokens = ["ftcXXXXXXX"]
 # auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
 
-# Accepted AGENT auth tokens (prefix `fta`, from `flextunnel-agent generate-token`).
-# A separate pool from client tokens: a client token can never authenticate as an
-# agent, or vice versa. Only needed if you use reverse routing ([agent_routes]).
-# agent_auth_tokens = ["ftaXXXXXXX"]
-# agent_auth_tokens_file = "/etc/flextunnel/agent_auth_tokens.txt"
-
 # Optional iroh tuning.
 # Custom relay(s) for failover. Configuring custom relays disables n0 internet
 # discovery (pkarr/DNS) — clients reach the server via relay hints instead; mDNS
@@ -34,7 +28,7 @@ auth_tokens = ["ftcXXXXXXX"]
 # bottom of this file). A connecting bridge must pass BOTH gates: its endpoint
 # id (TLS-authenticated by iroh, no extra proof needed) must be listed in
 # allowed_bridge_servers, AND it must present an `ftb` token from the
-# bridge_auth_tokens pool (a separate pool from client and agent tokens). An
+# bridge_auth_tokens pool (a separate pool from client tokens). An
 # empty/absent allowlist disables inbound bridging entirely; configuring only
 # one of the two halves is rejected at startup as dead config. Bridged-in
 # targets must also be on this server's routed set (routed_domains/routed_cidrs
@@ -46,10 +40,9 @@ auth_tokens = ["ftcXXXXXXX"]
 
 # Duplicate-id blocklist (JSON). This path is fixed at
 # ~/.config/flextunnel/blocklist.json and is deliberately not configurable. The
-# server records confirmed duplicate client ids here, duplicate agent network
-# ids, and its own id if it detects it is a duplicate server; on the next start
-# it refuses to run if its id is listed. Delete the offending entry after
-# resolving the conflict.
+# server records confirmed duplicate client ids here, and its own id if it
+# detects it is a duplicate server; on the next start it refuses to run if its
+# id is listed. Delete the offending entry after resolving the conflict.
 
 # Routed set (the "tunnel set") — REQUIRED. This is a VPN-style split-tunnel
 # "included routes" list and the single source of truth: it is pushed to every
@@ -87,8 +80,8 @@ routed_domains = ["*.example.com", "httpbin.org"]
 routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 
 # RESERVED namespace: `flextunnel.internal` and any `*.flextunnel.internal`
-# subdomain are reserved by flextunnel and cannot be used as [host_aliases] or
-# [agent_routes] names (the server rejects such configs at startup). Clients
+# subdomain are reserved by flextunnel and cannot be used as [host_aliases]
+# names (the server rejects such configs at startup). Clients
 # always tunnel these names regardless of the routed set. Browse to
 # `http://flextunnel.internal/` through the tunnel for the HTML server status
 # page, or query the plain-text form from a client with:
@@ -119,29 +112,6 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # "server6.internal" = "::1"           # -> the server's own loopback (IPv6, bare)
 # "node6.internal"   = "2001:db8::50"  # -> another host, global IPv6 (bare)
 
-# Optional reverse-routing reservations. Unlike [host_aliases] (which resolve to a
-# host on the SERVER's network), an [agent_routes] alias resolves to a connected
-# AGENT — a `flextunnel-agent` process, identified by its derived network id
-# (`ftm1…`, a one-way hash of the agent's machine id). When a client requests the
-# alias, the server forwards the stream over the agent's live connection and the
-# agent dials `127.0.0.1:<requested port>` on ITS OWN machine (reverse routing is
-# loopback-only in v1). This lets a client reach a service behind NAT that the
-# server cannot dial directly.
-#
-# Get the network id by running `flextunnel-agent machine-id` on the agent host.
-# A key is an exact hostname or a `*.suffix` wildcard (same syntax and precedence
-# as [host_aliases] above — every matched subdomain still dials 127.0.0.1 on the
-# SAME agent, since reverse routing is loopback-only in v1). Checked BEFORE
-# [host_aliases]; a name should appear in only one. When a routed set is active
-# (it always is), the requested hostname must also be on routed_domains above —
-# filtering happens on the requested hostname first. An EXACT alias
-# (`web.internal`) needs a matching exact routed_domains entry, or the global `*`;
-# a `*.web.internal` wildcard alias covers subdomains only, so add `*.web.internal`
-# there — it does NOT cover the bare apex `web.internal`.
-# [agent_routes]
-# "web.internal"   = { machine_id = "ftm1…" }   # exact; from `flextunnel-agent machine-id`
-# "*.web.internal" = { machine_id = "ftm1…" }   # wildcard: any subdomain -> same agent
-
 # Optional conditional DNS forwarding (split-DNS), applied server-side when the
 # server resolves a tunneled hostname. By default the server uses its own system
 # resolver for every name; a [dns_forwards] entry overrides that for names under
@@ -168,16 +138,16 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # flextunnel server over a persistent server-to-server connection (split-tunnel
 # across servers), instead of dialing them from this server's network. The
 # matched target is forwarded VERBATIM — the target server applies its own
-# host_aliases, agent_routes and dns_forwards, resolves domain targets on its
-# side, and re-enforces its own routed set. Single hop: a stream that arrived
-# over a bridge is never bridged again, so two servers bridging at each other
-# cannot loop.
+# host_aliases and dns_forwards, resolves domain targets on its side, and
+# re-enforces its own routed set. Single hop: a stream that arrived over a
+# bridge is never bridged again, so two servers bridging at each other cannot
+# loop.
 #
 # Each entry needs the target server's endpoint id, an `ftb` auth token accepted
 # by that server (exactly one of auth_token / auth_token_file; generate with
 # `flextunnel generate-bridge-token`), and at least one rule. Rules use the
 # routed-set syntax above (domains: exact, `*.x`, or `*`; cidrs: CIDR or bare
-# IP). Checked AFTER [agent_routes] and BEFORE [host_aliases]/local dialing;
+# IP). Checked BEFORE [host_aliases]/local dialing;
 # when several bridges match, the first in name order wins. Every rule must be
 # reachable through the routed set above (the whitelist runs first), or the
 # server refuses to start. The upstream connection is maintained with
