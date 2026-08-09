@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-agent"
-version = "0.0.59"
+version = "0.0.60"
 dependencies = [
  "anyhow",
  "clap",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-cli"
-version = "0.0.59"
+version = "0.0.60"
 dependencies = [
  "anyhow",
  "clap",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-core"
-version = "0.0.59"
+version = "0.0.60"
 dependencies = [
  "anyhow",
  "askama",
@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-desktop"
-version = "0.0.59"
+version = "0.0.60"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -2070,7 +2070,7 @@ dependencies = [
 
 [[package]]
 name = "flextunnel-ffi"
-version = "0.0.59"
+version = "0.0.60"
 dependencies = [
  "flextunnel-core",
  "iroh",
