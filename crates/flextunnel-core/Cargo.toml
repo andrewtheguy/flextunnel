@@ -18,7 +18,6 @@ futures.workspace = true
 hickory-resolver.workspace = true
 ipnetwork.workspace = true
 iroh.workspace = true
-iroh-mdns-address-lookup.workspace = true
 log.workspace = true
 n0-future.workspace = true
 rand.workspace = true
@@ -34,6 +33,11 @@ url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# iroh's mDNS discovery sends raw UDP multicast, which iOS rejects without the
+# com.apple.developer.networking.multicast entitlement, so it is compiled out.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+iroh-mdns-address-lookup.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

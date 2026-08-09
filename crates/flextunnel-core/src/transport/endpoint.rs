@@ -9,6 +9,7 @@ use iroh::{
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, presets},
 };
+#[cfg(not(target_os = "ios"))]
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use log::info;
 use std::path::Path;
@@ -26,7 +27,9 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// <https://docs.iroh.computer/concepts/address-lookup>), while
 /// [`Custom`](Self::Custom) uses the configured relays with n0 internet discovery
 /// disabled (clients, agents, and outbound bridges use relay hints instead). mDNS
-/// local-network discovery is independent of this and stays on in both modes.
+/// local-network discovery is independent of this and stays on in both modes,
+/// except on iOS where it is compiled out (raw multicast needs a special
+/// entitlement there).
 /// See "Relays and Address Lookup" in `docs/Architecture.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
@@ -185,7 +188,9 @@ fn print_relay_status(relay_config: &RelayConfig) {
 ///   Initials to every configured relay, so the handshake succeeds via whichever
 ///   relay the server is homed on.
 ///
-/// mDNS local-network discovery is independent of the relay mode and always on.
+/// mDNS local-network discovery is independent of the relay mode and always on,
+/// except on iOS where it is compiled out (raw multicast needs the
+/// `com.apple.developer.networking.multicast` entitlement).
 fn create_endpoint_builder(
     relay_config: &RelayConfig,
     secret_key: Option<&SecretKey>,
@@ -210,8 +215,12 @@ fn create_endpoint_builder(
         }
         builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     }
-    // mDNS always enabled for local network discovery.
-    builder = builder.address_lookup(MdnsAddressLookup::builder());
+    // mDNS local network discovery — unsupported on iOS (raw multicast needs
+    // the multicast entitlement), so it is compiled out there.
+    #[cfg(not(target_os = "ios"))]
+    {
+        builder = builder.address_lookup(MdnsAddressLookup::builder());
+    }
 
     Ok(builder)
 }
