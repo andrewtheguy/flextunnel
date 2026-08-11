@@ -30,7 +30,9 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// local-network discovery is independent of this and stays on in both modes,
 /// except on iOS where it is compiled out (raw multicast needs a special
 /// entitlement there).
-/// See "Relays and Address Lookup" in `docs/Architecture.md`.
+/// The full design — shared with tunnel-rs and ezvpn — is documented in
+/// <https://github.com/flexaccessdev/iroh-common-architecture> (see
+/// `relays-and-address-lookup.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.

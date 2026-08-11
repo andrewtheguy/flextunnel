@@ -576,6 +576,14 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 
 ## Documentation
 
+- [iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture) —
+  the iroh transport layer shared with [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs)
+  and [ezvpn](https://github.com/flexaccessdev/ezvpn):
+  [relays and address lookup](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md)
+  (default vs custom relays, relay hints, the per-relay startup probe, relay auth
+  tokens) and
+  [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
+  (running your own iroh relay).
 - [`docs/architecture.md`](docs/architecture.md) — how it works: connection
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
