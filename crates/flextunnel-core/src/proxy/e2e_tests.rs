@@ -298,8 +298,22 @@ async fn assert_bridge_rejected(ep: &Endpoint, server_addr: EndpointAddr, reason
             );
         }
         Err(e) => {
-            // Rejected before connect resolved — equally a refusal.
-            eprintln!("bridge connect refused at handshake: {e}");
+            // Rejected before `connect` resolved (the close raced the
+            // handshake) — equally a refusal, but only if the error carries
+            // the hook's reason. Anything else (refused socket, wrong
+            // address) is a test failure, not a rejection. Walk the source
+            // chain: the close reason may sit below the top-level error.
+            let mut chain = e.to_string();
+            let mut source = std::error::Error::source(&e);
+            while let Some(s) = source {
+                chain.push_str(": ");
+                chain.push_str(&s.to_string());
+                source = s.source();
+            }
+            assert!(
+                chain.contains(reason),
+                "bridge connect failed without the hook's reason {reason:?}: {chain}"
+            );
         }
     }
 }
