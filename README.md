@@ -60,6 +60,10 @@ A per-client auth token gates every connection:
 - **Auth token** — sent in the connection handshake and checked against the
   server's accepted set. Per-client, like an API key.
 
+(The tokenless exceptions are server-to-server bridges and `--quick` sessions,
+whose credential is the peer's TLS-authenticated **EndpointId**, checked
+natively against an allowlist at the handshake — the `authorized_keys` model.)
+
 The QUIC ALPN is a fixed protocol identifier (`flextunnel/1`), not a secret: it
 ensures both peers speak the flextunnel protocol but provides no access control
 on its own.
@@ -256,19 +260,27 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 #### Quick ephemeral tunnel (no setup)
 
 For a throwaway "route everything through this box for a few minutes" session,
-`--quick` skips all of the above — no key file, no token, no config:
+`--quick` skips all of the above — no key file, no token, no config. There is
+no token auth at all: each side enters the **other side's EndpointId**. The
+client's id becomes the server's one-entry allowlist (enforced natively at the
+TLS handshake, like bridge allowlisting), and dialing the server's id is itself
+what authenticates the server:
 
 ```sh
-# On the server host: mints an in-memory identity + client token, full-tunnels
-# all traffic, and prints the two values to paste. Exits on its own if no client
-# connects within 5 minutes. Nothing is persisted.
-flextunnel server start --quick
-
-# On the client host: ignores any saved config and prompts for the server
-# EndpointId and auth token printed above (token entry is masked), then shows a
-# live control panel in this terminal. Needs an interactive terminal.
+# On the client host: prints this client's EndpointId (enter it on the server)
+# and prompts for the server EndpointId, then shows a live control panel in
+# this terminal. Needs an interactive terminal.
 flextunnel client start --quick
+
+# On the server host: prompts for the client EndpointId printed above and
+# allowlists it as the only allowed client, then prints this server's
+# EndpointId to enter at the client prompt. Full-tunnels all traffic; exits on
+# its own if the client doesn't connect within 5 minutes. Nothing is persisted.
+flextunnel server start --quick
 ```
+
+Either side can start first — both block at their prompt until the other's id
+is entered.
 
 The quick server runs a full tunnel (`routed_domains = ["*"]`,
 `routed_cidrs = ["0.0.0.0/0", "::/0"]`); enter a SOCKS5/HTTP port at the client
@@ -358,7 +370,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
-| `--quick` | Ephemeral one-off server: mint an in-memory identity + client token, full-tunnel all traffic, print the EndpointId/token, and exit if no client connects within 5 minutes. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
+| `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth token — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
 
 ### `client start`
 
@@ -374,13 +386,15 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
-| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, prompt for the server EndpointId + auth token, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`. |
+| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth token), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-token(-file)`. |
 
 `flextunnel client start` needs at least one flag — run with no arguments and it
 prints help. With a flag but no `-c`, it loads `~/.config/flextunnel/client.toml`
 if it exists (so `flextunnel client start --socks-port 1080` runs off the default
-config). `--quick` ignores any saved config and prompts (on an interactive
-terminal) for the server EndpointId, auth token, and optional proxy ports, then
+config). `--quick` ignores any saved config, prints this client's EndpointId
+(its credential — enter it on the quick server; there is no auth token), and
+prompts (on an interactive terminal) for the server EndpointId and optional
+proxy ports, then
 runs the self-contained control panel described under [`client control`](#client-control)
 right in that terminal — but with no control socket exposed, and quitting the
 panel disconnects instead of detaching. Nothing is saved.

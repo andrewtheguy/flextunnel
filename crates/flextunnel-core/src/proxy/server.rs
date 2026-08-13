@@ -131,7 +131,7 @@ pub struct ProxyServer {
     valid_tokens: HashSet<String>,
     /// Endpoint ids of servers allowed to bridge into this server, mirrored
     /// here for the status page only. Enforcement is native: the endpoint's
-    /// `BridgeAllowlistHook` rejects a non-allowlisted bridge at the TLS
+    /// `AllowlistHook` rejects a non-allowlisted bridge at the TLS
     /// handshake, so such a connection never reaches this server's accept
     /// loop. Empty = inbound bridging disabled.
     allowed_bridge_servers: HashSet<EndpointId>,
@@ -175,7 +175,7 @@ pub struct ProxyServerParams {
     pub own_id: EndpointId,
     pub valid_tokens: HashSet<String>,
     /// For the status page's inbound-bridge list only; enforcement lives in
-    /// the endpoint's `BridgeAllowlistHook` (see `create_server_endpoint`).
+    /// the endpoint's `AllowlistHook` (see `create_server_endpoint`).
     pub allowed_bridge_servers: HashSet<EndpointId>,
     pub host_aliases: HashMap<String, String>,
     pub routed_set: RoutedSet,
@@ -475,7 +475,7 @@ impl ProxyServer {
 
         // Bridges arrive on their own ALPN and take a separate path: their sole
         // credential is the TLS-authenticated endpoint id, already checked
-        // against the allowlist by the endpoint's `BridgeAllowlistHook` — a
+        // against the allowlist by the endpoint's `AllowlistHook` — a
         // rejected bridge never gets here. They open data streams like a
         // client, but those streams are never re-bridged (single hop).
         if connection.alpn() == crate::transport::BRIDGE_ALPN {
@@ -487,12 +487,19 @@ impl ProxyServer {
         let hello = signaling::decode_hello(&data)?;
 
         // Authenticate first: only a validated, non-blocklisted peer may influence
-        // server behavior — including the duplicate-server self-block below. The
-        // ALPN is not a credential, so without this gate an unauthenticated peer
-        // could trip self-block + shutdown.
-        let token_ok = self.valid_tokens.contains(&hello.auth_token);
+        // server behavior — including the duplicate-server self-block below. A
+        // quick-mode client (QUICK_ALPN) is already authenticated: the endpoint's
+        // `AllowlistHook` checked its TLS-authenticated id against the quick
+        // allowlist at the handshake, so a non-allowlisted one never gets here.
+        // For a token client the ALPN is not a credential, so without the token
+        // gate an unauthenticated peer could trip self-block + shutdown.
+        let auth_ok = connection.alpn() == crate::transport::QUICK_ALPN
+            || hello
+                .auth_token
+                .as_ref()
+                .is_some_and(|token| self.valid_tokens.contains(token));
         let blocked = self.is_client_blocked(&remote_id);
-        if !token_ok || blocked {
+        if !auth_ok || blocked {
             let reason = if blocked {
                 log::warn!("Rejecting {remote_id}: node id is blocklisted (duplicate id)");
                 "node id is blocklisted (duplicate id previously detected)"
@@ -616,7 +623,7 @@ impl ProxyServer {
     /// against *this* server's routed set, and its domain targets are resolved
     /// (and aliased) here.
     ///
-    /// Authentication already happened: the endpoint's `BridgeAllowlistHook`
+    /// Authentication already happened: the endpoint's `AllowlistHook`
     /// validated the TLS-authenticated endpoint id against the allowlist at
     /// the handshake, so every connection reaching here is allowlisted.
     async fn handle_bridge(

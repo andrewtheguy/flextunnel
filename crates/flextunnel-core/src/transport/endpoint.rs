@@ -1,6 +1,6 @@
 //! Common endpoint helpers for iroh proxy connections.
 
-use crate::transport::{ALPN, BRIDGE_ALPN, build_quic_transport_config};
+use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use futures::future::join_all;
@@ -20,53 +20,81 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// QUIC application close code sent when a bridge connection is rejected by
-/// the endpoint-id allowlist (distinct from the in-band auth-failure code `1`
-/// and the duplicate-id code `2` used on the client path).
-pub const CLOSE_BRIDGE_NOT_ALLOWED: u32 = 3;
+/// QUIC application close code sent when a connection is rejected by an
+/// endpoint-id allowlist — a non-allowlisted bridge on [`BRIDGE_ALPN`] or a
+/// non-allowlisted quick client on [`QUICK_ALPN`] (distinct from the in-band
+/// auth-failure code `1` and the duplicate-id code `2` used on the token
+/// client path).
+pub const CLOSE_NOT_ALLOWLISTED: u32 = 3;
 
-/// Native bridge access control: an [`EndpointHooks`] that rejects inbound
-/// [`BRIDGE_ALPN`] connections whose TLS-authenticated endpoint id is not on
-/// the `allowed_bridge_servers` allowlist. Runs the moment the handshake
-/// completes, so a rejected bridge never reaches the accept loop; the dialing
-/// server sees the connection close with [`CLOSE_BRIDGE_NOT_ALLOWED`] and the
-/// reason text.
-///
-/// Only the accepting side of a bridge connection is gated: outbound dials
-/// (this server bridging *out*, or acting as a client) pass through, as do
-/// inbound [`ALPN`] client connections (gated by their token handshake). An
-/// empty allowlist rejects every inbound bridge — the allowlist is the sole
-/// and mandatory bridge credential.
-#[derive(Debug)]
-pub struct BridgeAllowlistHook {
-    allowed_bridge_servers: HashSet<EndpointId>,
+/// The server's per-ALPN endpoint-id allowlists, enforced natively at the TLS
+/// handshake by [`AllowlistHook`]. An empty set disables its ALPN entirely —
+/// the allowlist is the sole and mandatory credential on both.
+#[derive(Debug, Default)]
+pub struct EndpointAllowlists {
+    /// Servers allowed to bridge into this server over [`BRIDGE_ALPN`].
+    pub bridge_servers: HashSet<EndpointId>,
+    /// Clients allowed to connect over [`QUICK_ALPN`] (quick mode — normally a
+    /// single id, entered on the quick server).
+    pub quick_clients: HashSet<EndpointId>,
 }
 
-impl BridgeAllowlistHook {
-    pub fn new(allowed_bridge_servers: HashSet<EndpointId>) -> Self {
-        Self {
-            allowed_bridge_servers,
-        }
+/// Native allowlist access control: an [`EndpointHooks`] that rejects inbound
+/// [`BRIDGE_ALPN`] / [`QUICK_ALPN`] connections whose TLS-authenticated
+/// endpoint id is not on the matching [`EndpointAllowlists`] set. Runs the
+/// moment the handshake completes, so a rejected peer never reaches the accept
+/// loop; the dialer sees the connection close with [`CLOSE_NOT_ALLOWLISTED`]
+/// and the reason text.
+///
+/// Only the accepting side is gated: outbound dials (this server bridging
+/// *out*) pass through, as do inbound [`ALPN`] client connections (gated by
+/// their token handshake).
+#[derive(Debug)]
+pub struct AllowlistHook {
+    allowlists: EndpointAllowlists,
+}
+
+impl AllowlistHook {
+    pub fn new(allowlists: EndpointAllowlists) -> Self {
+        Self { allowlists }
     }
 }
 
-impl EndpointHooks for BridgeAllowlistHook {
+impl EndpointHooks for AllowlistHook {
     async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
-        if conn.side() != Side::Server || conn.alpn() != BRIDGE_ALPN {
+        if conn.side() != Side::Server {
             return AfterHandshakeOutcome::Accept;
         }
-        let remote_id = conn.remote_id();
-        if self.allowed_bridge_servers.contains(&remote_id) {
-            return AfterHandshakeOutcome::Accept;
-        }
-        let reason = if self.allowed_bridge_servers.is_empty() {
-            "bridging is not enabled on this server"
+        let alpn = conn.alpn();
+        let (allowed, kind, disabled_reason, rejected_reason) = if alpn == BRIDGE_ALPN {
+            (
+                &self.allowlists.bridge_servers,
+                "bridge",
+                "bridging is not enabled on this server",
+                "server id is not on this server's bridge allowlist",
+            )
+        } else if alpn == QUICK_ALPN {
+            (
+                &self.allowlists.quick_clients,
+                "quick client",
+                "quick mode is not enabled on this server",
+                "client id is not on this server's quick-client allowlist",
+            )
         } else {
-            "server id is not on this server's bridge allowlist"
+            return AfterHandshakeOutcome::Accept;
         };
-        log::warn!("Rejecting bridge {remote_id}: {reason}");
+        let remote_id = conn.remote_id();
+        if allowed.contains(&remote_id) {
+            return AfterHandshakeOutcome::Accept;
+        }
+        let reason = if allowed.is_empty() {
+            disabled_reason
+        } else {
+            rejected_reason
+        };
+        log::warn!("Rejecting {kind} {remote_id}: {reason}");
         AfterHandshakeOutcome::Reject {
-            error_code: VarInt::from_u32(CLOSE_BRIDGE_NOT_ALLOWED),
+            error_code: VarInt::from_u32(CLOSE_NOT_ALLOWLISTED),
             reason: reason.as_bytes().to_vec(),
         }
     }
@@ -374,10 +402,10 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-/// Create a server endpoint with a persistent identity, accepting both the
-/// client [`ALPN`] and the bridge [`BRIDGE_ALPN`]. Inbound bridge connections
-/// are gated natively by a [`BridgeAllowlistHook`] over
-/// `allowed_bridge_servers` (empty = inbound bridging disabled).
+/// Create a server endpoint with a persistent identity, accepting the client
+/// [`ALPN`], the bridge [`BRIDGE_ALPN`], and the quick-client [`QUICK_ALPN`].
+/// Inbound bridge and quick-client connections are gated natively by an
+/// [`AllowlistHook`] over `allowlists` (an empty set = that path disabled).
 ///
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
@@ -388,7 +416,7 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: SecretKey,
-    allowed_bridge_servers: HashSet<EndpointId>,
+    allowlists: EndpointAllowlists,
 ) -> Result<Endpoint> {
     print_relay_status(relay_config);
 
@@ -397,8 +425,8 @@ pub async fn create_server_endpoint(
     probe_custom_relays(relay_config).await?;
 
     let builder = create_endpoint_builder(relay_config, Some(&secret))?
-        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec()])
-        .hooks(BridgeAllowlistHook::new(allowed_bridge_servers))
+        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec(), QUICK_ALPN.to_vec()])
+        .hooks(AllowlistHook::new(allowlists))
         .secret_key(secret);
 
     let endpoint = builder
@@ -412,13 +440,38 @@ pub async fn create_server_endpoint(
 
 /// Create a client endpoint (ephemeral identity).
 pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<Endpoint> {
+    create_client_endpoint_inner(relay_config, None).await
+}
+
+/// Create a **quick-mode** client endpoint: same as [`create_client_endpoint`]
+/// but bound to the given (session-ephemeral) `secret`, so the endpoint id the
+/// user entered on the quick server is the id this endpoint presents in the
+/// TLS handshake — that id is the quick client's sole credential. The identity
+/// is still never published (the client only dials), so pkarr publishing stays
+/// off exactly as for an anonymous client.
+pub async fn create_quick_client_endpoint(
+    relay_config: &RelayConfig,
+    secret: SecretKey,
+) -> Result<Endpoint> {
+    create_client_endpoint_inner(relay_config, Some(secret)).await
+}
+
+async fn create_client_endpoint_inner(
+    relay_config: &RelayConfig,
+    secret: Option<SecretKey>,
+) -> Result<Endpoint> {
     print_relay_status(relay_config);
 
     // Validate each custom relay individually (fail if any is unreachable); a
     // no-op for the default relays.
     probe_custom_relays(relay_config).await?;
 
-    let builder = create_endpoint_builder(relay_config, None)?;
+    // `None` for the builder's lookup decision even with a quick secret: a
+    // client never publishes its address (it only dials out).
+    let mut builder = create_endpoint_builder(relay_config, None)?;
+    if let Some(secret) = secret {
+        builder = builder.secret_key(secret);
+    }
 
     let endpoint = builder
         .bind()

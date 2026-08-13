@@ -44,7 +44,7 @@ server.
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
-| `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native bridge-allowlist hook (`BridgeAllowlistHook`) |
+| `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients) |
 | `transport/paths.rs` | connection-path snapshot (direct/relay) + on-demand custom-relay `/healthz` health |
 | `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
@@ -72,28 +72,35 @@ coverage).
 
 ### 1. ALPN
 Clients connect with the fixed constant `flextunnel/1` (`transport::ALPN`);
-bridging servers connect with `flextunnel-bridge/1` (`transport::BRIDGE_ALPN`).
+bridging servers connect with `flextunnel-bridge/1` (`transport::BRIDGE_ALPN`);
+quick-mode clients connect with `flextunnel-quick/1` (`transport::QUICK_ALPN`).
 The ALPN is a protocol-negotiation label sent **unencrypted** in the TLS/QUIC
 handshake, not a secret: it carries the peer's *role*, never a credential.
-Client access control is the auth handshake below; bridge access control is the
-`allowed_bridge_servers` endpoint-id allowlist, enforced **natively at the TLS
+Token-client access control is the auth handshake below; bridge and quick-client
+access control is an endpoint-id allowlist (`allowed_bridge_servers`, or the
+single client id entered on a quick server), enforced **natively at the TLS
 handshake** by an iroh `EndpointHooks::after_handshake` hook
-(`transport::endpoint::BridgeAllowlistHook`) — a non-allowlisted bridge's
-connection is closed with the reason before it ever reaches the accept loop,
-and the id needs no further proof because iroh's handshake authenticates it.
+(`transport::endpoint::AllowlistHook` over `EndpointAllowlists`) — a
+non-allowlisted peer's connection is closed with the reason before it ever
+reaches the accept loop, and the id needs no further proof because iroh's
+handshake authenticates it. An empty set disables its ALPN entirely (a normal
+server rejects every quick dial; a no-bridging server rejects every bridge).
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 10`. On the first bi-stream a
+The protocol version is `PROTOCOL_VERSION = 11`. On the first bi-stream a
 client sends
-`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed }`
+`Hello { version, auth_token?, client_instance_nonce, duplicate_server_observed }`
 (a bridge sends the minimal `BridgeHello { version }` — its authentication
 already happened at the TLS handshake) and the server replies
 `HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, dns_forwards, bridges }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
-big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
-checks a client's token against the accepted `ftc` set. On rejection it closes
-the connection gracefully (with a short drain) carrying the reason. `Hello`'s
-`Debug` impl redacts `auth_token`.
+big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). On the
+client ALPN `auth_token` is required and checked against the accepted `ftc`
+set; on the quick ALPN it is absent — the allowlist hook already authenticated
+the endpoint id, and everything after the handshake (routed set, duplicate
+detection, heartbeats, data streams) is identical for both. On rejection the
+server closes the connection gracefully (with a short drain) carrying the
+reason. `Hello`'s `Debug` impl redacts `auth_token`.
 
 The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
 node id) that drive duplicate-id detection (see below); `duplicate_server_observed`
@@ -243,11 +250,13 @@ self-blocked server's restart. These are guard rails for operators, not adversar
 defenses.
 
 - **Credentials:** client auth tokens (`ftc`) are CRC16-checksummed Base64URL
-  bearer credentials checked in the handshake. Bridges carry no token: their
-  credential is their TLS-authenticated endpoint id, checked natively against
-  the `allowed_bridge_servers` allowlist (the `authorized_keys` model). The
-  QUIC ALPNs (`flextunnel/1`, `flextunnel-bridge/1`) are fixed protocol/role
-  identifiers, not credentials. All payload is encrypted by QUIC/TLS 1.3.
+  bearer credentials checked in the handshake. Bridges and quick-mode clients
+  carry no token: their credential is their TLS-authenticated endpoint id,
+  checked natively against the matching allowlist — `allowed_bridge_servers`,
+  or the single client id entered on a quick server (the `authorized_keys`
+  model). The QUIC ALPNs (`flextunnel/1`, `flextunnel-bridge/1`,
+  `flextunnel-quick/1`) are fixed protocol/role identifiers, not credentials.
+  All payload is encrypted by QUIC/TLS 1.3.
 - **The server is the exit point.** Anyone with valid tokens can reach whatever
   the server's network can reach (including its `localhost`). Treat token
   distribution accordingly; scope server network access if needed.
@@ -278,9 +287,11 @@ defenses.
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
-| `PROTOCOL_VERSION` | 9 | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 11 | `proxy/signaling.rs` |
 | auth token length | 49 chars | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
+| `BRIDGE_ALPN` | `flextunnel-bridge/1` | `transport/mod.rs` |
+| `QUICK_ALPN` | `flextunnel-quick/1` | `transport/mod.rs` |
 
 ## Relation to ezvpn
 

@@ -17,8 +17,11 @@ use flextunnel_core::forwards::{
     ForwardManager, ForwardState, ForwardStatus, PortForward, disable_failed_forwards,
     validate_label, validate_remote_host,
 };
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, reserved};
-use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::iroh::SecretKey;
+use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, reserved};
+use flextunnel_core::transport::endpoint::{
+    RelayConfig, create_client_endpoint, create_quick_client_endpoint,
+};
 use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
 use flextunnel_core::{app, auth, config};
 
@@ -58,7 +61,15 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
 
     // The routed set (tunnel set) is configured on the server and pushed
     // during the handshake (see ProxyClient::handshake).
-    let runtime = build_session(r, server_node_id, token, key.clone(), forwards, true).await?;
+    let runtime = build_session(
+        r,
+        server_node_id,
+        SessionAuth::Token(token),
+        key.clone(),
+        forwards,
+        true,
+    )
+    .await?;
     if runtime.state.socks_addr.is_none() && runtime.state.http_addr.is_none() {
         log::info!("No local proxy listeners configured; running in port-forward-only mode");
     }
@@ -72,7 +83,8 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
 }
 
 /// Resolve the client auth token: exactly one of the inline token or the token
-/// file. Shared by [`run`] and [`run_quick`].
+/// file. Normal sessions only — quick mode has no token (its credential is the
+/// client's endpoint id, allowlisted on the quick server).
 fn resolve_token(r: &config::ResolvedClient) -> Result<String> {
     if r.auth_token.is_some() && r.auth_token_file.is_some() {
         anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
@@ -99,18 +111,30 @@ fn resolve_token(r: &config::ResolvedClient) -> Result<String> {
 /// persisted and nothing else can attach. The panel and the session talk over an
 /// in-process channel; quitting the panel drops its sender, closing the channel,
 /// which shuts the session down — so the tunnel disconnects rather than detaching.
-pub async fn run_quick(r: config::ResolvedClient) -> Result<()> {
+///
+/// `client_secret` is the session's pre-generated identity, whose endpoint id
+/// the caller already printed for the user to allowlist on the quick server —
+/// that id (not a token) is the quick client's credential, so the endpoint must
+/// bind with exactly this secret.
+pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> Result<()> {
     let server_node_id = r.server_node_id.clone().context(
         "The client requires a server node id (--server-node-id or server_node_id in the config).",
     )?;
     // Display-only in quick mode (no lock/socket/forwards paths are derived from
     // it); computing it also validates the id shape up front.
     let key = instance::instance_key(&server_node_id)?;
-    let token = resolve_token(&r)?;
 
     // Forwards are ephemeral: none are loaded, none are saved (`persist=false`).
     // They can still be added/edited live in the panel, in memory only.
-    let runtime = build_session(r, server_node_id, token, key, Vec::new(), false).await?;
+    let runtime = build_session(
+        r,
+        server_node_id,
+        SessionAuth::Quick(client_secret),
+        key,
+        Vec::new(),
+        false,
+    )
+    .await?;
 
     // Drive the self-contained panel over an in-process channel — no socket is
     // exposed, so `flextunnel client control` cannot attach. The panel runs a
@@ -139,25 +163,47 @@ struct SessionRuntime {
     state: SessionState,
 }
 
+/// How a session authenticates, coupling the credential to the endpoint
+/// identity it requires so the two cannot be mixed and matched: a token
+/// session dials from an anonymous ephemeral endpoint, while a quick session
+/// must bind its endpoint to the fixed secret whose id the quick server
+/// allowlisted — the id *is* the credential.
+enum SessionAuth {
+    /// Normal session: bearer token over the client ALPN.
+    Token(String),
+    /// Quick session: no token; the endpoint binds to this secret and its
+    /// endpoint id is checked against the quick server's allowlist.
+    Quick(SecretKey),
+}
+
 /// Create the iroh endpoint, bind the enabled proxy front-ends (127.0.0.1 only,
 /// like the desktop client — unauthenticated, never exposed off-machine), and
 /// assemble the [`SessionRuntime`]. Shared by [`run`] and [`run_quick`]; the
-/// caller supplies the auth `token`, the instance `key` (status display), the
-/// initial `forwards`, and whether mutations `persist`. On any failure past
-/// endpoint creation the endpoint is closed gracefully before returning.
+/// caller supplies the [`SessionAuth`] (which also determines the endpoint's
+/// identity), the instance `key` (status display), the initial `forwards`, and
+/// whether mutations `persist`. On any failure past endpoint creation the
+/// endpoint is closed gracefully before returning.
 async fn build_session(
     r: config::ResolvedClient,
     server_node_id: String,
-    token: String,
+    auth: SessionAuth,
     key: String,
     forwards: Vec<PortForward>,
     persist: bool,
 ) -> Result<SessionRuntime> {
     let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
         .context("Invalid relay configuration")?;
-    let endpoint = create_client_endpoint(&relay_config)
-        .await
-        .context("Failed to create iroh endpoint")?;
+    let (endpoint, auth) = match auth {
+        SessionAuth::Token(token) => (
+            create_client_endpoint(&relay_config).await,
+            ClientAuth::Token(token),
+        ),
+        SessionAuth::Quick(secret) => (
+            create_quick_client_endpoint(&relay_config, secret).await,
+            ClientAuth::QuickAllowlisted,
+        ),
+    };
+    let endpoint = endpoint.context("Failed to create iroh endpoint")?;
     log::info!("flextunnel client Node ID: {}", endpoint.id());
 
     let socks_bind = r.socks_port.map(|p| SocketAddr::from(([127, 0, 0, 1], p)));
@@ -165,7 +211,7 @@ async fn build_session(
 
     let client = std::sync::Arc::new(ProxyClient::new(ClientConfig {
         server_node_id: server_node_id.clone(),
-        auth_token: token,
+        auth,
         socks_listen: socks_bind,
         http_listen: http_bind,
         relay_urls: r.relay_urls,
@@ -796,7 +842,7 @@ mod tests {
     /// defensively in case a regression re-enables the save.)
     #[tokio::test]
     async fn quick_session_does_not_persist_forward_edits() {
-        use flextunnel_core::proxy::{ClientConfig, ProxyClient};
+        use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient};
 
         let key = "quickpersisttestkey0";
         let path = store::forwards_path(key).unwrap();
@@ -804,7 +850,7 @@ mod tests {
 
         let client = ProxyClient::new(ClientConfig {
             server_node_id: "server".into(),
-            auth_token: "ftc".into(),
+            auth: ClientAuth::QuickAllowlisted,
             socks_listen: None,
             http_listen: None,
             relay_urls: Vec::new(),
