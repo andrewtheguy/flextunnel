@@ -39,12 +39,12 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens); separate client (`ftc`) and bridge (`ftb`) prefixes |
+| `auth.rs` | client auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens, `ftc` prefix) |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
-| `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers |
+| `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native bridge-allowlist hook (`BridgeAllowlistHook`) |
 | `transport/paths.rs` | connection-path snapshot (direct/relay) + on-demand custom-relay `/healthz` health |
 | `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
@@ -52,17 +52,18 @@ server.
 | `proxy/http.rs` | client-side HTTP proxy front-end: `CONNECT` tunneling + absolute-URI plain-HTTP forwarding |
 | `proxy/routed_set.rs` | parsed tunnel set: client split-tunnel decision + server whitelist enforcement |
 | `proxy/server.rs` | accept + auth + routed-set whitelist + per-stream DNS/connect/pipe; status page |
-| `proxy/bridge.rs` | outbound server-to-server bridge: persistent upstream connection (`role=Bridge`, `ftb` token) with retry-forever reconnect; matching streams splice over it |
+| `proxy/bridge.rs` | outbound server-to-server bridge: persistent upstream connection (`BRIDGE_ALPN`, id-allowlist-authenticated) with retry-forever reconnect; matching streams splice over it |
 | `proxy/dial.rs` | `Target` → TCP dial + `connect_and_pipe` (the server's exit-point body) |
 
 **Bridges** split-tunnel *across servers*: a `[bridges.<name>]` entry on server A
 forwards targets matching its domain/CIDR rules verbatim over a persistent
 connection to server B, which re-enforces its own routed set, applies its own
 aliases/DNS forwards, and dials from its network. A dials out on its
-own server endpoint, so the TLS-authenticated id it presents is its persistent
-server id — which B must list in `allowed_bridge_servers` in addition to
-validating the `ftb` token (both gates required; empty allowlist = inbound
-bridging disabled). Bridged-in streams are served like client streams but are
+own server endpoint with the bridge ALPN, so the TLS-authenticated id it
+presents is its persistent server id — which B must list in
+`allowed_bridge_servers`, the sole bridge credential, enforced natively at the
+TLS handshake by B's endpoint hook (empty allowlist = inbound bridging
+disabled). Bridged-in streams are served like client streams but are
 never re-bridged (single hop, so mutual bridges cannot loop). Bridge rules must
 be reachable through A's routed set (validated at startup, like `dns_forwards`
 coverage).
@@ -70,24 +71,28 @@ coverage).
 ## Connection lifecycle
 
 ### 1. ALPN
-The ALPN value is the fixed constant `flextunnel/1` (`transport::ALPN`). It is a
-protocol-negotiation label sent **unencrypted** in the TLS/QUIC handshake, not a
-secret: both peers must offer the same ALPN or negotiation fails. Access control
-is enforced by the auth handshake below, not by the ALPN.
+Clients connect with the fixed constant `flextunnel/1` (`transport::ALPN`);
+bridging servers connect with `flextunnel-bridge/1` (`transport::BRIDGE_ALPN`).
+The ALPN is a protocol-negotiation label sent **unencrypted** in the TLS/QUIC
+handshake, not a secret: it carries the peer's *role*, never a credential.
+Client access control is the auth handshake below; bridge access control is the
+`allowed_bridge_servers` endpoint-id allowlist, enforced **natively at the TLS
+handshake** by an iroh `EndpointHooks::after_handshake` hook
+(`transport::endpoint::BridgeAllowlistHook`) — a non-allowlisted bridge's
+connection is closed with the reason before it ever reaches the accept loop,
+and the id needs no further proof because iroh's handshake authenticates it.
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 9`. On the first bi-stream the
-connecting peer sends
-`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed, role }`
-and the server replies
+The protocol version is `PROTOCOL_VERSION = 10`. On the first bi-stream a
+client sends
+`Hello { version, auth_token, client_instance_nonce, duplicate_server_observed }`
+(a bridge sends the minimal `BridgeHello { version }` — its authentication
+already happened at the TLS handshake) and the server replies
 `HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, dns_forwards, bridges }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). The server
-checks the token against the role's accepted set (`ftc` client or `ftb` bridge
-tokens). Clients send `role = Client`; bridging servers send `role = Bridge`
-(their persistent iroh id is TLS-authenticated and checked against the
-`allowed_bridge_servers` allowlist). On rejection it closes the
-connection gracefully (with a short drain) carrying the reason. `Hello`'s
+checks a client's token against the accepted `ftc` set. On rejection it closes
+the connection gracefully (with a short drain) carrying the reason. `Hello`'s
 `Debug` impl redacts `auth_token`.
 
 The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
@@ -237,10 +242,12 @@ servers started with the same identity, blocking the conflicted id and refusing 
 self-blocked server's restart. These are guard rails for operators, not adversary
 defenses.
 
-- **Bearer tokens:** client (`ftc`) and bridge (`ftb`) auth
-  tokens are separate CRC16-checksummed Base64URL credential pools checked in the
-  handshake. The QUIC ALPN (`flextunnel/1`) is a fixed protocol identifier, not
-  a credential. All payload is encrypted by QUIC/TLS 1.3.
+- **Credentials:** client auth tokens (`ftc`) are CRC16-checksummed Base64URL
+  bearer credentials checked in the handshake. Bridges carry no token: their
+  credential is their TLS-authenticated endpoint id, checked natively against
+  the `allowed_bridge_servers` allowlist (the `authorized_keys` model). The
+  QUIC ALPNs (`flextunnel/1`, `flextunnel-bridge/1`) are fixed protocol/role
+  identifiers, not credentials. All payload is encrypted by QUIC/TLS 1.3.
 - **The server is the exit point.** Anyone with valid tokens can reach whatever
   the server's network can reach (including its `localhost`). Treat token
   distribution accordingly; scope server network access if needed.

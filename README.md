@@ -346,7 +346,6 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
 | `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
 | `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
-| `generate-bridge-token [-c N]` | Generate N bridge auth tokens (prefix `ftb`). |
 
 ### `server start`
 
@@ -455,9 +454,11 @@ Secrets may be inline (as above) or kept in separate files via the `*_file`
 keys. CLI flags still work and override any of these.
 
 Server-only routing keys include `host_aliases`,
-`dns_forwards`, outbound `[bridges.<name>]`, inbound `allowed_bridge_servers`,
-and `bridge_auth_tokens` / `bridge_auth_tokens_file`; these are config-file only
-because they describe the server's routing policy.
+`dns_forwards`, outbound `[bridges.<name>]`, and inbound
+`allowed_bridge_servers`; these are config-file only because they describe the
+server's routing policy. Bridges carry no token: a bridging server
+authenticates by its TLS-authenticated endpoint id, which the receiving server
+must list in `allowed_bridge_servers` (enforced natively at the handshake).
 
 ## Host aliases (server-side)
 

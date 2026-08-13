@@ -43,14 +43,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Generous: a healthy connect through discovery + relay completes well within.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Connect to `addr` bounded by [`CONNECT_TIMEOUT`], mapping both the timeout and
-/// the underlying connect error to a signaling error. Shared by the client and
-/// bridge `establish()` flows.
+/// Connect to `addr` with `alpn` bounded by [`CONNECT_TIMEOUT`], mapping both
+/// the timeout and the underlying connect error to a signaling error. Shared by
+/// the client (`ALPN`) and bridge (`BRIDGE_ALPN`) `establish()` flows.
 pub(crate) async fn connect_with_timeout(
     endpoint: &Endpoint,
     addr: EndpointAddr,
+    alpn: &[u8],
 ) -> ProxyResult<Connection> {
-    tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, crate::transport::ALPN))
+    tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, alpn))
         .await
         .map_err(|_| {
             ProxyError::Signaling(format!(
@@ -639,7 +640,7 @@ impl ProxyClient {
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, Arc<RoutedSet>, SendStream, RecvStream)> {
         let endpoint_addr = self.resolve_server_addr()?;
-        let connection = connect_with_timeout(endpoint, endpoint_addr).await?;
+        let connection = connect_with_timeout(endpoint, endpoint_addr, crate::transport::ALPN).await?;
         log::info!("Connected to server, authenticating...");
         let (routed_set, send, recv) = self.handshake(&connection).await?;
         log::info!("Authenticated.");
