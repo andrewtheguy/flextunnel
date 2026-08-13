@@ -10,7 +10,7 @@
 
 use crate::config::Profile;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
-use flextunnel_core::proxy::{ClientConfig, ProxyClient, TunnelRoutes};
+use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, TunnelRoutes};
 use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::collections::HashMap;
@@ -479,7 +479,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
 
     let client = ProxyClient::new(ClientConfig {
         server_node_id: profile.server_node_id.clone(),
-        auth_token: profile.auth_token.clone(),
+        auth: ClientAuth::Token(profile.auth_token.clone()),
         socks_listen: socks_addr,
         http_listen: http_addr,
         relay_urls: profile.relay_urls.clone(),

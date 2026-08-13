@@ -102,12 +102,24 @@ type SharedConn = Arc<Mutex<Option<Connection>>>;
 /// (directly or tunneled) before the policy is known, so nothing leaks out.
 type SharedRoutedSet = Arc<Mutex<Option<Arc<RoutedSet>>>>;
 
+/// How the client authenticates to the server.
+pub enum ClientAuth {
+    /// Regular client: dial the client [`ALPN`](crate::transport::ALPN) and
+    /// present this bearer token in the `Hello`.
+    Token(String),
+    /// Quick-mode client: dial [`QUICK_ALPN`](crate::transport::QUICK_ALPN)
+    /// with no token. The sole credential is this endpoint's TLS-authenticated
+    /// id, which the quick server has allowlisted — the endpoint must be bound
+    /// to the session's fixed secret (see `create_quick_client_endpoint`).
+    QuickAllowlisted,
+}
+
 /// Configuration for the proxy client.
 pub struct ClientConfig {
     /// Server's iroh EndpointId (as a string).
     pub server_node_id: String,
-    /// Authentication token sent in the connection handshake.
-    pub auth_token: String,
+    /// How to authenticate: bearer token, or quick-mode endpoint-id allowlist.
+    pub auth: ClientAuth,
     /// Local address the optional SOCKS5 listener binds to. CLI clients always
     /// set this; GUI forwarding-only sessions may leave it disabled.
     pub socks_listen: Option<SocketAddr>,
@@ -640,7 +652,11 @@ impl ProxyClient {
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, Arc<RoutedSet>, SendStream, RecvStream)> {
         let endpoint_addr = self.resolve_server_addr()?;
-        let connection = connect_with_timeout(endpoint, endpoint_addr, crate::transport::ALPN).await?;
+        let alpn = match &self.config.auth {
+            ClientAuth::Token(_) => crate::transport::ALPN,
+            ClientAuth::QuickAllowlisted => crate::transport::QUICK_ALPN,
+        };
+        let connection = connect_with_timeout(endpoint, endpoint_addr, alpn).await?;
         log::info!("Connected to server, authenticating...");
         let (routed_set, send, recv) = self.handshake(&connection).await?;
         log::info!("Authenticated.");
@@ -703,7 +719,13 @@ impl ProxyClient {
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
 
-        let mut hello = Hello::new(self.config.auth_token.clone(), self.instance_nonce);
+        let token = match &self.config.auth {
+            ClientAuth::Token(token) => Some(token.clone()),
+            // Quick mode: the endpoint id is the credential; the server's
+            // allowlist hook already authenticated it at the TLS handshake.
+            ClientAuth::QuickAllowlisted => None,
+        };
+        let mut hello = Hello::new(token, self.instance_nonce);
         hello.duplicate_server_observed = self.duplicate_server.load(Ordering::Relaxed);
         signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
         send.flush().await?;
@@ -1310,7 +1332,7 @@ mod tests {
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
             server_node_id: "server".to_string(),
-            auth_token: "token".to_string(),
+            auth: ClientAuth::Token("token".to_string()),
             socks_listen: Some("127.0.0.1:0".parse().unwrap()),
             http_listen: None,
             relay_urls: Vec::new(),

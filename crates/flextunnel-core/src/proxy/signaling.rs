@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -53,7 +53,15 @@ pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u16,
-    pub auth_token: String,
+    /// Bearer token for a regular [`ALPN`] client. `None` for a quick-mode
+    /// [`QUICK_ALPN`] client, whose sole credential is its TLS-authenticated
+    /// endpoint id — already checked against the server's allowlist natively
+    /// before the connection reaches the accept loop.
+    ///
+    /// [`ALPN`]: crate::transport::ALPN
+    /// [`QUICK_ALPN`]: crate::transport::QUICK_ALPN
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
     /// Random per-process identity of the *client process*, distinct from its
     /// (ephemeral) iroh node id. Lets the server tell a benign reconnect of one
     /// client (same nonce) apart from two distinct processes presenting the same
@@ -71,7 +79,10 @@ impl std::fmt::Debug for Hello {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hello")
             .field("version", &self.version)
-            .field("auth_token", &"<redacted>")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("client_instance_nonce", &self.client_instance_nonce)
             .field("duplicate_server_observed", &self.duplicate_server_observed)
             .finish()
@@ -123,11 +134,12 @@ pub struct HelloResponse {
 }
 
 impl Hello {
-    /// A client `Hello`.
-    pub fn new(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
+    /// A client `Hello`. `auth_token` is `Some` for a token client, `None` for
+    /// a quick-mode client (see the field docs).
+    pub fn new(auth_token: Option<String>, client_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
-            auth_token: auth_token.into(),
+            auth_token,
             client_instance_nonce,
             duplicate_server_observed: false,
         }
@@ -139,7 +151,7 @@ impl Hello {
 /// Carries only the protocol version: the bridge's role rides the ALPN, and its
 /// sole credential is its TLS-authenticated endpoint id, checked natively
 /// against the server's allowlist before the connection ever reaches the
-/// accept loop (see `transport::endpoint::BridgeAllowlistHook`). The server
+/// accept loop (see `transport::endpoint::AllowlistHook`). The server
 /// replies with a [`HelloResponse`] and the stream stays open for heartbeats.
 ///
 /// [`BRIDGE_ALPN`]: crate::transport::BRIDGE_ALPN
@@ -480,16 +492,26 @@ mod tests {
 
     #[test]
     fn hello_roundtrip() {
-        let hello = Hello::new("token", 0x1234_5678_9abc_def0_1122_3344_5566_7788);
+        let hello = Hello::new(
+            Some("token".to_string()),
+            0x1234_5678_9abc_def0_1122_3344_5566_7788,
+        );
         let encoded = encode_hello(&hello).unwrap();
         let decoded = decode_hello(&encoded).unwrap();
-        assert_eq!(decoded.auth_token, "token");
+        assert_eq!(decoded.auth_token.as_deref(), Some("token"));
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(
             decoded.client_instance_nonce,
             0x1234_5678_9abc_def0_1122_3344_5566_7788
         );
         assert!(!decoded.duplicate_server_observed);
+
+        // A quick-mode hello carries no token (the endpoint-id allowlist is
+        // the credential); the field is omitted on the wire entirely.
+        let quick = Hello::new(None, 7);
+        let encoded = encode_hello(&quick).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("auth_token"));
+        assert_eq!(decode_hello(&encoded).unwrap().auth_token, None);
     }
 
     #[test]

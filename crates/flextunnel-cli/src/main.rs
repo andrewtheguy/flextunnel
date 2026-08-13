@@ -27,12 +27,12 @@ mod tui;
 
 use flextunnel_core::app;
 use flextunnel_core::blocklist::BlockList;
-use flextunnel_core::iroh::EndpointId;
+use flextunnel_core::iroh::{EndpointId, SecretKey};
 use flextunnel_core::proxy::{
     BridgeUpstream, BridgeUpstreamConfig, DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet,
 };
 use flextunnel_core::transport::endpoint::{
-    RelayConfig, create_server_endpoint, secret_to_endpoint_id,
+    EndpointAllowlists, RelayConfig, create_server_endpoint, secret_to_endpoint_id,
 };
 use flextunnel_core::{auth, config, secret};
 
@@ -118,9 +118,13 @@ enum ServerAction {
         /// Shared bearer token sent to every custom relay (custom relays only).
         #[arg(long)]
         relay_auth_token: Option<String>,
-        /// Ephemeral one-off server: generate an in-memory identity + client
-        /// token, full-tunnel all traffic, print the EndpointId/token, and exit
-        /// if no client connects within 5 minutes. Nothing is persisted.
+        /// Ephemeral one-off server. Run `client start --quick` FIRST — it
+        /// prints the client's EndpointId; enter that id at this server's
+        /// prompt to allowlist it as the only allowed client (no auth token).
+        /// Generates an in-memory identity, full-tunnels all traffic, prints
+        /// this server's EndpointId to enter back at the client's prompt, and
+        /// exits if the client doesn't connect within 5 minutes. Needs an
+        /// interactive terminal. Nothing is persisted.
         #[arg(
             long,
             conflicts_with_all = ["config", "default_config", "secret_file", "auth_tokens",
@@ -176,9 +180,11 @@ enum ClientAction {
         /// Cap on reconnect attempts between successful connections (unlimited if unset).
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
-        /// Ignore any saved config and prompt for the server EndpointId + auth
-        /// token (pairs with `server start --quick`). Nothing is persisted.
-        #[arg(long, conflicts_with = "config")]
+        /// Ignore any saved config, print this client's EndpointId (enter it on
+        /// the quick server, which allowlists it — no auth token), and prompt
+        /// for the server EndpointId (pairs with `server start --quick`).
+        /// Nothing is persisted.
+        #[arg(long, conflicts_with_all = ["config", "auth_token", "auth_token_file"])]
         quick: bool,
     },
     /// Attach the control panel to the running client for a profile: live
@@ -319,6 +325,10 @@ mod cli_tests {
             vec!["flextunnel", "server", "start", "--quick", "--secret-file", "k.key"],
             vec!["flextunnel", "server", "start", "--quick", "--auth-token", "ftcXXX"],
             vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
+            // Quick mode has no token auth at all (the credential is the
+            // client's endpoint id), so token flags are rejected too.
+            vec!["flextunnel", "client", "start", "--quick", "--auth-token", "ftcXXX"],
+            vec!["flextunnel", "client", "start", "--quick", "--auth-token-file", "t.txt"],
         ];
         for case in cases {
             let Err(error) = Args::try_parse_from(&case) else {
@@ -329,12 +339,12 @@ mod cli_tests {
     }
 
     #[test]
-    fn quick_server_config_is_full_tunnel_with_one_token() {
-        let (cli, endpoint_id, token) = quick_server_config(Vec::new(), None);
-        // The generated token is a valid client token, and it is the sole
-        // accepted token in the ephemeral config.
-        auth::validate_client_token(&token).expect("generated token must be valid");
-        assert_eq!(cli.auth_tokens.as_deref(), Some([token.clone()].as_slice()));
+    fn quick_server_config_is_full_tunnel_without_tokens() {
+        let (cli, endpoint_id) = quick_server_config(Vec::new(), None);
+        // No token auth in quick mode: the allowlisted client endpoint id is
+        // the sole credential.
+        assert_eq!(cli.auth_tokens, None);
+        assert_eq!(cli.auth_tokens_file, None);
         // Full tunnel: the catch-alls for domains and both IP families.
         assert_eq!(cli.routed_domains.as_deref(), Some(["*".to_string()].as_slice()));
         assert_eq!(
@@ -447,15 +457,37 @@ async fn run_async(command: Command) -> Result<()> {
         } => {
             log_version();
             if quick {
-                // Ephemeral one-off server: mint an identity + client token,
-                // full-tunnel everything, print the bootstrap, and exit if no
-                // client connects within QUICK_IDLE_TIMEOUT. `--quick` conflicts
-                // with the config/secret/token flags (clap-enforced), so the
-                // ephemeral values are the whole configuration.
-                let (cli, endpoint_id, token) = quick_server_config(relay_urls, relay_auth_token);
-                print_quick_server_bootstrap(&endpoint_id, &token);
-                return run_server(config::resolve_server(cli, None)?, Some(QUICK_IDLE_TIMEOUT))
-                    .await;
+                // Ephemeral one-off server: prompt for the client's endpoint id
+                // and natively allowlist it as the only allowed (quick) client —
+                // no auth token — then mint an in-memory identity, full-tunnel
+                // everything, print the bootstrap, and exit if no client
+                // connects within QUICK_IDLE_TIMEOUT. `--quick` conflicts with
+                // the config/secret/token flags (clap-enforced), so the
+                // ephemeral values are the whole configuration. The prompt
+                // needs a TTY, so a piped `--quick` fails fast.
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!("`server start --quick` needs an interactive terminal.");
+                }
+                println!(
+                    "Quick mode — ephemeral server, full tunnel (all traffic routed). Nothing saved."
+                );
+                println!(
+                    "Start the client first if you haven't: `flextunnel client start --quick` \
+                     prints the client EndpointId to enter below."
+                );
+                let client_id = tokio::task::spawn_blocking(|| {
+                    prompt::prompt_endpoint_id(
+                        "Client EndpointId (shown by `flextunnel client start --quick`)",
+                    )
+                })
+                .await??;
+                let (cli, endpoint_id) = quick_server_config(relay_urls, relay_auth_token);
+                print_quick_server_bootstrap(&endpoint_id);
+                return run_server(
+                    config::resolve_server(cli, None)?,
+                    Some(QuickServer { client_id }),
+                )
+                .await;
             }
             let cli = config::ServerConfig {
                 secret_file,
@@ -515,21 +547,35 @@ async fn run_async(command: Command) -> Result<()> {
                 max_reconnect_attempts,
             };
             // `--quick` is a self-contained ephemeral session: it ignores any
-            // saved config, prompts for the connection details, and then runs a
-            // live control panel in this terminal (pairs with `server start
-            // --quick`). Both the prompt and the panel need a TTY, so a piped
-            // `--quick` fails fast instead of hanging. Nothing is persisted and
-            // no control socket is exposed. A bare `client start` never reaches
-            // here — clap prints help (arg_required_else_help).
+            // saved config, mints a session identity whose EndpointId is the
+            // credential (printed here for the user to allowlist on the quick
+            // server — no auth token), prompts for the remaining connection
+            // details, and then runs a live control panel in this terminal
+            // (pairs with `server start --quick`). Both the prompt and the
+            // panel need a TTY, so a piped `--quick` fails fast instead of
+            // hanging. Nothing is persisted and no control socket is exposed.
+            // A bare `client start` never reaches here — clap prints help
+            // (arg_required_else_help).
             if quick {
                 if !std::io::stdin().is_terminal() {
                     anyhow::bail!("`client start --quick` needs an interactive terminal.");
                 }
+                let client_secret = SecretKey::generate();
+                println!("Quick mode. Enter connection details (nothing will be saved):");
+                println!(
+                    "  Your client EndpointId: {}",
+                    secret_to_endpoint_id(&client_secret)
+                );
+                println!(
+                    "Enter it at the `flextunnel server start --quick` prompt — it is this \
+                     client's credential (no auth token)."
+                );
                 cli = tokio::task::spawn_blocking(move || {
                     prompt::fill_client_config(&mut cli).map(|()| cli)
                 })
                 .await??;
-                return client_session::run_quick(config::resolve_client(cli, None)).await;
+                return client_session::run_quick(config::resolve_client(cli, None), client_secret)
+                    .await;
             }
             let file = config::load_client_config(config_path.as_deref())?;
             client_session::run(config::resolve_client(cli, file)).await
@@ -560,53 +606,61 @@ fn validate_dns_forwards_coverage(forwarder: &DnsForwarder, routed_set: &RoutedS
 /// is cancelled for the rest of the process's life.
 const QUICK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Quick-mode (`server start --quick`) parameters for [`run_server`]: `Some`
+/// arms the idle-exit grace timer, skips the single-instance lock and the
+/// client-token requirement, and natively allowlists the one entered client id.
+struct QuickServer {
+    /// The single client endpoint id allowed to connect (over the quick ALPN);
+    /// entered at the prompt, enforced by the endpoint's allowlist hook.
+    client_id: EndpointId,
+}
+
 /// How long to wait for a graceful `endpoint.close()` during shutdown before
 /// forcing exit. iroh's close normally completes promptly, but a lingering
 /// relay/connection teardown must never leave the process unkillable.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the ephemeral `ServerConfig` for `server start --quick`: a freshly
-/// generated in-memory identity + client token and a full-tunnel routed set
-/// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). Returns
-/// the config plus the EndpointId and token to print. Nothing is written to
-/// disk. `--relay-url` stays compatible with `--quick`, so any relays are kept.
+/// generated in-memory identity and a full-tunnel routed set
+/// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). No auth
+/// tokens — the allowlisted client endpoint id is the sole credential. Returns
+/// the config plus the EndpointId to print. Nothing is written to disk.
+/// `--relay-url` stays compatible with `--quick`, so any relays are kept.
 fn quick_server_config(
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
-) -> (config::ServerConfig, EndpointId, String) {
+) -> (config::ServerConfig, EndpointId) {
     let (secret, endpoint_id) = secret::generate_ephemeral_secret();
-    let token = auth::generate_client_token();
     let cli = config::ServerConfig {
         secret: Some(secret),
-        auth_tokens: Some(vec![token.clone()]),
         routed_domains: Some(vec!["*".to_string()]),
         routed_cidrs: Some(vec!["0.0.0.0/0".to_string(), "::/0".to_string()]),
         relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
         relay_auth_token,
         ..Default::default()
     };
-    (cli, endpoint_id, token)
+    (cli, endpoint_id)
 }
 
-/// Print the copy-paste bootstrap block for a quick-mode server: the EndpointId
-/// and client token a `flextunnel client start --quick` needs.
-fn print_quick_server_bootstrap(endpoint_id: &EndpointId, token: &str) {
-    println!("Quick mode — ephemeral server, full tunnel (all traffic routed). Nothing saved.");
+/// Print the bootstrap line for a quick-mode server: the EndpointId to enter at
+/// the client's prompt. The client is already running at this point — it was
+/// started first to show the id just entered here — and is sitting at its
+/// "Server EndpointId" prompt.
+fn print_quick_server_bootstrap(endpoint_id: &EndpointId) {
     println!("  Server EndpointId: {endpoint_id}");
-    println!("  Auth token:        {token}");
-    println!("On the client:  flextunnel client start --quick   (paste the two values above)");
-    println!("Waiting for a client — will exit in 5 minutes if none connects.");
+    println!("Enter it at the client's \"Server EndpointId\" prompt to connect.");
+    println!("Waiting for the client — will exit in 5 minutes if it does not connect.");
 }
 
 async fn run_server(
     r: config::ResolvedServer,
-    quick_timeout: Option<Duration>,
+    quick: Option<QuickServer>,
 ) -> Result<()> {
     // Enforce one server per user before doing any work (held for the process
     // lifetime; released automatically on exit or crash) — except a quick
     // ephemeral server, which is an intentional throwaway and takes no lock, so
     // it can run alongside a real server (or another quick one).
-    let _lock = quick_timeout.is_none().then(lock::acquire).transpose()?;
+    let _lock = quick.is_none().then(lock::acquire).transpose()?;
 
     let valid_tokens = auth::load_auth_tokens(
         &r.auth_tokens,
@@ -614,7 +668,9 @@ async fn run_server(
         auth::CLIENT_TOKEN_PREFIX,
     )
     .context("Failed to load client authentication tokens")?;
-    if valid_tokens.is_empty() {
+    // A quick server runs without tokens: its single allowlisted client id is
+    // the whole credential set (enforced natively by the endpoint's hook).
+    if valid_tokens.is_empty() && quick.is_none() {
         anyhow::bail!(
             "The server requires at least one client authentication token.\n\
              Generate one with: flextunnel generate-auth-token\n\
@@ -622,7 +678,13 @@ async fn run_server(
              auth_tokens/auth_tokens_file in the config."
         );
     }
-    log::info!("Loaded {} client authentication token(s)", valid_tokens.len());
+    match &quick {
+        Some(q) => log::info!(
+            "Quick mode: client {} allowlisted (endpoint-id credential; no tokens)",
+            q.client_id
+        ),
+        None => log::info!("Loaded {} client authentication token(s)", valid_tokens.len()),
+    }
 
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
     let own_id = secret_to_endpoint_id(&secret_key);
@@ -728,15 +790,30 @@ async fn run_server(
         log::info!("Loaded {} bridge route(s)", bridges.len());
     }
 
-    let endpoint = create_server_endpoint(&relay_config, secret_key, allowed_bridge_servers.clone())
+    let allowlists = EndpointAllowlists {
+        bridge_servers: allowed_bridge_servers.clone(),
+        // Quick mode: the one entered client id, enforced natively at the TLS
+        // handshake. Empty otherwise — the quick ALPN is then disabled.
+        quick_clients: quick
+            .as_ref()
+            .map(|q| std::collections::HashSet::from([q.client_id]))
+            .unwrap_or_default(),
+    };
+    let endpoint = create_server_endpoint(&relay_config, secret_key, allowlists)
         .await
         .context("Failed to create iroh endpoint")?;
 
     log::info!("flextunnel server Node ID: {}", endpoint.id());
-    log::info!(
-        "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN>",
-        endpoint.id()
-    );
+    match &quick {
+        Some(_) => log::info!(
+            "Quick mode: enter this server's EndpointId ({}) at the waiting client's prompt",
+            endpoint.id()
+        ),
+        None => log::info!(
+            "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN>",
+            endpoint.id()
+        ),
+    }
 
     if !r.host_aliases.is_empty() {
         log::info!("Loaded {} host alias(es)", r.host_aliases.len());
@@ -754,7 +831,7 @@ async fn run_server(
     );
     // Quick mode arms an idle-exit timer; the server fires this on the first
     // client to cancel it. `None` for a normal server (the timer never runs).
-    let first_client = quick_timeout.map(|_| Arc::new(Notify::new()));
+    let first_client = quick.as_ref().map(|_| Arc::new(Notify::new()));
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         valid_tokens,
@@ -775,20 +852,21 @@ async fn run_server(
             .map_err(|e| anyhow::anyhow!("Server error: {e}"))
     };
 
-    // Quick-mode grace window: fire after `quick_timeout` unless a client
+    // Quick-mode grace window: fire after `QUICK_IDLE_TIMEOUT` unless a client
     // connects first (which resolves `notified()` and parks this future
-    // forever). A normal server parks here immediately, so the arm never fires.
-    // `notify_one` stores a permit, so a client that connects before this future
-    // is first polled is not missed.
+    // forever). `first_client` is `Some` exactly in quick mode; a normal server
+    // parks here immediately, so the arm never fires. `notify_one` stores a
+    // permit, so a client that connects before this future is first polled is
+    // not missed.
     let grace = async {
-        match (quick_timeout, &first_client) {
-            (Some(timeout), Some(notify)) => {
+        match &first_client {
+            Some(notify) => {
                 tokio::select! {
                     _ = notify.notified() => std::future::pending::<()>().await,
-                    _ = tokio::time::sleep(timeout) => {}
+                    _ = tokio::time::sleep(QUICK_IDLE_TIMEOUT) => {}
                 }
             }
-            _ => std::future::pending::<()>().await,
+            None => std::future::pending::<()>().await,
         }
     };
 

@@ -64,7 +64,7 @@ use tokio::net::TcpListener;
 use flextunnel_core::error::ProxyResult;
 use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{
-    ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
+    ClientAuth, ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
 };
 use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
 use flextunnel_core::transport::paths::ConnPathKind;
@@ -240,7 +240,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 
     let client = Arc::new(ProxyClient::new(ClientConfig {
         server_node_id: cfg.server_node_id,
-        auth_token: cfg.auth_token,
+        auth: ClientAuth::Token(cfg.auth_token),
         // Unused: any listener is already bound above and passed in directly.
         socks_listen: port.map(|p| SocketAddr::from((Ipv4Addr::LOCALHOST, p))),
         // iOS exposes no HTTP front-end.
