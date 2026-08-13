@@ -16,16 +16,17 @@
 //!   duplicate client id, exactly as the design intends.
 
 use crate::blocklist::BlockList;
-use crate::proxy::signaling::{self, Hello, HelloResponse, Target};
+use crate::proxy::signaling::{self, BridgeHello, Hello, HelloResponse, Target};
 use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
     BridgeUpstream, BridgeUpstreamConfig, ForwardManager, ForwardSpec, ProxyServer,
     ProxyServerParams, RoutedSet, ServerForwarder,
 };
-use crate::transport::{ALPN, build_quic_transport_config};
+use crate::transport::endpoint::BridgeAllowlistHook;
+use crate::transport::{ALPN, BRIDGE_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,12 +35,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const TOKEN: &str = "test-token";
-/// A distinct bridge-token string (the server checks pool membership, not the
-/// prefix, so any string works as long as the pools differ).
-const BRIDGE_TOKEN: &str = "test-bridge-token";
 
 /// Bind a hermetic loopback endpoint: relay off, no discovery, `127.0.0.1:0`.
-/// Servers get the ALPN so they can accept; clients only dial.
+/// Servers get the ALPNs so they can accept (with inbound bridging disabled —
+/// the allowlist hook gets an empty set); clients only dial.
 async fn loopback_endpoint(secret: SecretKey, is_server: bool) -> Endpoint {
     loopback_endpoint_seeded(secret, is_server, Vec::new()).await
 }
@@ -52,16 +51,26 @@ async fn loopback_endpoint_seeded(
     is_server: bool,
     peers: Vec<EndpointAddr>,
 ) -> Endpoint {
-    loopback_endpoint_with_lookup(secret, is_server, MemoryLookup::from_endpoint_info(peers)).await
+    loopback_endpoint_full(
+        secret,
+        is_server,
+        MemoryLookup::from_endpoint_info(peers),
+        HashSet::new(),
+    )
+    .await
 }
 
-/// Like [`loopback_endpoint_seeded`] with an externally-held [`MemoryLookup`]
-/// (Arc-backed), so a test can add peer addresses *after* binding — needed when
-/// two endpoints must learn each other's ephemeral addresses.
-async fn loopback_endpoint_with_lookup(
+/// The full-knob loopback endpoint: servers accept both ALPNs and install the
+/// native bridge-allowlist hook over `allowed_bridges` (mirroring
+/// `create_server_endpoint`); clients only dial. The externally-held
+/// [`MemoryLookup`] (Arc-backed) lets a test add peer addresses *after*
+/// binding — needed when two endpoints must learn each other's ephemeral
+/// addresses.
+async fn loopback_endpoint_full(
     secret: SecretKey,
     is_server: bool,
     lookup: MemoryLookup,
+    allowed_bridges: HashSet<EndpointId>,
 ) -> Endpoint {
     let builder = Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Disabled)
@@ -72,7 +81,9 @@ async fn loopback_endpoint_with_lookup(
         .unwrap()
         .address_lookup(lookup);
     let builder = if is_server {
-        builder.alpns(vec![ALPN.to_vec()])
+        builder
+            .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec()])
+            .hooks(BridgeAllowlistHook::new(allowed_bridges))
     } else {
         builder
     };
@@ -120,7 +131,6 @@ fn spawn_server_dns(
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         valid_tokens: tokens,
-        bridge_valid_tokens: HashSet::new(),
         allowed_bridge_servers: HashSet::new(),
         host_aliases,
         routed_set: RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
@@ -149,7 +159,6 @@ fn base_params(own_id: iroh::EndpointId, blocklist_path: std::path::PathBuf) -> 
     ProxyServerParams {
         own_id,
         valid_tokens: HashSet::from([TOKEN.to_string()]),
-        bridge_valid_tokens: HashSet::new(),
         allowed_bridge_servers: HashSet::new(),
         host_aliases: HashMap::new(),
         routed_set: RoutedSet::default(),
@@ -181,12 +190,11 @@ fn loopback_cidr_set() -> (RoutedSet, Vec<String>) {
 }
 
 /// An outbound bridge upstream forwarding all of loopback to `target`.
-fn loopback_bridge(name: &str, target: iroh::EndpointId) -> Arc<BridgeUpstream> {
+fn loopback_bridge(name: &str, target: EndpointId) -> Arc<BridgeUpstream> {
     let (routed_set, cidrs) = loopback_cidr_set();
     BridgeUpstream::new(BridgeUpstreamConfig {
         name: name.to_string(),
         endpoint_id: target,
-        auth_token: BRIDGE_TOKEN.to_string(),
         relay_urls: Vec::new(),
         routed_set,
         domains: Vec::new(),
@@ -257,29 +265,57 @@ async fn client_handshake(
     (conn, send, recv, resp)
 }
 
-/// Perform the bridge side of the auth handshake (`role = Bridge`) and return
-/// the open control stream + the server's response.
-async fn bridge_handshake(
-    ep: &Endpoint,
-    server_addr: EndpointAddr,
-    token: &str,
-    nonce: u128,
-) -> (Connection, SendStream, RecvStream, HelloResponse) {
-    let conn = with_timeout(ep.connect(server_addr, ALPN)).await.unwrap();
-    let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    let hello = Hello::new_bridge(token, nonce);
-    signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
-        .await
-        .unwrap();
-    send.flush().await.unwrap();
-    let data = with_timeout(signaling::read_message(
-        &mut recv,
-        signaling::MAX_HANDSHAKE_SIZE,
-    ))
-    .await
-    .unwrap();
-    let resp = signaling::decode_hello_response(&data).unwrap();
-    (conn, send, recv, resp)
+/// Dial `server_addr` on the bridge ALPN and assert the native allowlist hook
+/// rejects it: the server closes the connection at the handshake with
+/// `reason`, before any bridge handshake message can be exchanged.
+async fn assert_bridge_rejected(ep: &Endpoint, server_addr: EndpointAddr, reason: &str) {
+    // The QUIC handshake itself completes on the dialer side (the rejection is
+    // an application close right after it), so `connect` may return Ok; the
+    // rejection then surfaces as the connection closing with the hook's
+    // reason. A `connect` error (rejection raced the handshake) is fine too.
+    match with_timeout(ep.connect(server_addr, BRIDGE_ALPN)).await {
+        Ok(conn) => {
+            // Attempting the bridge handshake must fail...
+            let handshake = async {
+                let (mut send, mut recv) = conn.open_bi().await.map_err(std::io::Error::other)?;
+                signaling::write_message(
+                    &mut send,
+                    &signaling::encode_bridge_hello(&BridgeHello::new()).unwrap(),
+                )
+                .await?;
+                send.flush().await?;
+                signaling::read_message(&mut recv, signaling::MAX_HANDSHAKE_SIZE).await
+            };
+            assert!(
+                with_timeout(handshake).await.is_err(),
+                "a rejected bridge must not complete a handshake"
+            );
+            // ...because the server closed the connection with the hook's reason.
+            let closed = with_timeout(conn.closed()).await.to_string();
+            assert!(
+                closed.contains(reason),
+                "close reason should say {reason:?}: {closed}"
+            );
+        }
+        Err(e) => {
+            // Rejected before `connect` resolved (the close raced the
+            // handshake) — equally a refusal, but only if the error carries
+            // the hook's reason. Anything else (refused socket, wrong
+            // address) is a test failure, not a rejection. Walk the source
+            // chain: the close reason may sit below the top-level error.
+            let mut chain = e.to_string();
+            let mut source = std::error::Error::source(&e);
+            while let Some(s) = source {
+                chain.push_str(": ");
+                chain.push_str(&s.to_string());
+                source = s.source();
+            }
+            assert!(
+                chain.contains(reason),
+                "bridge connect failed without the hook's reason {reason:?}: {chain}"
+            );
+        }
+    }
 }
 
 /// Open a tunnel stream to `127.0.0.1:port` through `conn` and assert the echo
@@ -743,22 +779,30 @@ async fn bridge_routes_pipe_through_target_server() {
     let echo_port = spawn_echo().await;
     let (routed_set, cidrs) = loopback_cidr_set();
 
-    // Server B (target): allows bridging from A, dials loopback locally.
-    let b_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    // A's identity is fixed up front so B's endpoint can allowlist it at bind.
+    let a_secret = SecretKey::generate();
+    let a_id = a_secret.public();
+
+    // Server B (target): natively allows bridging from A, dials loopback locally.
+    let b_ep = loopback_endpoint_full(
+        SecretKey::generate(),
+        true,
+        MemoryLookup::new(),
+        HashSet::from([a_id]),
+    )
+    .await;
     let b_id = b_ep.id();
     let b_addr = EndpointAddr::new(b_id).with_ip_addr(b_ep.bound_sockets()[0]);
 
     // Server A (bridging): seeded with B's direct address so its id-only
     // upstream dial resolves hermetically.
-    let a_ep = loopback_endpoint_seeded(SecretKey::generate(), true, vec![b_addr.clone()]).await;
-    let a_id = a_ep.id();
+    let a_ep = loopback_endpoint_seeded(a_secret, true, vec![b_addr.clone()]).await;
     let a_addr = EndpointAddr::new(a_id).with_ip_addr(a_ep.bound_sockets()[0]);
 
     let mut b_params = base_params(b_id, temp_blocklist("bridgetarget"));
     b_params.routed_set = routed_set.clone();
     b_params.routed_cidrs = cidrs.clone();
     b_params.allowed_bridge_servers = HashSet::from([a_id]);
-    b_params.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
     spawn_server_params(b_ep, b_params);
 
     let bridge = loopback_bridge("lab", b_id);
@@ -822,59 +866,35 @@ async fn bridge_routes_pipe_through_target_server() {
     drop(b_client_conn);
 }
 
-/// Inbound bridge gating: every gate must pass — the endpoint-id allowlist, the
-/// `ftb` token pool, and bridging being enabled at all (non-empty allowlist).
+/// Inbound bridge gating, enforced natively by the endpoint's allowlist hook:
+/// a non-allowlisted id is rejected at the TLS handshake (the connection is
+/// closed with the reason — no bridge ever reaches the server's accept path),
+/// and an empty allowlist means bridging is off entirely.
 #[tokio::test]
-async fn bridge_rejected_without_allowlist_or_token() {
-    // Case 1: token valid, id not allowlisted (allowlist names someone else).
-    let ep1 = loopback_endpoint(SecretKey::generate(), true).await;
+async fn bridge_rejected_by_native_allowlist() {
+    // Case 1: id not allowlisted (allowlist names someone else).
+    let ep1 = loopback_endpoint_full(
+        SecretKey::generate(),
+        true,
+        MemoryLookup::new(),
+        HashSet::from([SecretKey::generate().public()]),
+    )
+    .await;
     let addr1 = EndpointAddr::new(ep1.id()).with_ip_addr(ep1.bound_sockets()[0]);
     let mut p1 = base_params(ep1.id(), temp_blocklist("bridgerej1"));
     p1.allowed_bridge_servers = HashSet::from([SecretKey::generate().public()]);
-    p1.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
     spawn_server_params(ep1, p1);
     let dialer = loopback_endpoint(SecretKey::generate(), false).await;
-    let (_c, _s, _r, resp) = bridge_handshake(&dialer, addr1, BRIDGE_TOKEN, 1).await;
-    assert!(!resp.accepted, "an unlisted bridge id must be rejected");
-    assert!(
-        resp.reject_reason.as_deref().unwrap_or_default().contains("allowlist"),
-        "reject reason should mention the allowlist: {:?}",
-        resp.reject_reason
-    );
+    assert_bridge_rejected(&dialer, addr1, "allowlist").await;
 
-    // Case 2: id allowlisted, wrong token.
+    // Case 2: bridging not enabled (empty allowlist) — every bridge dial is
+    // rejected up front.
     let dialer2 = loopback_endpoint(SecretKey::generate(), false).await;
     let ep2 = loopback_endpoint(SecretKey::generate(), true).await;
     let addr2 = EndpointAddr::new(ep2.id()).with_ip_addr(ep2.bound_sockets()[0]);
-    let mut p2 = base_params(ep2.id(), temp_blocklist("bridgerej2"));
-    p2.allowed_bridge_servers = HashSet::from([dialer2.id()]);
-    p2.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
+    let p2 = base_params(ep2.id(), temp_blocklist("bridgerej2"));
     spawn_server_params(ep2, p2);
-    let (_c, _s, _r, resp) = bridge_handshake(&dialer2, addr2, "wrong-token", 2).await;
-    assert!(!resp.accepted, "a wrong bridge token must be rejected");
-    assert!(
-        resp.reject_reason.as_deref().unwrap_or_default().contains("token"),
-        "reject reason should mention the token: {:?}",
-        resp.reject_reason
-    );
-
-    // Case 3: bridging not enabled (empty allowlist) — even a token that IS in
-    // the pool is rejected up front, proving the enabled-at-all gate runs
-    // before token validation. (The CLI refuses tokens-without-allowlist as
-    // dead config, but the server layer must still gate on the allowlist.)
-    let dialer3 = loopback_endpoint(SecretKey::generate(), false).await;
-    let ep3 = loopback_endpoint(SecretKey::generate(), true).await;
-    let addr3 = EndpointAddr::new(ep3.id()).with_ip_addr(ep3.bound_sockets()[0]);
-    let mut p3 = base_params(ep3.id(), temp_blocklist("bridgerej3"));
-    p3.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
-    spawn_server_params(ep3, p3);
-    let (_c, _s, _r, resp) = bridge_handshake(&dialer3, addr3, BRIDGE_TOKEN, 3).await;
-    assert!(!resp.accepted, "bridging must be off with an empty allowlist");
-    assert!(
-        resp.reject_reason.as_deref().unwrap_or_default().contains("not enabled"),
-        "reject reason should say bridging is not enabled: {:?}",
-        resp.reject_reason
-    );
+    assert_bridge_rejected(&dialer2, addr2, "not enabled").await;
 }
 
 /// Single hop: two servers bridging the same range at each other must not
@@ -886,14 +906,20 @@ async fn bridged_stream_is_never_rebridged() {
     let echo_port = spawn_echo().await;
     let (routed_set, cidrs) = loopback_cidr_set();
 
-    // Each server must learn the other's ephemeral address, so bind both with
-    // shared-handle lookups and seed them after binding.
+    // Both identities are fixed up front so each endpoint can natively
+    // allowlist the other at bind. Each server must also learn the other's
+    // ephemeral address, so bind both with shared-handle lookups and seed them
+    // after binding.
+    let a_secret = SecretKey::generate();
+    let b_secret = SecretKey::generate();
+    let a_id = a_secret.public();
+    let b_id = b_secret.public();
     let a_lookup = MemoryLookup::new();
     let b_lookup = MemoryLookup::new();
-    let a_ep = loopback_endpoint_with_lookup(SecretKey::generate(), true, a_lookup.clone()).await;
-    let b_ep = loopback_endpoint_with_lookup(SecretKey::generate(), true, b_lookup.clone()).await;
-    let a_id = a_ep.id();
-    let b_id = b_ep.id();
+    let a_ep =
+        loopback_endpoint_full(a_secret, true, a_lookup.clone(), HashSet::from([b_id])).await;
+    let b_ep =
+        loopback_endpoint_full(b_secret, true, b_lookup.clone(), HashSet::from([a_id])).await;
     let a_addr = EndpointAddr::new(a_id).with_ip_addr(a_ep.bound_sockets()[0]);
     let b_addr = EndpointAddr::new(b_id).with_ip_addr(b_ep.bound_sockets()[0]);
     a_lookup.add_endpoint_info(b_addr);
@@ -905,7 +931,6 @@ async fn bridged_stream_is_never_rebridged() {
     a_params.routed_cidrs = cidrs.clone();
     a_params.bridges = vec![bridge_a_to_b.clone()];
     a_params.allowed_bridge_servers = HashSet::from([b_id]);
-    a_params.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
     spawn_server_params(a_ep, a_params);
 
     let bridge_b_to_a = loopback_bridge("to-a", a_id);
@@ -914,7 +939,6 @@ async fn bridged_stream_is_never_rebridged() {
     b_params.routed_cidrs = cidrs;
     b_params.bridges = vec![bridge_b_to_a.clone()];
     b_params.allowed_bridge_servers = HashSet::from([a_id]);
-    b_params.bridge_valid_tokens = HashSet::from([BRIDGE_TOKEN.to_string()]);
     spawn_server_params(b_ep, b_params);
 
     // Both upstreams live: the loop is armed if re-bridging were possible.

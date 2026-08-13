@@ -6,7 +6,7 @@ use crate::blocklist::{self, BlockList};
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::bridge::BridgeUpstream;
 use crate::proxy::signaling::{
-    self, AcceptedRoutes, BridgeSummary, ControlMsg, Hello, HelloResponse, PeerRole, Target,
+    self, AcceptedRoutes, BridgeSummary, ControlMsg, HelloResponse, Target,
 };
 use crate::proxy::status_page::{
     self, BridgeInboundStatus, BridgeUpstreamStatus, ServerStatusTemplate,
@@ -129,12 +129,11 @@ pub struct ProxyServer {
     server_instance_nonce: u128,
     /// Accepted **client** auth tokens (`ftc` prefix).
     valid_tokens: HashSet<String>,
-    /// Accepted **bridge** auth tokens (`ftb` prefix) — a separate pool so a
-    /// client credential can never authenticate as a bridge, or vice versa.
-    bridge_valid_tokens: HashSet<String>,
-    /// Endpoint ids of servers allowed to bridge into this server. A connecting
-    /// bridge must present both an allowlisted (TLS-authenticated) id and a
-    /// valid `ftb` token. Empty = inbound bridging disabled.
+    /// Endpoint ids of servers allowed to bridge into this server, mirrored
+    /// here for the status page only. Enforcement is native: the endpoint's
+    /// `BridgeAllowlistHook` rejects a non-allowlisted bridge at the TLS
+    /// handshake, so such a connection never reaches this server's accept
+    /// loop. Empty = inbound bridging disabled.
     allowed_bridge_servers: HashSet<EndpointId>,
     /// Outbound bridges, sorted by name (deterministic first-match in
     /// [`Self::bridge_for`]). Their persistent upstream connections are
@@ -175,7 +174,8 @@ pub struct ProxyServer {
 pub struct ProxyServerParams {
     pub own_id: EndpointId,
     pub valid_tokens: HashSet<String>,
-    pub bridge_valid_tokens: HashSet<String>,
+    /// For the status page's inbound-bridge list only; enforcement lives in
+    /// the endpoint's `BridgeAllowlistHook` (see `create_server_endpoint`).
     pub allowed_bridge_servers: HashSet<EndpointId>,
     pub host_aliases: HashMap<String, String>,
     pub routed_set: RoutedSet,
@@ -199,7 +199,6 @@ impl ProxyServer {
             own_id: params.own_id,
             server_instance_nonce: rand::rng().random(),
             valid_tokens: params.valid_tokens,
-            bridge_valid_tokens: params.bridge_valid_tokens,
             allowed_bridge_servers: params.allowed_bridge_servers,
             bridges,
             host_aliases: params.host_aliases,
@@ -460,9 +459,10 @@ impl ProxyServer {
         // returns (it outlives the awaited bridge path too).
         let _path_watcher = crate::transport::paths::watch_connection_paths(&connection);
 
-        // Control stream: read Hello. Kept open afterwards for heartbeats, so the
-        // send/recv halves flow through to the heartbeat loop. Bounded so a peer
-        // that opens the connection but never sends the handshake can't hang us.
+        // Control stream: read the handshake. Kept open afterwards for
+        // heartbeats, so the send/recv halves flow through to the heartbeat
+        // loop. Bounded so a peer that opens the connection but never sends the
+        // handshake can't hang us.
         let (mut send, recv, data) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let (send, mut recv) = connection.accept_bi().await.map_err(|e| {
                 ProxyError::Signaling(format!("Failed to accept handshake stream: {e}"))
@@ -472,16 +472,19 @@ impl ProxyServer {
         })
         .await
         .map_err(|_| ProxyError::Signaling("timed out waiting for client handshake".into()))??;
-        let hello = signaling::decode_hello(&data)?;
 
-        // Bridges take a separate path: their own token pool (`ftb`) plus the
-        // endpoint-id allowlist. They open data streams like a client, but those
-        // streams are never re-bridged (single hop). Handled fully in there.
-        if hello.role == PeerRole::Bridge {
+        // Bridges arrive on their own ALPN and take a separate path: their sole
+        // credential is the TLS-authenticated endpoint id, already checked
+        // against the allowlist by the endpoint's `BridgeAllowlistHook` — a
+        // rejected bridge never gets here. They open data streams like a
+        // client, but those streams are never re-bridged (single hop).
+        if connection.alpn() == crate::transport::BRIDGE_ALPN {
+            signaling::decode_bridge_hello(&data)?;
             return self
-                .handle_bridge(connection, remote_id, conn_seq, send, recv, hello)
+                .handle_bridge(connection, remote_id, conn_seq, send, recv)
                 .await;
         }
+        let hello = signaling::decode_hello(&data)?;
 
         // Authenticate first: only a validated, non-blocklisted peer may influence
         // server behavior — including the duplicate-server self-block below. The
@@ -606,13 +609,16 @@ impl ProxyServer {
         }
     }
 
-    /// Serve an authenticated **bridge** connection: validate its `ftb` token
-    /// AND its TLS-authenticated endpoint id against the allowlist (both must
-    /// pass), register it for the status page, accept it, then serve its
-    /// streams like a client's — except they are flagged `from_bridge` so they
-    /// are never bridged again (single hop; prevents forwarding loops). The
-    /// bridge's targets are re-checked against *this* server's routed set, and
-    /// its domain targets are resolved (and aliased) here.
+    /// Serve an authenticated **bridge** connection: register it for the
+    /// status page, accept it, then serve its streams like a client's — except
+    /// they are flagged `from_bridge` so they are never bridged again (single
+    /// hop; prevents forwarding loops). The bridge's targets are re-checked
+    /// against *this* server's routed set, and its domain targets are resolved
+    /// (and aliased) here.
+    ///
+    /// Authentication already happened: the endpoint's `BridgeAllowlistHook`
+    /// validated the TLS-authenticated endpoint id against the allowlist at
+    /// the handshake, so every connection reaching here is allowlisted.
     async fn handle_bridge(
         self: Arc<Self>,
         connection: Connection,
@@ -620,36 +626,7 @@ impl ProxyServer {
         conn_seq: u64,
         mut send: SendStream,
         recv: RecvStream,
-        hello: Hello,
     ) -> ProxyResult<()> {
-        if self.allowed_bridge_servers.is_empty() {
-            return self
-                .reject_bridge(
-                    &connection,
-                    &mut send,
-                    remote_id,
-                    "bridging is not enabled on this server",
-                )
-                .await;
-        }
-        // Both gates must pass. The endpoint id needs no further proof — iroh's
-        // TLS handshake already authenticated it.
-        if !self.bridge_valid_tokens.contains(&hello.auth_token) {
-            return self
-                .reject_bridge(&connection, &mut send, remote_id, "Invalid authentication token")
-                .await;
-        }
-        if !self.allowed_bridge_servers.contains(&remote_id) {
-            return self
-                .reject_bridge(
-                    &connection,
-                    &mut send,
-                    remote_id,
-                    "server id is not on this server's bridge allowlist",
-                )
-                .await;
-        }
-
         // Register for the status page's connected badge. `_guard` removes the
         // entry on any exit; overlapping entries during a reconnect are benign.
         self.bridge_registry
@@ -680,27 +657,6 @@ impl ProxyServer {
             r = socks => r,
             r = heartbeat => r,
         }
-    }
-
-    /// Reject a bridge handshake: write a rejection response, close gracefully,
-    /// and return the auth-failure error. Mirrors the client rejection path.
-    async fn reject_bridge(
-        &self,
-        connection: &Connection,
-        send: &mut SendStream,
-        remote_id: EndpointId,
-        reason: &str,
-    ) -> ProxyResult<()> {
-        log::warn!("Rejecting bridge {remote_id}: {reason}");
-        let resp = HelloResponse::rejected(self.server_instance_nonce, reason);
-        let _ = signaling::write_message(send, &signaling::encode_hello_response(&resp)?).await;
-        let _ = send.finish();
-        // Give the bridge a moment to read the rejection, then close with the reason.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        connection.close(1u32.into(), b"authentication rejected");
-        Err(ProxyError::AuthenticationFailed(format!(
-            "bridge {remote_id} rejected: {reason}"
-        )))
     }
 
     /// The first (name-ordered) outbound bridge whose rules match `target`, if

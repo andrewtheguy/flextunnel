@@ -27,13 +27,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
-    /// The target server's iroh endpoint id.
+    /// The target server's iroh endpoint id. No credential accompanies it:
+    /// this server authenticates to the target by its own TLS-authenticated
+    /// endpoint id, which must be on the target's `allowed_bridge_servers`.
     pub endpoint_id: String,
-    /// Bridge auth token (an `ftb` token accepted by the target server's
-    /// `bridge_auth_tokens`). Exactly one of `auth_token`/`auth_token_file`.
-    pub auth_token: Option<String>,
-    /// File containing the bridge auth token.
-    pub auth_token_file: Option<PathBuf>,
     /// Domain rules forwarded to the target server (routed-set syntax: exact,
     /// `*.x`, or `*`).
     #[serde(default)]
@@ -90,15 +87,10 @@ pub struct ServerConfig {
     /// to that bridge's server instead of dialed locally. See [`BridgeConfig`].
     pub bridges: Option<HashMap<String, BridgeConfig>>,
     /// Endpoint ids of servers allowed to connect **to this server** as
-    /// bridges. Empty/absent = inbound bridging disabled. A connecting bridge
-    /// must present both an allowlisted (TLS-authenticated) endpoint id and a
-    /// valid `ftb` token from `bridge_auth_tokens`.
+    /// bridges — the sole, mandatory bridge credential (the id is
+    /// TLS-authenticated by iroh's handshake; the allowlist is enforced
+    /// natively there). Empty/absent = inbound bridging disabled.
     pub allowed_bridge_servers: Option<Vec<String>>,
-    /// Accepted bridge auth tokens (inline list) — a separate pool from client
-    /// tokens, using the `ftb` prefix.
-    pub bridge_auth_tokens: Option<Vec<String>>,
-    /// File of accepted bridge auth tokens (one per line).
-    pub bridge_auth_tokens_file: Option<PathBuf>,
 }
 
 /// Client config file schema. Every field is optional; CLI flags override these.
@@ -155,14 +147,11 @@ pub struct ResolvedServer {
     /// case-insensitive matching (parsed into a `DnsForwarder` at startup).
     pub dns_forwards: HashMap<String, Vec<String>>,
     /// Outbound bridge routes keyed by their friendly label, shape-validated
-    /// (token source, non-empty rules, unique endpoint ids) with token-file
-    /// paths tilde-expanded. See [`BridgeConfig`].
+    /// (non-empty rules, unique endpoint ids). See [`BridgeConfig`].
     pub bridges: HashMap<String, BridgeConfig>,
     /// Endpoint ids of servers allowed to bridge into this server (parsed and
     /// checked against `own_id` at startup).
     pub allowed_bridge_servers: Vec<String>,
-    pub bridge_auth_tokens: Vec<String>,
-    pub bridge_auth_tokens_file: Option<PathBuf>,
     /// Path to the duplicate-id blocklist file. Always the fixed default
     /// (`~/.config/flextunnel/blocklist.json`); it is deliberately **not**
     /// configurable, since relocating this security guard rail would let it be
@@ -278,12 +267,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
     } else {
         (file.auth_tokens, file.auth_tokens_file)
     };
-    let (bridge_auth_tokens, bridge_auth_tokens_file) =
-        if cli.bridge_auth_tokens.is_some() || cli.bridge_auth_tokens_file.is_some() {
-            (cli.bridge_auth_tokens, cli.bridge_auth_tokens_file)
-        } else {
-            (file.bridge_auth_tokens, file.bridge_auth_tokens_file)
-        };
 
     // Host aliases are file-only (no CLI flag). Lowercase keys so matching is
     // case-insensitive against a lowercased requested host (DNS hostnames are
@@ -317,19 +300,14 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
 
     // Bridges are file-only (no CLI flag). Shape-validate each entry here so
     // bad bridge config fails at startup with the offending name; I/O-dependent
-    // validation (endpoint-id parsing, token loading, routed-set coverage)
-    // happens at server startup.
-    let mut bridges = cli.bridges.or(file.bridges).unwrap_or_default();
+    // validation (endpoint-id parsing, routed-set coverage) happens at server
+    // startup.
+    let bridges = cli.bridges.or(file.bridges).unwrap_or_default();
     let mut seen_endpoint_ids: HashMap<&str, &str> = HashMap::new();
     let mut names: Vec<&String> = bridges.keys().collect();
     names.sort();
     for name in names {
         let b = &bridges[name];
-        if b.auth_token.is_some() == b.auth_token_file.is_some() {
-            anyhow::bail!(
-                "bridge '{name}' must set exactly one of auth_token / auth_token_file"
-            );
-        }
         if b.domains.is_empty() && b.cidrs.is_empty() {
             anyhow::bail!("bridge '{name}' has no domains and no cidrs; it would never match");
         }
@@ -339,9 +317,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
                  merge their domains/cidrs into one entry"
             );
         }
-    }
-    for b in bridges.values_mut() {
-        b.auth_token_file = b.auth_token_file.take().map(|p| expand_tilde(&p));
     }
 
     // Fixed at the default (~/.config/flextunnel/blocklist.json) and NOT
@@ -373,8 +348,6 @@ pub fn resolve_server(cli: ServerConfig, file: Option<ServerConfig>) -> Result<R
             .allowed_bridge_servers
             .or(file.allowed_bridge_servers)
             .unwrap_or_default(),
-        bridge_auth_tokens: bridge_auth_tokens.unwrap_or_default(),
-        bridge_auth_tokens_file: bridge_auth_tokens_file.map(|p| expand_tilde(&p)),
         blocklist_file,
     })
 }
@@ -633,51 +606,28 @@ mod tests {
     fn bridges_parsed_and_validated() {
         let toml = r#"
             allowed_bridge_servers = ["endpointid_a"]
-            bridge_auth_tokens = ["ftbAAA"]
 
             [bridges.lab]
             endpoint_id = "endpointid_b"
-            auth_token = "ftbBBB"
             domains = ["*.svc"]
             cidrs = ["fd34::/64"]
 
             [bridges.other]
             endpoint_id = "endpointid_c"
-            auth_token_file = "~/bridge.token"
             cidrs = ["10.9.0.0/16"]
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let r = resolve_server(ServerConfig::default(), Some(file)).unwrap();
         let lab = &r.bridges["lab"];
         assert_eq!(lab.endpoint_id, "endpointid_b");
-        assert_eq!(lab.auth_token.as_deref(), Some("ftbBBB"));
         assert_eq!(lab.domains, vec!["*.svc"]);
         assert_eq!(lab.cidrs, vec!["fd34::/64"]);
-        // Token-file paths are tilde-expanded.
-        let other = &r.bridges["other"];
-        assert_eq!(other.auth_token_file, Some(expand_tilde(Path::new("~/bridge.token"))));
+        assert_eq!(r.bridges["other"].endpoint_id, "endpointid_c");
         assert_eq!(r.allowed_bridge_servers, vec!["endpointid_a".to_string()]);
-        assert_eq!(r.bridge_auth_tokens, vec!["ftbAAA".to_string()]);
         // Defaults to empty when unset.
         let empty = resolve_server(ServerConfig::default(), None).unwrap();
         assert!(empty.bridges.is_empty());
         assert!(empty.allowed_bridge_servers.is_empty());
-        assert!(empty.bridge_auth_tokens.is_empty());
-    }
-
-    #[test]
-    fn bridge_requires_exactly_one_token_source() {
-        for body in [
-            // Neither source.
-            "endpoint_id = \"e\"\ndomains = [\"*.svc\"]",
-            // Both sources.
-            "endpoint_id = \"e\"\nauth_token = \"ftbAAA\"\nauth_token_file = \"t\"\ndomains = [\"*.svc\"]",
-        ] {
-            let toml = format!("[bridges.lab]\n{body}\n");
-            let file: ServerConfig = toml::from_str(&toml).unwrap();
-            let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
-            assert!(err.to_string().contains("exactly one of auth_token"), "{err}");
-        }
     }
 
     #[test]
@@ -685,7 +635,6 @@ mod tests {
         let toml = r#"
             [bridges.lab]
             endpoint_id = "e"
-            auth_token = "ftbAAA"
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
         let err = resolve_server(ServerConfig::default(), Some(file)).unwrap_err();
@@ -697,12 +646,10 @@ mod tests {
         let toml = r#"
             [bridges.a]
             endpoint_id = "same"
-            auth_token = "ftbAAA"
             domains = ["*.svc"]
 
             [bridges.b]
             endpoint_id = "same"
-            auth_token = "ftbBBB"
             cidrs = ["10.0.0.0/8"]
         "#;
         let file: ServerConfig = toml::from_str(toml).unwrap();
@@ -750,8 +697,6 @@ mod tests {
             auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
             relay_urls = ["https://relay.example"]
             allowed_bridge_servers = ["<endpoint id>"]
-            bridge_auth_tokens = ["ftbAAA"]
-            bridge_auth_tokens_file = "/etc/flextunnel/bridge_auth_tokens.txt"
             routed_domains = ["*.example.com"]
             routed_cidrs = ["10.0.0.0/8"]
 
@@ -763,7 +708,6 @@ mod tests {
 
             [bridges.lab]
             endpoint_id = "<endpoint id>"
-            auth_token = "ftbBBB"
             domains = ["*.svc"]
             cidrs = ["fd34::/64"]
         "#;

@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -46,21 +46,6 @@ pub const REP_CONN_REFUSED: u8 = 0x05;
 pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// Which kind of peer is connecting. A **client** runs local proxy listener(s)
-/// and *opens* tunnel streams to the server; a **bridge** is another flextunnel
-/// server forwarding bridged streams.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PeerRole {
-    /// Local proxy listener(s); opens tunnel streams to the server.
-    #[default]
-    Client,
-    /// Another flextunnel server forwarding bridged streams. Opens tunnel
-    /// streams like a client but authenticates with an `ftb` token, and its
-    /// TLS-authenticated iroh endpoint id must be on the receiving server's
-    /// bridge allowlist (see the server's `allowed_bridge_servers`).
-    Bridge,
-}
-
 /// Client → server auth handshake (first bi-stream of the connection).
 ///
 /// `Debug` is implemented manually to redact `auth_token` (a bearer credential)
@@ -80,11 +65,6 @@ pub struct Hello {
     /// not a command; the server decides whether to self-block on it.
     #[serde(default)]
     pub duplicate_server_observed: bool,
-    /// Whether this peer is a client (local proxy listener) or a bridge. Drives
-    /// the server's post-handshake handling and which auth-token pool the token
-    /// is checked against.
-    #[serde(default)]
-    pub role: PeerRole,
 }
 
 impl std::fmt::Debug for Hello {
@@ -94,7 +74,6 @@ impl std::fmt::Debug for Hello {
             .field("auth_token", &"<redacted>")
             .field("client_instance_nonce", &self.client_instance_nonce)
             .field("duplicate_server_observed", &self.duplicate_server_observed)
-            .field("role", &self.role)
             .finish()
     }
 }
@@ -144,25 +123,60 @@ pub struct HelloResponse {
 }
 
 impl Hello {
-    /// A client `Hello` (`role = Client`).
+    /// A client `Hello`.
     pub fn new(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             auth_token: auth_token.into(),
             client_instance_nonce,
             duplicate_server_observed: false,
-            role: PeerRole::Client,
         }
     }
+}
 
-    /// A bridge `Hello` (`role = Bridge`). A bridge's identity is its persistent
-    /// iroh endpoint id, already TLS-authenticated by the QUIC connection.
-    pub fn new_bridge(auth_token: impl Into<String>, client_instance_nonce: u128) -> Self {
+/// Bridge → server handshake (first bi-stream of a [`BRIDGE_ALPN`] connection).
+///
+/// Carries only the protocol version: the bridge's role rides the ALPN, and its
+/// sole credential is its TLS-authenticated endpoint id, checked natively
+/// against the server's allowlist before the connection ever reaches the
+/// accept loop (see `transport::endpoint::BridgeAllowlistHook`). The server
+/// replies with a [`HelloResponse`] and the stream stays open for heartbeats.
+///
+/// [`BRIDGE_ALPN`]: crate::transport::BRIDGE_ALPN
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeHello {
+    pub version: u16,
+}
+
+impl BridgeHello {
+    pub fn new() -> Self {
         Self {
-            role: PeerRole::Bridge,
-            ..Self::new(auth_token, client_instance_nonce)
+            version: PROTOCOL_VERSION,
         }
     }
+}
+
+impl Default for BridgeHello {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Encode a `BridgeHello` to JSON bytes.
+pub fn encode_bridge_hello(hello: &BridgeHello) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(hello).map_err(io::Error::other)
+}
+
+/// Decode a `BridgeHello` from JSON bytes, validating the protocol version.
+pub fn decode_bridge_hello(data: &[u8]) -> io::Result<BridgeHello> {
+    let hello: BridgeHello = serde_json::from_slice(data).map_err(io::Error::other)?;
+    if hello.version != PROTOCOL_VERSION {
+        return Err(io::Error::other(format!(
+            "Unsupported protocol version: {} (expected {})",
+            hello.version, PROTOCOL_VERSION
+        )));
+    }
+    Ok(hello)
 }
 
 /// One outbound bridge route, pushed to clients on acceptance. Config only —
@@ -536,13 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn hello_bridge_roundtrip() {
-        let hello = Hello::new_bridge("token", 42);
-        let decoded = decode_hello(&encode_hello(&hello).unwrap()).unwrap();
-        assert_eq!(decoded.role, PeerRole::Bridge);
-        assert_eq!(decoded.auth_token, "token");
-        assert_eq!(decoded.client_instance_nonce, 42);
-        assert!(!decoded.duplicate_server_observed);
+    fn bridge_hello_roundtrip() {
+        let hello = BridgeHello::new();
+        let decoded = decode_bridge_hello(&encode_bridge_hello(&hello).unwrap()).unwrap();
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+
+        // A version mismatch is rejected at decode.
+        let stale = serde_json::to_vec(&BridgeHello { version: 1 }).unwrap();
+        assert!(decode_bridge_hello(&stale).is_err());
     }
 
     #[test]

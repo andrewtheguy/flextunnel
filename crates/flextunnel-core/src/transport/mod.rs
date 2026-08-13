@@ -56,6 +56,16 @@ pub const LIVENESS_WINDOW: Duration =
 /// the auth-token handshake, not by this value.
 pub const ALPN: &[u8] = b"flextunnel/1";
 
+/// QUIC ALPN protocol identifier for server-to-server **bridge** connections.
+///
+/// The ALPN carries the peer's *role* (bridge vs client) so the two paths can
+/// be told apart at the transport layer; like [`ALPN`] it is not a credential.
+/// Bridge access control is the receiving server's endpoint-id allowlist,
+/// enforced natively at the TLS handshake (see
+/// [`endpoint::BridgeAllowlistHook`]) — the id needs no further proof because
+/// iroh's handshake authenticates it.
+pub const BRIDGE_ALPN: &[u8] = b"flextunnel-bridge/1";
+
 /// Build a QUIC transport config with keep-alive, idle timeout, and a larger
 /// initial MTU. Shared by client and server endpoint creation so both sides
 /// apply identical settings.

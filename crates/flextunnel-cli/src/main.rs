@@ -87,12 +87,6 @@ enum Command {
         #[arg(short, long, default_value = "1")]
         count: usize,
     },
-    /// Generate bridge authentication token(s) (server-to-server, `ftb` prefix).
-    GenerateBridgeToken {
-        /// Number of tokens to generate.
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
 }
 
 #[derive(Subcommand)]
@@ -428,12 +422,6 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::GenerateBridgeToken { count } => {
-            for _ in 0..count {
-                println!("{}", auth::generate_bridge_token());
-            }
-            Ok(())
-        }
         command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
@@ -482,8 +470,6 @@ async fn run_async(command: Command) -> Result<()> {
                 dns_forwards: None,   // config-file only; no CLI flag
                 bridges: None,        // config-file only; no CLI flag
                 allowed_bridge_servers: None, // config-file only; no CLI flag
-                bridge_auth_tokens: None,     // config-file only; no CLI flag
-                bridge_auth_tokens_file: None, // config-file only; no CLI flag
             };
             let file = config::load_server_config(config_path.as_deref(), default_config)?;
             run_server(config::resolve_server(cli, file)?, None).await
@@ -677,15 +663,8 @@ async fn run_server(
         validate_dns_forwards_coverage(forwarder, &routed_set)?;
     }
 
-    // Inbound bridging: parse the allowlist and load the `ftb` token pool. Both
-    // gates are required for a bridge to connect, so either half alone is dead
-    // config — fail loudly.
-    let bridge_valid_tokens = auth::load_auth_tokens(
-        &r.bridge_auth_tokens,
-        r.bridge_auth_tokens_file.as_deref(),
-        auth::BRIDGE_TOKEN_PREFIX,
-    )
-    .context("Failed to load bridge authentication tokens")?;
+    // Inbound bridging: parse the allowlist — the sole bridge credential,
+    // enforced natively at the TLS handshake by the endpoint's allowlist hook.
     let allowed_bridge_servers = r
         .allowed_bridge_servers
         .iter()
@@ -700,29 +679,10 @@ async fn run_server(
              cannot bridge to itself — this is likely a copy-paste mistake"
         );
     }
-    if !allowed_bridge_servers.is_empty() && bridge_valid_tokens.is_empty() {
-        anyhow::bail!(
-            "{} allowed bridge server(s) are configured but no bridge authentication token \
-             was provided, so no bridge can connect.\n\
-             Generate one with: flextunnel generate-bridge-token\n\
-             Then set bridge_auth_tokens/bridge_auth_tokens_file in the config, or remove \
-             allowed_bridge_servers.",
-            allowed_bridge_servers.len()
-        );
-    }
-    if allowed_bridge_servers.is_empty() && !bridge_valid_tokens.is_empty() {
-        anyhow::bail!(
-            "bridge authentication token(s) are configured but allowed_bridge_servers is \
-             empty; inbound bridging is gated on the allowlist, so tokens alone can never \
-             admit a bridge. Add the bridging servers' endpoint ids to \
-             allowed_bridge_servers, or remove the bridge tokens."
-        );
-    }
     if !allowed_bridge_servers.is_empty() {
         log::info!(
-            "Inbound bridging enabled for {} server(s), {} bridge token(s)",
-            allowed_bridge_servers.len(),
-            bridge_valid_tokens.len()
+            "Inbound bridging enabled for {} server(s)",
+            allowed_bridge_servers.len()
         );
     }
 
@@ -733,7 +693,7 @@ async fn run_server(
         .context("Invalid relay configuration")?;
 
     // Outbound bridges: resolve each `[bridges.<name>]` entry (endpoint id,
-    // token, rules) and reject rules the routed set never reaches — the server
+    // rules) and reject rules the routed set never reaches — the server
     // rejects off-list targets before bridge routing, so such a rule is dead
     // config (same reasoning as the dns_forwards coverage check above).
     let mut bridges = Vec::with_capacity(r.bridges.len());
@@ -744,16 +704,6 @@ async fn run_server(
         if endpoint_id == own_id {
             anyhow::bail!("bridge '{name}' targets this server itself ({own_id})");
         }
-        let auth_token = if let Some(token) = &b.auth_token {
-            auth::validate_bridge_token(token)
-                .with_context(|| format!("bridge '{name}' has an invalid auth_token"))?;
-            token.clone()
-        } else {
-            // resolve_server validated exactly one source is set.
-            let path = b.auth_token_file.as_deref().expect("validated token source");
-            auth::load_auth_token_from_file(path, auth::BRIDGE_TOKEN_PREFIX)
-                .with_context(|| format!("bridge '{name}': failed to load auth token file"))?
-        };
         let bridge_routed_set = RoutedSet::new(&b.domains, &b.cidrs)
             .with_context(|| format!("bridge '{name}' has invalid route rules"))?;
         routed_set
@@ -768,7 +718,6 @@ async fn run_server(
         bridges.push(BridgeUpstream::new(BridgeUpstreamConfig {
             name: name.clone(),
             endpoint_id,
-            auth_token,
             relay_urls: relay_config.custom_urls().to_vec(),
             routed_set: bridge_routed_set,
             domains: b.domains.clone(),
@@ -779,7 +728,7 @@ async fn run_server(
         log::info!("Loaded {} bridge route(s)", bridges.len());
     }
 
-    let endpoint = create_server_endpoint(&relay_config, secret_key)
+    let endpoint = create_server_endpoint(&relay_config, secret_key, allowed_bridge_servers.clone())
         .await
         .context("Failed to create iroh endpoint")?;
 
@@ -809,7 +758,6 @@ async fn run_server(
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
         valid_tokens,
-        bridge_valid_tokens,
         allowed_bridge_servers,
         host_aliases: r.host_aliases,
         routed_set,

@@ -4,19 +4,18 @@
 //!
 //! ## Token Format
 //! - Exactly 49 characters
-//! - Starts with a 3-char role prefix: `ftc` (client) or `ftb` (bridge — a
-//!   server connecting to another server)
+//! - Starts with the 3-char role prefix `ftc` (client)
 //! - Remaining 46 characters are Base64URL (no padding)
 //! - Decoded payload is exactly 34 bytes:
 //!   - First 32 bytes: random entropy
 //!   - Last 2 bytes: CRC16-CCITT-FALSE checksum (big-endian) of the 32 random bytes
 //!
-//! All roles share this format but use distinct prefixes so a credential for
-//! one role can never authenticate as another — the server validates each
-//! against the prefix for the connecting peer's role.
+//! Tokens authenticate **clients** only. Bridges (a server connecting to
+//! another server) carry no token: their credential is their persistent iroh
+//! endpoint id, TLS-authenticated and checked against the receiving server's
+//! `allowed_bridge_servers` allowlist at the handshake.
 //!
-//! Generate client tokens with `flextunnel generate-auth-token`, bridge tokens
-//! with `flextunnel generate-bridge-token`.
+//! Generate client tokens with `flextunnel generate-auth-token`.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -29,9 +28,6 @@ pub const TOKEN_LENGTH: usize = 49;
 
 /// Required prefix for client tokens.
 pub const CLIENT_TOKEN_PREFIX: &str = "ftc";
-
-/// Required prefix for bridge tokens (server-to-server).
-pub const BRIDGE_TOKEN_PREFIX: &str = "ftb";
 
 /// Number of random bytes in token payload.
 const RANDOM_BYTES_LEN: usize = 32;
@@ -72,11 +68,6 @@ pub fn generate_client_token() -> String {
     generate_token_with_prefix(CLIENT_TOKEN_PREFIX)
 }
 
-/// Generate a new bridge authentication token (prefix `ftb`).
-pub fn generate_bridge_token() -> String {
-    generate_token_with_prefix(BRIDGE_TOKEN_PREFIX)
-}
-
 /// Generate a new authentication token with the given 3-char role prefix.
 ///
 /// Format: `<prefix>` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 49
@@ -97,11 +88,6 @@ pub fn generate_token_with_prefix(prefix: &str) -> String {
 /// Validate a client token (prefix `ftc`).
 pub fn validate_client_token(token: &str) -> Result<()> {
     validate_token_with_prefix(token, CLIENT_TOKEN_PREFIX)
-}
-
-/// Validate a bridge token (prefix `ftb`).
-pub fn validate_bridge_token(token: &str) -> Result<()> {
-    validate_token_with_prefix(token, BRIDGE_TOKEN_PREFIX)
 }
 
 /// Validate token format against a specific role prefix.
@@ -155,7 +141,7 @@ pub fn validate_token_with_prefix(token: &str, prefix: &str) -> Result<()> {
 }
 
 /// Load auth tokens from CLI arguments and/or a file, validating each against
-/// the given role `prefix` (`ftc` for clients, `ftb` for bridges).
+/// the given role `prefix` (`ftc` for clients).
 ///
 /// # Arguments
 /// * `cli_tokens` - Tokens specified via CLI `--auth-tokens` flags
@@ -490,26 +476,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_bridge_token_format_and_prefix_isolation() {
-        // Bridge tokens are well-formed with the `ftb` prefix...
-        let bridge = generate_bridge_token();
-        assert_eq!(bridge.len(), TOKEN_LENGTH);
-        assert!(bridge.starts_with(BRIDGE_TOKEN_PREFIX));
-        assert!(validate_bridge_token(&bridge).is_ok());
-
-        // ...and the two pools are mutually exclusive: a bridge token is not a
-        // valid client token, and a client token is not a valid bridge token.
-        assert!(validate_client_token(&bridge).is_err());
-        assert!(validate_bridge_token(&generate_client_token()).is_err());
-    }
-
-    #[test]
-    fn test_load_bridge_tokens_rejects_client_prefix() {
-        // A client token in a bridge-token file must fail prefix validation.
-        let client = generate_client_token();
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "{}", client).unwrap();
-        assert!(load_auth_tokens_from_file(file.path(), BRIDGE_TOKEN_PREFIX).is_err());
-    }
 }

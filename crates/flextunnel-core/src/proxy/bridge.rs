@@ -1,9 +1,12 @@
 //! Outbound bridge: a persistent connection from this server to **another
 //! flextunnel server**, used to forward tunnel streams whose target matches the
 //! bridge's rules (split-tunnel across servers). The bridging server dials out
-//! on its own server endpoint, so the TLS identity it presents is its
-//! persistent server id — exactly what the target server's
-//! `allowed_bridge_servers` allowlist matches, alongside the `ftb` token.
+//! on its own server endpoint with the [`BRIDGE_ALPN`], so the TLS identity it
+//! presents is its persistent server id — the target server's
+//! `allowed_bridge_servers` allowlist matches exactly that id, natively at the
+//! TLS handshake, and it is the sole bridge credential.
+//!
+//! [`BRIDGE_ALPN`]: crate::transport::BRIDGE_ALPN
 //!
 //! The connect/auth/heartbeat machinery mirrors [`super::client`], with one
 //! deliberate difference in reconnect policy: a bridge retries **forever** (no
@@ -15,11 +18,10 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::client::{calculate_backoff, client_heartbeat_loop, connect_with_timeout};
-use crate::proxy::signaling::{self, Hello};
+use crate::proxy::signaling::{self, BridgeHello};
 use crate::proxy::RoutedSet;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
-use rand::Rng;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -28,16 +30,15 @@ use tokio::io::AsyncWriteExt;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolved config for one outbound bridge (from a `[bridges.<name>]` entry),
-/// validated at startup: the endpoint id parsed, the token loaded, and the
-/// rules parsed into a [`RoutedSet`] whose coverage by the server's own routed
-/// set has been checked.
+/// validated at startup: the endpoint id parsed and the rules parsed into a
+/// [`RoutedSet`] whose coverage by the server's own routed set has been
+/// checked. No credential is carried — this server's persistent endpoint id,
+/// authenticated by the TLS handshake, is what the target server allowlists.
 pub struct BridgeUpstreamConfig {
     /// The friendly `[bridges.<name>]` config key, for logs and status.
     pub name: String,
     /// The target server's endpoint id.
     pub endpoint_id: EndpointId,
-    /// The `ftb` token presented in the bridge handshake.
-    pub auth_token: String,
     /// Relay hints for reaching the target server. These are the same custom
     /// relay URLs installed on this server's endpoint; the relay PSK itself is
     /// endpoint-level state and must not be copied into the peer address.
@@ -57,8 +58,6 @@ pub struct BridgeUpstreamConfig {
 /// stream routing reads it via [`Self::active_conn`] and fails fast when down.
 pub struct BridgeUpstream {
     pub config: BridgeUpstreamConfig,
-    /// Random per-process identity sent in every `Hello` (see the client).
-    instance_nonce: u128,
     conn: Mutex<Option<Connection>>,
 }
 
@@ -66,7 +65,6 @@ impl BridgeUpstream {
     pub fn new(config: BridgeUpstreamConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
-            instance_nonce: rand::rng().random(),
             conn: Mutex::new(None),
         })
     }
@@ -124,15 +122,13 @@ impl BridgeUpstream {
             let (connection, ctrl_send, ctrl_recv) = match self.establish(&endpoint).await {
                 Ok(established) => established,
                 Err(e) => {
-                    // An explicit rejection means misconfig (wrong token, or
-                    // this server missing from the target's allowlist) — log
-                    // loudly. Still retry at capped backoff: the operator may
-                    // fix the *target's* config without restarting this server.
-                    if matches!(e, ProxyError::AuthenticationFailed(_)) {
-                        log::error!("Bridge '{name}': rejected by target server: {e}");
-                    } else {
-                        log::warn!("Bridge '{name}': connect failed: {e}");
-                    }
+                    // An allowlist rejection surfaces here as the target
+                    // closing the connection at the handshake with its reason
+                    // ("not on this server's bridge allowlist"), carried in the
+                    // error text. Retry at capped backoff regardless: the
+                    // operator may fix the *target's* config without
+                    // restarting this server.
+                    log::warn!("Bridge '{name}': connect failed: {e}");
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
@@ -163,23 +159,26 @@ impl BridgeUpstream {
         }
     }
 
-    /// Connect + authenticate as a bridge, returning the connection and the
-    /// control-stream halves (kept open for heartbeats).
+    /// Connect + handshake as a bridge, returning the connection and the
+    /// control-stream halves (kept open for heartbeats). Authentication is the
+    /// TLS handshake itself: a non-allowlisted id is rejected natively by the
+    /// target's endpoint hook, surfacing here as a connect/handshake error
+    /// carrying the target's close reason.
     async fn establish(
         &self,
         endpoint: &Endpoint,
     ) -> ProxyResult<(Connection, SendStream, RecvStream)> {
         let addr = self.target_addr();
-        let connection = connect_with_timeout(endpoint, addr).await?;
+        let connection = connect_with_timeout(endpoint, addr, crate::transport::BRIDGE_ALPN).await?;
         log::debug!(
-            "Bridge '{}': connected to target server, authenticating...",
+            "Bridge '{}': connected to target server, handshaking...",
             self.config.name
         );
         let (send, recv) = self.handshake(&connection).await?;
         Ok((connection, send, recv))
     }
 
-    /// Perform the bridge auth handshake on the first bi-stream, returning the
+    /// Perform the bridge handshake on the first bi-stream, returning the
     /// control-stream halves. The stream stays open as the heartbeat channel.
     async fn handshake(&self, connection: &Connection) -> ProxyResult<(SendStream, RecvStream)> {
         let (mut send, mut recv) = connection
@@ -187,8 +186,8 @@ impl BridgeUpstream {
             .await
             .map_err(|e| ProxyError::Signaling(format!("Failed to open handshake stream: {e}")))?;
 
-        let hello = Hello::new_bridge(self.config.auth_token.clone(), self.instance_nonce);
-        signaling::write_message(&mut send, &signaling::encode_hello(&hello)?).await?;
+        signaling::write_message(&mut send, &signaling::encode_bridge_hello(&BridgeHello::new())?)
+            .await?;
         send.flush().await?;
 
         let data = tokio::time::timeout(
@@ -220,7 +219,6 @@ mod tests {
         BridgeUpstream::new(BridgeUpstreamConfig {
             name: "test".to_string(),
             endpoint_id: SecretKey::generate().public(),
-            auth_token: "test-token".to_string(),
             relay_urls,
             routed_set: RoutedSet::default(),
             domains: Vec::new(),

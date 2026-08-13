@@ -25,18 +25,14 @@ auth_tokens = ["ftcXXXXXXX"]
 
 # Optional INBOUND bridging: allow other flextunnel servers to bridge INTO this
 # server (the inbound counterpart to the [bridges.*] OUTBOUND routes at the
-# bottom of this file). A connecting bridge must pass BOTH gates: its endpoint
-# id (TLS-authenticated by iroh, no extra proof needed) must be listed in
-# allowed_bridge_servers, AND it must present an `ftb` token from the
-# bridge_auth_tokens pool (a separate pool from client tokens). An
-# empty/absent allowlist disables inbound bridging entirely; configuring only
-# one of the two halves is rejected at startup as dead config. Bridged-in
+# bottom of this file). The allowlist is the sole bridge credential: a
+# connecting bridge's endpoint id (TLS-authenticated by iroh, no extra proof
+# needed) must be listed here, enforced natively at the handshake. An
+# empty/absent allowlist disables inbound bridging entirely. Bridged-in
 # targets must also be on this server's routed set (routed_domains/routed_cidrs
-# below). These are top-level keys, so they must appear BEFORE the [tables]
+# below). This is a top-level key, so it must appear BEFORE the [tables]
 # below (bare keys after a [table] header would bind to that table).
 # allowed_bridge_servers = ["<endpoint id of the bridging server>"]
-# bridge_auth_tokens = ["ftbXXXXXXX"]
-# bridge_auth_tokens_file = "/etc/flextunnel/bridge_auth_tokens.txt"
 
 # Duplicate-id blocklist (JSON). This path is fixed at
 # ~/.config/flextunnel/blocklist.json and is deliberately not configurable. The
@@ -143,25 +139,22 @@ routed_cidrs = ["10.0.0.0/8", "192.168.1.5"]
 # bridge is never bridged again, so two servers bridging at each other cannot
 # loop.
 #
-# Each entry needs the target server's endpoint id, an `ftb` auth token accepted
-# by that server (exactly one of auth_token / auth_token_file; generate with
-# `flextunnel generate-bridge-token`), and at least one rule. Rules use the
-# routed-set syntax above (domains: exact, `*.x`, or `*`; cidrs: CIDR or bare
-# IP). Checked BEFORE [host_aliases]/local dialing;
-# when several bridges match, the first in name order wins. Every rule must be
-# reachable through the routed set above (the whitelist runs first), or the
-# server refuses to start. The upstream connection is maintained with
-# reconnect/backoff; while it is down, matching requests fail as
-# host-unreachable. This server dials out with its own server identity — the
-# endpoint id the target server must allowlist.
+# Each entry needs the target server's endpoint id and at least one rule; no
+# credential — this server dials out with its own server identity, and that
+# TLS-authenticated endpoint id is what the target server must list in ITS
+# allowed_bridge_servers. Rules use the routed-set syntax above (domains:
+# exact, `*.x`, or `*`; cidrs: CIDR or bare IP). Checked BEFORE
+# [host_aliases]/local dialing; when several bridges match, the first in name
+# order wins. Every rule must be reachable through the routed set above (the
+# whitelist runs first), or the server refuses to start. The upstream
+# connection is maintained with reconnect/backoff; while it is down, matching
+# requests fail as host-unreachable.
 # [bridges.lab]
 # endpoint_id = "<endpoint id of the target server>"
-# auth_token = "ftbXXXXXXX"
-# # auth_token_file = "/etc/flextunnel/bridge_lab.token"
 # domains = ["*.svc"]
 # cidrs = ["fd34::/64"]
 
 # INBOUND bridging (letting other flextunnel servers bridge INTO this one) is
-# configured via the top-level `allowed_bridge_servers` / `bridge_auth_tokens`
-# keys near the top of this file — top-level keys must precede the [tables]
-# above, so they can't live down here beside the outbound routes.
+# configured via the top-level `allowed_bridge_servers` key near the top of
+# this file — top-level keys must precede the [tables] above, so it can't live
+# down here beside the outbound routes.
