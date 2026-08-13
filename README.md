@@ -603,6 +603,9 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
   constants.
+- [`docs/local-ci.md`](docs/local-ci.md) — running the CI workflow's clippy and
+  test steps locally on all three host platforms (macOS natively, Linux and
+  Windows over ssh) against the working tree, via `ci/all.sh`.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — the HTTP proxy
   front-end (CONNECT tunneling + absolute-URI forwarding): motivation, design,
   and remaining hardening work.

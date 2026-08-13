@@ -1,5 +1,6 @@
 - strict no backward compatibility
 - run cargo clippy and test after rust code changes
+- to run the CI workflow's clippy + test steps on all three host platforms against the working tree (macOS natively, Linux on `workstation-wsl` and Windows on `winsandbox` over ssh), use `ci/all.sh` — see `docs/local-ci.md`. Worth doing before a release, or after touching platform-gated code (`flextunnel-desktop`'s macOS/Windows backends), which Linux-only checks never compile.
 - no cargo fmt
 - always use uv to run python scripts if needed
 - clients and server are expected to be trusted and error detections, for example, duplicate id detections are meant for preventing accidental misconfigurations such as running two clients or servers with the same id.
