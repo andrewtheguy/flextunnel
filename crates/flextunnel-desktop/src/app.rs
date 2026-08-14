@@ -1338,15 +1338,7 @@ impl App {
             secret: client_key.secret_str(),
         };
         let id = key.id.clone();
-        let mut keys = self.keys.clone();
-        keys.push(key);
-        // Secrets first: only adopt the new list once the keychain write took.
-        if let Err(e) = config::save_key_secrets(&keys) {
-            log::error!("{e:#}");
-            self.notice = Some(format!("{e:#}"));
-            return;
-        }
-        self.keys = keys;
+        self.keys.push(key);
         self.persist_store();
         if let Some(form) = &mut self.profile_form {
             form.auth_key_id = id;
@@ -1361,18 +1353,10 @@ impl App {
         let Ok(key) = form.validate(&self.keys) else {
             return;
         };
-        let mut keys = self.keys.clone();
-        match keys.iter_mut().find(|k| k.id == key.id) {
+        match self.keys.iter_mut().find(|k| k.id == key.id) {
             Some(slot) => *slot = key,
-            None => keys.push(key),
+            None => self.keys.push(key),
         }
-        // Secrets first: only adopt the new list once the keychain write took.
-        if let Err(e) = config::save_key_secrets(&keys) {
-            log::error!("{e:#}");
-            self.notice = Some(format!("{e:#}"));
-            return;
-        }
-        self.keys = keys;
         self.persist_store();
         if self.notice.is_none() {
             // An edited secret reaches running sessions on their next connect.
@@ -1399,12 +1383,9 @@ impl App {
         }
         self.confirm_delete_key = None;
         self.keys.retain(|k| k.id != id);
-        // Best effort: a stale secret left behind in the keychain entry is
-        // harmless (nothing references its id anymore).
-        if let Err(e) = config::save_key_secrets(&self.keys) {
-            log::warn!("Failed to remove the deleted key's secret: {e:#}");
-        }
         self.key_form = None;
+        // The sealed blob is rebuilt from the retained keys, so this also
+        // erases the deleted key's secret.
         self.persist_store();
     }
 
