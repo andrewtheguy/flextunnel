@@ -64,7 +64,11 @@ Mirroring the jobs in `ci.yml`:
 - **macOS** — clippy over the whole workspace, tests for core + cli + desktop,
   then `./build-ios.sh debug` (the `verify-ios-xcframework` job). The iOS step
   skips itself, loudly, on a machine with no `xcodebuild`; set
-  `FLEXTUNNEL_CI_SKIP_IOS=1` to skip it on a machine that has one.
+  `FLEXTUNNEL_CI_SKIP_IOS=1` to skip it on a machine that has one. That step only
+  proves the xcframework *builds*; whether an iOS-affecting change still compiles
+  and links into the app, and whether it runs on a real phone, is the sibling
+  repo's `../flextunnel-ios/ci/` (`ci/ci.sh ffi` builds this working tree and
+  links the app against it — see that repo's `docs/local-ci.md`).
 - **Windows** — clippy over the whole workspace, tests for core + cli + desktop.
 
 Deliberately **not** here: release-profile builds, `.dmg`/`.msi` packaging, the
