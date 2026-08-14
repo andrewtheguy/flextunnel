@@ -127,7 +127,7 @@ pub struct ProxyServer {
     /// server instances that share this identity — how a duplicate server is
     /// detected client-side.
     server_instance_nonce: u128,
-    /// Authorized **client** public keys (`flextunnelpubv1:`), loaded from the
+    /// Authorized **client** public keys (`flxtpubv1:`), loaded from the
     /// server's authorized-keys file at startup.
     authorized_keys: HashSet<iroh::PublicKey>,
     /// Endpoint ids of servers allowed to bridge into this server, mirrored

@@ -30,7 +30,7 @@
 //!
 //! ## Config JSON (input to `flextunnel_start`)
 //!
-//! `auth_key` (the client's `flextunnelsecretv1:...` secret key, whose public
+//! `auth_key` (the client's `flxtsecretv1:...` secret key, whose public
 //! half must be on the server's authorized-keys file) and `server_node_id` are
 //! required; the rest are optional. The routed set (the *tunnel set* that
 //! decides split-tunneling) is configured on the server and pushed to the
@@ -39,7 +39,7 @@
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
-//!   "auth_key": "flextunnelsecretv1:...",
+//!   "auth_key": "flxtsecretv1:...",
 //!   "socks_port": null,
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_auth_token": null
@@ -98,7 +98,7 @@ pub struct FlextunnelHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     server_node_id: String,
-    /// The client's secret key (`flextunnelsecretv1:...`); the app stores it
+    /// The client's secret key (`flxtsecretv1:...`); the app stores it
     /// in the iOS keychain and passes it here at start.
     auth_key: String,
     /// Loopback SOCKS5 port to bind. `None` disables the SOCKS5 front-end;
@@ -137,7 +137,7 @@ pub extern "C" fn flextunnel_init_logging() {
 }
 
 /// Generate a fresh client authentication keypair. Writes
-/// `{"created":"<UTC>","public_key":"flextunnelpubv1:...","secret_key":"flextunnelsecretv1:..."}`
+/// `{"created":"<UTC>","public_key":"flxtpubv1:...","secret_key":"flxtsecretv1:..."}`
 /// to `out_buf`. The app stores the secret key in the keychain and shows the
 /// public key (never a secret) for the user to put on the server's
 /// authorized-keys file. Returns 1 on success, 0 if `out_buf` is too small.
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn flextunnel_generate_client_key(
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
-/// Derive the public key (`flextunnelpubv1:...`) of a stored secret key, so
+/// Derive the public key (`flxtpubv1:...`) of a stored secret key, so
 /// the app can display it unmasked without persisting it separately. Writes
 /// the public key string to `out_buf` on success (returns 1), or an error
 /// message (returns 0) for an invalid secret. A too-small `out_buf` also

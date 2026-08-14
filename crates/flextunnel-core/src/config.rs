@@ -49,7 +49,7 @@ pub struct ServerConfig {
     /// ephemeral identity never touches the config).
     pub secret_file: Option<PathBuf>,
     /// File of authorized client public keys (ssh-`authorized_keys` style: one
-    /// `flextunnelpubv1:...` per line, optional trailing comment). Always a
+    /// `flxtpubv1:...` per line, optional trailing comment). Always a
     /// file — there is no inline list.
     pub authorized_keys_file: Option<PathBuf>,
     /// Custom relay URL(s) for failover.
@@ -113,7 +113,7 @@ pub struct ClientConfig {
     /// absolute-URI plain-HTTP forwarding; binds `127.0.0.1` only). Unset =
     /// HTTP front-end disabled.
     pub http_port: Option<u16>,
-    /// Inline client secret key (`flextunnelsecretv1:...`) used to
+    /// Inline client secret key (`flxtsecretv1:...`) used to
     /// authenticate to the server. Never settable from TOML (`serde(skip)` +
     /// `deny_unknown_fields` rejects it loudly) — carrier for the `--auth-key`
     /// CLI flag only; config files must use `auth_key_file`.
@@ -463,7 +463,7 @@ mod tests {
         let err = toml::from_str::<ServerConfig>("secret = \"aGVsbG8=\"").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
         let err =
-            toml::from_str::<ClientConfig>("auth_key = \"flextunnelsecretv1:AAAA\"").unwrap_err();
+            toml::from_str::<ClientConfig>("auth_key = \"flxtsecretv1:AAAA\"").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
