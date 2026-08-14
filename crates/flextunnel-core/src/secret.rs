@@ -104,8 +104,9 @@ pub fn generate_iroh_key(output: PathBuf, force: bool, json: bool) -> Result<()>
     let created = crate::auth::utc_timestamp();
     let contents = format!("# created: {created}\n# public key: {endpoint_id}\n{secret_base64}\n");
     if output.as_os_str() == std::ffi::OsStr::new("-") {
-        // Print the whole key file (comments + secret) to stdout like
-        // age-keygen, or one JSON object carrying the same fields.
+        // Print the whole key file (comments + secret) to stdout, or one JSON
+        // object carrying the same fields. No separate EndpointId line — the
+        // `# public key:` comment already shows it.
         if json {
             println!(
                 "{}",
@@ -117,7 +118,6 @@ pub fn generate_iroh_key(output: PathBuf, force: bool, json: bool) -> Result<()>
             );
         } else {
             print!("{contents}");
-            eprintln!("EndpointId: {}", endpoint_id);
         }
         return Ok(());
     }
@@ -144,8 +144,9 @@ pub fn generate_auth_private_key(output: PathBuf, force: bool, json: bool) -> Re
     let created = crate::auth::utc_timestamp();
     let contents = key.to_key_file(&created);
     if output.as_os_str() == std::ffi::OsStr::new("-") {
-        // Print the whole key file (comments + secret) to stdout like
-        // age-keygen, or one JSON object carrying the same fields.
+        // Print the whole key file (comments + secret) to stdout, or one JSON
+        // object carrying the same fields. No separate public-key line — the
+        // `# public key:` comment already shows it.
         if json {
             println!(
                 "{}",
@@ -157,7 +158,6 @@ pub fn generate_auth_private_key(output: PathBuf, force: bool, json: bool) -> Re
             );
         } else {
             print!("{contents}");
-            eprintln!("Public key: {}", key.public_str());
         }
         return Ok(());
     }
