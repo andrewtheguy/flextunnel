@@ -3,10 +3,12 @@
 //! each profile references one by [`AuthKey::id`]. The non-secret data (key
 //! names and public halves, profile names, server ids, ports, forwards) lives
 //! in a plaintext `profiles.json` under the local data dir — same treatment
-//! as the iOS app's `forwards.json`. The secret halves are stored one
-//! keychain entry per key (macOS Keychain / Windows Credential Manager,
-//! account = key id), which keeps every blob tiny — Windows caps credential
-//! blobs at ~2.5 KB.
+//! as the iOS app's `forwards.json`. The secret halves all live in a single
+//! keychain entry (macOS Keychain / Windows Credential Manager) as a
+//! key-id → secret JSON map: one entry means a fresh install (or a rebuilt,
+//! differently-signed binary) triggers one macOS keychain prompt, not one
+//! per key. Even a large key list stays far below the ~2.5 KB Windows
+//! credential-blob cap (~90 bytes per key).
 //!
 //! Development escape hatch: setting `FLEXTUNNEL_DEV_CONFIG` swaps all of the
 //! above for a single plaintext JSON file with the secret keys inline, so a rebuild
@@ -54,8 +56,8 @@ pub struct AuthKey {
     /// file), and keeping it here lets the UI identify the key even when its
     /// keychain entry is lost.
     pub public_key: String,
-    /// The secret half. Never serialized here: in keychain mode it lives in a
-    /// per-key keychain entry; the dev file backend re-adds it via
+    /// The secret half. Never serialized here: in keychain mode it lives in
+    /// the shared keychain entry; the dev file backend re-adds it via
     /// [`StoredKey`].
     #[serde(skip)]
     pub secret: String,
@@ -227,8 +229,24 @@ pub fn init_store() -> bool {
     false
 }
 
-fn secret_entry(key_id: &str) -> Result<keyring_core::Entry> {
-    keyring_core::Entry::new(KEYCHAIN_SERVICE, key_id).context("Failed to open keychain entry")
+/// The single keychain entry holding every key's secret as a key-id → secret
+/// JSON map. One entry rather than one per key: macOS asks for keychain
+/// access per entry when the binary changes, so per-key entries would turn a
+/// new install into one prompt per key.
+fn secrets_entry() -> Result<keyring_core::Entry> {
+    keyring_core::Entry::new(KEYCHAIN_SERVICE, "auth-keys")
+        .context("Failed to open the keychain entry")
+}
+
+/// The keychain's key-id → secret map; empty when nothing was saved yet.
+fn load_key_secrets() -> Result<std::collections::HashMap<String, String>> {
+    match secrets_entry()?.get_password() {
+        Ok(json) => {
+            serde_json::from_str(&json).context("Failed to parse the keychain auth-keys entry")
+        }
+        Err(keyring_core::Error::NoEntry) => Ok(Default::default()),
+        Err(e) => Err(e).context("Failed to read the secret keys from the keychain"),
+    }
 }
 
 /// Drop structurally invalid keys from a (possibly hand-edited) store,
@@ -336,16 +354,14 @@ pub fn load_store() -> Result<Store> {
         _ => {
             let mut store: Store = read_json(&profiles_path()?)?.unwrap_or_default();
             store.keys = drop_invalid_keys(store.keys);
+            let secrets = load_key_secrets()?;
             for key in &mut store.keys {
-                match secret_entry(&key.id)?.get_password() {
-                    Ok(secret) => key.secret = secret,
-                    Err(keyring_core::Error::NoEntry) => log::warn!(
-                        "No keychain entry for key \"{}\"; its secret must be re-entered",
+                match secrets.get(&key.id) {
+                    Some(secret) => key.secret = secret.clone(),
+                    None => log::warn!(
+                        "No keychain secret for key \"{}\"; its secret must be re-entered",
                         key.name
                     ),
-                    Err(e) => {
-                        return Err(e).context("Failed to read a secret key from the keychain")
-                    }
                 }
             }
             store
@@ -365,7 +381,7 @@ pub fn load_store() -> Result<Store> {
 }
 
 /// Persist the key list and profiles (non-secret data only in keychain mode —
-/// secrets are written separately by [`save_key_secret`], so routine saves
+/// secrets are written separately by [`save_key_secrets`], so routine saves
 /// after a forward toggle never touch the keychain).
 pub fn save_store(keys: &[AuthKey], profiles: &[Profile]) -> Result<()> {
     match BACKEND.get() {
@@ -440,30 +456,25 @@ fn forwards_of(
         .filter_map(|f| f.as_object_mut())
 }
 
-/// Store one key's secret. Called only when the secret itself changes (a key
-/// is added or edited); a no-op in dev file mode where `save_store` already
-/// wrote it inline.
-pub fn save_key_secret(key_id: &str, secret: &str) -> Result<()> {
+/// Store every key's secret — the whole map replaces the keychain entry, so
+/// this also covers deletion. Called only when a secret changes (a key is
+/// added, edited, or deleted); a no-op in dev file mode where `save_store`
+/// already writes them inline. Secretless keys (lost keychain data) are left
+/// out of the map so a later load warns about them again instead of loading
+/// an empty secret.
+pub fn save_key_secrets(keys: &[AuthKey]) -> Result<()> {
     match BACKEND.get() {
         Some(Backend::File(_)) => Ok(()),
-        _ => secret_entry(key_id)?
-            .set_password(secret)
-            .context("Failed to write the secret key to the keychain"),
-    }
-}
-
-/// Remove a deleted key's keychain entry (no-op in dev file mode). Best
-/// effort: a stale entry is harmless.
-pub fn delete_key_secret(key_id: &str) {
-    if let Some(Backend::File(_)) = BACKEND.get() {
-        return;
-    }
-    match secret_entry(key_id) {
-        Ok(entry) => match entry.delete_credential() {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => {}
-            Err(e) => log::warn!("Failed to delete the keychain key: {e}"),
-        },
-        Err(e) => log::warn!("{e:#}"),
+        _ => {
+            let map: std::collections::BTreeMap<&str, &str> = keys
+                .iter()
+                .filter(|k| !k.secret.is_empty())
+                .map(|k| (k.id.as_str(), k.secret.as_str()))
+                .collect();
+            secrets_entry()?
+                .set_password(&serde_json::to_string(&map)?)
+                .context("Failed to write the secret keys to the keychain")
+        }
     }
 }
 

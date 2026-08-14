@@ -1331,13 +1331,16 @@ impl App {
             public_key: client_key.public_str(),
             secret: client_key.secret_str(),
         };
-        if let Err(e) = config::save_key_secret(&key.id, &key.secret) {
+        let id = key.id.clone();
+        let mut keys = self.keys.clone();
+        keys.push(key);
+        // Secrets first: only adopt the new list once the keychain write took.
+        if let Err(e) = config::save_key_secrets(&keys) {
             log::error!("{e:#}");
             self.notice = Some(format!("{e:#}"));
             return;
         }
-        let id = key.id.clone();
-        self.keys.push(key);
+        self.keys = keys;
         self.persist_store();
         if let Some(form) = &mut self.profile_form {
             form.auth_key_id = id;
@@ -1352,15 +1355,18 @@ impl App {
         let Ok(key) = form.validate(&self.keys) else {
             return;
         };
-        if let Err(e) = config::save_key_secret(&key.id, &key.secret) {
+        let mut keys = self.keys.clone();
+        match keys.iter_mut().find(|k| k.id == key.id) {
+            Some(slot) => *slot = key,
+            None => keys.push(key),
+        }
+        // Secrets first: only adopt the new list once the keychain write took.
+        if let Err(e) = config::save_key_secrets(&keys) {
             log::error!("{e:#}");
             self.notice = Some(format!("{e:#}"));
             return;
         }
-        match self.keys.iter_mut().find(|k| k.id == key.id) {
-            Some(slot) => *slot = key,
-            None => self.keys.push(key),
-        }
+        self.keys = keys;
         self.persist_store();
         if self.notice.is_none() {
             // An edited secret reaches running sessions on their next connect.
@@ -1386,8 +1392,12 @@ impl App {
             return;
         }
         self.confirm_delete_key = None;
-        config::delete_key_secret(&id);
         self.keys.retain(|k| k.id != id);
+        // Best effort: a stale secret left behind in the keychain entry is
+        // harmless (nothing references its id anymore).
+        if let Err(e) = config::save_key_secrets(&self.keys) {
+            log::warn!("Failed to remove the deleted key's secret: {e:#}");
+        }
         self.key_form = None;
         self.persist_store();
     }
