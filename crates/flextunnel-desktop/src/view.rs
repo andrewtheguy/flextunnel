@@ -1178,7 +1178,14 @@ fn key_form_view<'a>(app: &'a App, form: &'a KeyForm) -> Element<'a, Message> {
         form_row("Secret key", secret),
     ]
     .spacing(10);
-    if let Some(public_key) = form.public_key() {
+    // The validated key already carries the derived public half; deriving it
+    // again is only needed when validation failed for another reason (e.g. a
+    // name clash) but the secret itself parses.
+    let public_key = match &validated {
+        Ok(key) => Some(key.public_key.clone()),
+        Err(_) => form.public_key(),
+    };
+    if let Some(public_key) = public_key {
         col = col.push(form_row(
             "Public key",
             row![

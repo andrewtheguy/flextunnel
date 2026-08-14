@@ -232,17 +232,23 @@ fn secret_entry(key_id: &str) -> Result<keyring_core::Entry> {
 }
 
 /// Drop structurally invalid keys from a (possibly hand-edited) store,
-/// keeping the first occurrence of duplicates: duplicate ids break the
-/// profile references and the keychain keying, malformed or duplicate names
-/// break the picker, and a duplicate public key means the same keypair was
-/// accidentally added twice. The form rejects all of these; this is the
-/// backstop.
+/// keeping the first occurrence of duplicates: an empty id would match
+/// profiles with no key picked, duplicate ids break the profile references
+/// and the keychain keying, malformed or duplicate names break the picker,
+/// and a duplicate public key means the same keypair was accidentally added
+/// twice. The form rejects all of these; this is the backstop.
 fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
     let mut ids = std::collections::HashSet::new();
     let mut names = std::collections::HashSet::new();
     let mut publics = std::collections::HashSet::new();
     keys.into_iter()
         .filter(|k| {
+            // An empty id would match every profile that has no key picked
+            // (`auth_key_id` defaults to empty) — see `find_key`.
+            if k.id.is_empty() {
+                log::error!("Ignoring key \"{}\": empty key id", k.name);
+                return false;
+            }
             if !ids.insert(k.id.clone()) {
                 log::error!("Ignoring key \"{}\": duplicate key id {}", k.name, k.id);
                 return false;
@@ -620,6 +626,10 @@ mod tests {
         bad_name.id = "key4".into();
         bad_name.name = " padded ".into();
         bad_name.public_key = "flextunnelpubv1:ghi".into();
+        let mut empty_id = key();
+        empty_id.id = String::new();
+        empty_id.name = "no id".into();
+        empty_id.public_key = "flextunnelpubv1:mno".into();
         let mut unique = key();
         unique.id = "key5".into();
         unique.name = "home".into();
@@ -631,6 +641,7 @@ mod tests {
             same_name,
             same_public,
             bad_name,
+            empty_id,
             unique.clone(),
         ]);
         assert_eq!(kept, vec![a, unique]);

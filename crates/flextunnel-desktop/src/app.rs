@@ -461,7 +461,7 @@ pub fn validate_key_name(
     if name.is_empty() {
         return Err("Key name is required".into());
     }
-    if name.len() > 64 {
+    if name.chars().count() > 64 {
         return Err("Key name must be 64 characters or fewer".into());
     }
     if keys
@@ -1141,12 +1141,19 @@ impl App {
                 ));
                 self.show_window()
             }
-            _ => {
-                // No key picked (fresh import), a dangling reference, or a
-                // hand-edited empty server id — the profile form covers all.
+            key => {
+                // `Some` here means the key is usable (the empty-secret case
+                // was caught above) and the server node id is empty (only a
+                // hand-edited file gets there); `None` is no key picked (fresh
+                // import) or a dangling reference.
+                let notice = if key.is_some() {
+                    "Enter the server node id to connect."
+                } else {
+                    "Pick an auth key to connect."
+                };
                 self.selection = Selection::Profile(profile.id.clone());
                 self.profile_form = Some(ProfileForm::edit(&profile));
-                self.notice = Some("Pick an auth key to connect.".into());
+                self.notice = Some(notice.into());
                 self.show_window()
             }
         }
