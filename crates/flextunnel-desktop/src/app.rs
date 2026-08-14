@@ -1406,10 +1406,13 @@ impl App {
             return;
         };
         let (name, secret) = (key.name.clone(), key.secret.clone());
-        self.copy_text(secret);
-        self.notice = Some(format!(
-            "Secret key of \"{name}\" copied — paste it into the key form of another install."
-        ));
+        // Announce "copied" only when the clipboard write actually took —
+        // a false success here would have the user paste nothing elsewhere.
+        self.notice = Some(if self.copy_text(secret) {
+            format!("Secret key of \"{name}\" copied — paste it into the key form of another install.")
+        } else {
+            "Clipboard unavailable — the secret key was not copied.".into()
+        });
     }
 
     fn save_forward_form(&mut self) {
@@ -1503,20 +1506,27 @@ impl App {
         }
     }
 
-    fn copy_text(&mut self, text: String) {
+    /// Copy `text` to the clipboard; false (with a log) when the clipboard is
+    /// unavailable or rejects the write.
+    fn copy_text(&mut self, text: String) -> bool {
         if self.clipboard.is_none() {
             match arboard::Clipboard::new() {
                 Ok(clipboard) => self.clipboard = Some(clipboard),
                 Err(e) => {
                     log::error!("Clipboard unavailable: {e}");
-                    return;
+                    return false;
                 }
             }
         }
-        if let Some(clipboard) = &mut self.clipboard
-            && let Err(e) = clipboard.set_text(text)
-        {
-            log::error!("Failed to copy to the clipboard: {e}");
+        let Some(clipboard) = &mut self.clipboard else {
+            return false;
+        };
+        match clipboard.set_text(text) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("Failed to copy to the clipboard: {e}");
+                false
+            }
         }
     }
 }
