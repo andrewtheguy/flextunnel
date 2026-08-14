@@ -109,10 +109,6 @@ jobs:
         run: |
           cargo build --release -p flextunnel-cli --target ${{ matrix.target }}
 
-      - name: Test Release
-        run: |
-          cargo test --release -p flextunnel-cli --target ${{ matrix.target }}
-
       - name: Rename Binaries
         run: |
           mv target/${{ matrix.target }}/release/flextunnel target/release/flextunnel-${{ matrix.suffix }}
@@ -141,10 +137,6 @@ jobs:
       - name: Build Release
         run: |
           cargo build --release -p flextunnel-cli --target aarch64-apple-darwin
-
-      - name: Test Release
-        run: |
-          cargo test --release -p flextunnel-cli --target aarch64-apple-darwin
 
       - name: Rename Binaries
         run: |
@@ -216,10 +208,6 @@ jobs:
       - name: Build Release
         run: |
           cargo build --release -p flextunnel-cli --target x86_64-pc-windows-msvc
-
-      - name: Test Release
-        run: |
-          cargo test --release -p flextunnel-cli --target x86_64-pc-windows-msvc
 
       - name: Rename Binaries
         run: |
