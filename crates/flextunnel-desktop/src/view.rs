@@ -4,9 +4,10 @@
 //! comes from the design system in [`crate::style`].
 
 use crate::app::{
-    format_duration, App, ForwardForm, Message, ProfileForm, Selection, LOG_FILTER_ALL,
+    format_duration, App, ForwardForm, KeyChoice, KeyForm, Message, ProfileForm, Selection,
+    LOG_FILTER_ALL,
 };
-use crate::config::Profile;
+use crate::config::{self, AuthKey, Profile};
 use flextunnel_core::forwards::{ForwardState, ForwardStatus, PortForward};
 use crate::style::{self, AMBER, GRAY, GREEN, RED};
 use crate::tunnel::{Phase, Snapshot};
@@ -252,6 +253,13 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         list = list.push(sidebar_profile_row(app, profile));
     }
 
+    let keys_selected = app.selection == Selection::Keys && app.profile_form.is_none();
+    let keys_row = button(text("Keys").size(13))
+        .padding([6, 10])
+        .width(Fill)
+        .style(style::sidebar_row(keys_selected))
+        .on_press(Message::Select(Selection::Keys));
+
     let logs_selected = app.selection == Selection::Logs && app.profile_form.is_none();
     let logs_row = button(text("Logs").size(13))
         .padding([6, 10])
@@ -271,7 +279,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     ]
     .spacing(4);
 
-    let mut footer = column![logs_row, io_row].spacing(6);
+    let mut footer = column![keys_row, logs_row, io_row].spacing(6);
     if let Some(notice) = &app.io_notice {
         footer = footer.push(text(notice.as_str()).size(10).style(style::dim_text));
     }
@@ -365,6 +373,7 @@ fn detail_pane(app: &App) -> Element<'_, Message> {
         profile_form_view(app, form)
     } else {
         match &app.selection {
+            Selection::Keys => keys_pane(app),
             Selection::Logs => logs_pane(app),
             Selection::Profile(id) => match app.profile(id) {
                 Some(profile) => profile_detail(app, profile),
@@ -396,6 +405,7 @@ fn empty_state() -> Element<'static, Message> {
 
 fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message> {
     let snapshot = app.snapshot_for(&profile.id);
+    let ready = profile.is_ready(&app.keys);
 
     let mut hero = row![
         dot(phase_color(snapshot.phase), 12.0),
@@ -416,7 +426,7 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         Phase::Idle | Phase::Failed => button(text("Connect").size(13).font(semibold()))
             .padding([7, 16])
             .style(style::primary)
-            .on_press_maybe(profile.is_ready().then(|| Message::Connect(profile.id.clone()))),
+            .on_press_maybe(ready.then(|| Message::Connect(profile.id.clone()))),
         _ => button(text("Disconnect").size(13))
             .padding([7, 16])
             .style(style::outlined)
@@ -431,12 +441,16 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
     if let Some(error) = &snapshot.last_error {
         col = col.push(text(error.as_str()).size(12).color(RED));
     }
-    if !profile.is_ready() {
-        col = col.push(
-            text("The auth token is missing — edit the profile to re-enter it.")
-                .size(12)
-                .color(AMBER),
-        );
+    if !ready {
+        let fix = match config::find_key(&app.keys, &profile.auth_key_id) {
+            // The key exists but its secret was lost from the keychain.
+            Some(key) => format!(
+                "The secret of key \"{}\" is missing — re-enter it in the Keys pane.",
+                key.name
+            ),
+            None => "No auth key picked — edit the profile to pick one.".into(),
+        };
+        col = col.push(text(fix).size(12).color(AMBER));
     }
 
     // CONNECTION card
@@ -457,19 +471,14 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
     ]
     .spacing(8);
-    // The auth public key is not a secret — always shown unmasked so it can
+    // The key's public half is not a secret — always shown unmasked so it can
     // be copied onto the server's authorized-keys file. (The secret never
     // appears anywhere in the UI.)
-    if let Some(public_key) = flextunnel_core::auth::ClientKey::from_secret_str(
-        profile.auth_key.trim(),
-    )
-    .ok()
-    .map(|key| key.public_str())
-    {
+    if let Some(key) = config::find_key(&app.keys, &profile.auth_key_id) {
         info = info.push(info_row(
-            "Auth public key",
-            truncate_middle(&public_key, 22),
-            Some(public_key),
+            "Auth key",
+            format!("{} ({})", key.name, truncate_middle(&key.public_key, 14)),
+            Some(key.public_key.clone()),
         ));
     }
     if let Some(socks) = socks {
@@ -512,7 +521,7 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
     }
 
     // FORWARDINGS
-    if let Some(banner) = connection_banner(profile, snapshot) {
+    if let Some(banner) = connection_banner(profile, ready, snapshot) {
         col = col.push(banner);
     }
     col = col.push(
@@ -595,6 +604,7 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
 /// Connect button where that's the fix — instead of every row repeating it.
 fn connection_banner<'a>(
     profile: &'a Profile,
+    ready: bool,
     snapshot: &'a Snapshot,
 ) -> Option<Element<'a, Message>> {
     let (color, message, show_connect) = match snapshot.phase {
@@ -621,7 +631,7 @@ fn connection_banner<'a>(
             button(text("Connect").size(11).font(semibold()))
                 .padding([3, 10])
                 .style(style::tinted)
-                .on_press_maybe(profile.is_ready().then(|| Message::Connect(profile.id.clone()))),
+                .on_press_maybe(ready.then(|| Message::Connect(profile.id.clone()))),
         );
     }
     Some(
@@ -893,16 +903,29 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         http = http.push(input("", &form.http_port, Message::HttpPortChanged).width(90));
     }
 
-    let validated = form.validate(&app.profiles);
+    let validated = form.validate(&app.profiles, &app.keys);
 
-    // The secret key stays masked; the derived public key below is not a
-    // secret and is always shown unmasked (it's what goes on the server's
-    // authorized-keys file).
+    // Keys are shared across profiles: pick one from the list (managed in the
+    // Keys pane), or mint a fresh one right here with "New key".
+    let choices: Vec<KeyChoice> = app
+        .keys
+        .iter()
+        .map(|k| KeyChoice {
+            id: k.id.clone(),
+            name: k.name.clone(),
+        })
+        .collect();
+    let selected = choices.iter().find(|c| c.id == form.auth_key_id).cloned();
     let auth_key = row![
-        input("flextunnelsecretv1:…", &form.auth_key, Message::AuthKeyChanged)
-            .secure(true)
+        pick_list(choices, selected, Message::AuthKeyPicked)
+            .placeholder(if app.keys.is_empty() {
+                "no keys yet"
+            } else {
+                "pick a key"
+            })
+            .text_size(13)
             .width(240),
-        button(text("Generate").size(12))
+        button(text("New key").size(12))
             .padding([4, 10])
             .style(style::outlined)
             .on_press(Message::GenerateAuthKey),
@@ -919,12 +942,12 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         form_row("Auth key", auth_key),
     ]
     .spacing(10);
-    if let Some(public_key) = form.public_key() {
+    if let Some(key) = config::find_key(&app.keys, &form.auth_key_id) {
         card = card.push(form_row(
             "Public key",
             row![
-                text(truncate_middle(&public_key, 30)).size(12).font(Font::MONOSPACE),
-                copy_button(public_key),
+                text(truncate_middle(&key.public_key, 30)).size(12).font(Font::MONOSPACE),
+                copy_button(key.public_key.clone()),
             ]
             .spacing(8)
             .align_y(Center),
@@ -980,13 +1003,181 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
             "NEW PROFILE"
         }),
         container(card).padding([12, 14]).width(Fill).style(style::card),
-        text("The secret key is stored in the system keychain; everything else in a local file. \
-              Give the public key to the server operator (authorized_keys_file).")
+        text("Auth keys are shared — any number of profiles can pick the same one (manage them \
+              in the Keys pane). Give the public key to the server operator \
+              (authorized_keys_file).")
             .size(11)
             .style(style::faint_text),
     ]
     .spacing(10)
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// Keys pane
+
+fn keys_pane(app: &App) -> Element<'_, Message> {
+    let header = row![
+        section_label(if app.keys.is_empty() {
+            "AUTH KEYS".to_string()
+        } else {
+            format!("AUTH KEYS · {}", app.keys.len())
+        }),
+        space().width(Fill),
+        button(text("+ Add key").size(12).font(semibold()))
+            .padding([4, 12])
+            .style(style::tinted)
+            .on_press(Message::AddKey),
+    ]
+    .align_y(Center);
+
+    let mut col = column![header].spacing(12);
+    if let Some(notice) = &app.notice {
+        col = col.push(text(notice.as_str()).size(12).style(style::dim_text));
+    }
+    if let Some(form) = &app.key_form {
+        col = col.push(key_form_view(app, form));
+    }
+
+    if app.keys.is_empty() {
+        col = col.push(
+            container(
+                text("No auth keys yet. Add one to authenticate profiles with — any number \
+                      of profiles can share the same key.")
+                    .size(12)
+                    .style(style::dim_text),
+            )
+            .padding(24)
+            .width(Fill)
+            .align_x(Center)
+            .style(style::card),
+        );
+    }
+    for key in &app.keys {
+        col = col.push(key_card(app, key));
+    }
+    col = col.push(
+        text("Secret halves live in the system keychain; names and public keys in a local \
+              file. Put a key's public half on each server's authorized_keys_file.")
+            .size(11)
+            .style(style::faint_text),
+    );
+
+    scrollable(col.padding([0, 4])).height(Fill).spacing(4).into()
+}
+
+fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
+    let users: Vec<&str> = app
+        .profiles
+        .iter()
+        .filter(|p| p.auth_key_id == key.id)
+        .map(|p| p.name.as_str())
+        .collect();
+    let confirming = app.confirm_delete_key.as_deref() == Some(key.id.as_str());
+
+    let header = row![
+        text(key.name.as_str()).size(14).font(semibold()),
+        space().width(Fill),
+        button(text("Edit").size(12))
+            .padding([3, 10])
+            .style(style::ghost)
+            .on_press(Message::EditKey(key.id.clone())),
+        button(
+            text(if confirming { "Click again to delete" } else { "Delete…" }).size(12)
+        )
+        .padding([3, 10])
+        .style(style::ghost_danger)
+        .on_press(Message::DeleteKey(key.id.clone())),
+    ]
+    .spacing(6)
+    .align_y(Center);
+
+    let mut card = column![
+        header,
+        info_row(
+            "Public key",
+            truncate_middle(&key.public_key, 30),
+            Some(key.public_key.clone()),
+        ),
+    ]
+    .spacing(8);
+    if key.secret.is_empty() {
+        card = card.push(
+            text("Secret missing from the keychain — edit this key to re-enter it.")
+                .size(12)
+                .color(AMBER),
+        );
+    }
+    card = card.push(
+        text(if users.is_empty() {
+            "Not used by any profile.".to_string()
+        } else {
+            format!("Used by: {}", users.join(", "))
+        })
+        .size(11)
+        .style(style::faint_text),
+    );
+
+    container(card).padding([12, 14]).width(Fill).style(style::card).into()
+}
+
+fn key_form_view<'a>(app: &'a App, form: &'a KeyForm) -> Element<'a, Message> {
+    let validated = form.validate(&app.keys);
+
+    // The secret stays masked; the derived public key below is not a secret
+    // and is always shown unmasked (it's what goes on the server's
+    // authorized-keys file).
+    let secret = row![
+        input("flextunnelsecretv1:…", &form.secret, Message::KeySecretChanged)
+            .secure(true)
+            .width(240),
+        button(text("Generate").size(12))
+            .padding([4, 10])
+            .style(style::outlined)
+            .on_press(Message::KeyGenerateSecret),
+    ]
+    .spacing(8)
+    .align_y(Center);
+
+    let mut col = column![
+        text(if form.is_edit() { "Edit key" } else { "Add key" })
+            .size(13)
+            .font(semibold()),
+        form_row("Name", input("e.g. work laptop", &form.name, Message::KeyNameChanged)),
+        form_row("Secret key", secret),
+    ]
+    .spacing(10);
+    if let Some(public_key) = form.public_key() {
+        col = col.push(form_row(
+            "Public key",
+            row![
+                text(truncate_middle(&public_key, 30)).size(12).font(Font::MONOSPACE),
+                copy_button(public_key),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ));
+    }
+
+    if let Err(message) = &validated {
+        col = col.push(text(message.clone()).size(12).color(AMBER));
+    }
+    col = col.push(
+        row![
+            button(text("Save").size(13).font(semibold()))
+                .padding([6, 16])
+                .style(style::primary)
+                .on_press_maybe(validated.is_ok().then_some(Message::KeyFormSave)),
+            button(text("Cancel").size(13))
+                .padding([6, 16])
+                .style(style::outlined)
+                .on_press(Message::KeyFormCancel),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    );
+
+    container(col).padding([12, 14]).width(Fill).style(style::card).into()
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,12 @@
-//! Profile persistence. The non-secret profile data (name, server id, ports,
-//! forwards) lives in a plaintext `profiles.json` under the local data dir —
-//! same treatment as the iOS app's `forwards.json`. Client auth secret keys are
-//! stored one keychain entry per profile (macOS Keychain /
-//! Windows Credential Manager, account = profile id), which keeps every blob
-//! tiny — Windows caps credential blobs at ~2.5 KB.
+//! Profile and auth-key persistence. Client auth keys live in a shared,
+//! named list so several profiles can authenticate with the same keypair;
+//! each profile references one by [`AuthKey::id`]. The non-secret data (key
+//! names and public halves, profile names, server ids, ports, forwards) lives
+//! in a plaintext `profiles.json` under the local data dir — same treatment
+//! as the iOS app's `forwards.json`. The secret halves are stored one
+//! keychain entry per key (macOS Keychain / Windows Credential Manager,
+//! account = key id), which keeps every blob tiny — Windows caps credential
+//! blobs at ~2.5 KB.
 //!
 //! Development escape hatch: setting `FLEXTUNNEL_DEV_CONFIG` swaps all of the
 //! above for a single plaintext JSON file with the secret keys inline, so a rebuild
@@ -39,6 +42,53 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
+/// One named client auth keypair, shared across profiles: any number of
+/// profiles can pick the same key to authenticate with (its public half then
+/// only needs one line on each server's authorized-keys file).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthKey {
+    pub id: String,
+    pub name: String,
+    /// Derived from the secret, but stored plaintext on purpose: the public
+    /// half is not a secret (it's what goes on the server's authorized-keys
+    /// file), and keeping it here lets the UI identify the key even when its
+    /// keychain entry is lost.
+    pub public_key: String,
+    /// The secret half. Never serialized here: in keychain mode it lives in a
+    /// per-key keychain entry; the dev file backend re-adds it via
+    /// [`StoredKey`].
+    #[serde(skip)]
+    pub secret: String,
+}
+
+impl AuthKey {
+    pub fn new_id() -> String {
+        random_id()
+    }
+}
+
+/// The key with the given id, if any (an empty id never matches).
+pub fn find_key<'a>(keys: &'a [AuthKey], id: &str) -> Option<&'a AuthKey> {
+    keys.iter().find(|k| k.id == id)
+}
+
+fn random_id() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// A well-formed profile or key name: 1-64 characters, words separated by
+/// single spaces — no leading/trailing spaces, no consecutive spaces, no
+/// other whitespace. The forms normalize into this shape; only a hand-edited
+/// file can violate it.
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && !name.contains("  ")
+        && !name.chars().any(|c| c.is_whitespace() && c != ' ')
+}
+
 /// One connection profile — the desktop equivalent of a `client.toml`. Each
 /// active profile runs its own tunnel session with optional local proxy
 /// front-ends and its own server-direct port forwards.
@@ -47,11 +97,11 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub server_node_id: String,
-    /// The one secret. Never serialized here: in keychain mode it lives in a
-    /// per-profile keychain entry; the dev file backend re-adds it via
-    /// [`StoredProfile`].
-    #[serde(skip)]
-    pub auth_key: String,
+    /// Which shared [`AuthKey`] this profile authenticates with; empty when
+    /// none is picked yet (fresh import). A plain reference, not a secret —
+    /// it serializes with the rest of the profile.
+    #[serde(default)]
+    pub auth_key_id: String,
     /// Local SOCKS5 proxy port; `None` leaves that front-end disabled.
     #[serde(default)]
     pub socks_port: Option<u16>,
@@ -71,37 +121,53 @@ pub struct Profile {
 
 impl Profile {
     pub fn new_id() -> String {
-        format!("{:016x}", rand::random::<u64>())
+        random_id()
     }
 
-    /// A well-formed profile name: 1-64 characters, words separated by single
-    /// spaces — no leading/trailing spaces, no consecutive spaces, no other
-    /// whitespace. The form normalizes into this shape; only a hand-edited
-    /// file can violate it.
-    pub fn is_valid_name(name: &str) -> bool {
-        !name.is_empty()
-            && name.chars().count() <= 64
-            && !name.starts_with(' ')
-            && !name.ends_with(' ')
-            && !name.contains("  ")
-            && !name.chars().any(|c| c.is_whitespace() && c != ' ')
-    }
-
-    /// Whether the profile can be connected: a missing key happens when its
-    /// keychain entry was lost (the user re-enters it in the edit form).
-    pub fn is_ready(&self) -> bool {
-        !self.server_node_id.is_empty() && !self.auth_key.is_empty()
+    /// Whether the profile can be connected: it must reference a key whose
+    /// secret is present. The secret goes missing when the key's keychain
+    /// entry was lost (re-entered in the Keys pane).
+    pub fn is_ready(&self, keys: &[AuthKey]) -> bool {
+        !self.server_node_id.is_empty()
+            && find_key(keys, &self.auth_key_id).is_some_and(|k| !k.secret.is_empty())
     }
 }
 
-/// Serialization wrapper for the dev file backend only: the secret key rides along
+/// Everything the app persists: the shared key list plus the profiles that
+/// reference into it. Saved as one JSON document so a profile can never be
+/// written without the key list it points into.
+#[derive(Default, Serialize, Deserialize)]
+pub struct Store {
+    #[serde(default)]
+    pub keys: Vec<AuthKey>,
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
+}
+
+/// Borrowing twin of [`Store`] so saves don't clone the app state.
+#[derive(Serialize)]
+struct StoreRef<'a> {
+    keys: &'a [AuthKey],
+    profiles: &'a [Profile],
+}
+
+/// Serialization wrapper for the dev file backend only: the secret rides along
 /// inline (plaintext, development only) since there is no keychain to hold it.
 #[derive(Serialize, Deserialize)]
-struct StoredProfile {
+struct StoredKey {
     #[serde(default)]
-    auth_key: String,
+    secret: String,
     #[serde(flatten)]
-    profile: Profile,
+    key: AuthKey,
+}
+
+/// The dev file's document shape: [`Store`] with key secrets inlined.
+#[derive(Default, Serialize, Deserialize)]
+struct DevFile {
+    #[serde(default)]
+    keys: Vec<StoredKey>,
+    #[serde(default)]
+    profiles: Vec<Profile>,
 }
 
 /// Path to the plaintext dev profiles file when `FLEXTUNNEL_DEV_CONFIG` is
@@ -161,9 +227,49 @@ pub fn init_store() -> bool {
     false
 }
 
-fn secret_entry(profile_id: &str) -> Result<keyring_core::Entry> {
-    keyring_core::Entry::new(KEYCHAIN_SERVICE, profile_id)
-        .context("Failed to open keychain entry")
+fn secret_entry(key_id: &str) -> Result<keyring_core::Entry> {
+    keyring_core::Entry::new(KEYCHAIN_SERVICE, key_id).context("Failed to open keychain entry")
+}
+
+/// Drop structurally invalid keys from a (possibly hand-edited) store,
+/// keeping the first occurrence of duplicates: duplicate ids break the
+/// profile references and the keychain keying, malformed or duplicate names
+/// break the picker, and a duplicate public key means the same keypair was
+/// accidentally added twice. The form rejects all of these; this is the
+/// backstop.
+fn drop_invalid_keys(keys: Vec<AuthKey>) -> Vec<AuthKey> {
+    let mut ids = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    let mut publics = std::collections::HashSet::new();
+    keys.into_iter()
+        .filter(|k| {
+            if !ids.insert(k.id.clone()) {
+                log::error!("Ignoring key \"{}\": duplicate key id {}", k.name, k.id);
+                return false;
+            }
+            if !is_valid_name(&k.name) {
+                log::error!(
+                    "Ignoring key {}: invalid name {:?} (1-64 chars, single spaces \
+                     between words only)",
+                    k.id,
+                    k.name
+                );
+                return false;
+            }
+            if !names.insert(k.name.clone()) {
+                log::error!("Ignoring a key: duplicate key name \"{}\"", k.name);
+                return false;
+            }
+            if !publics.insert(k.public_key.clone()) {
+                log::error!(
+                    "Ignoring key \"{}\": another key already holds its public key",
+                    k.name
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 /// Drop structurally invalid entries from a (possibly hand-edited) profiles
@@ -183,7 +289,7 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
                 log::error!("Ignoring profile \"{}\": duplicate profile id {}", p.name, p.id);
                 return false;
             }
-            if !Profile::is_valid_name(&p.name) {
+            if !is_valid_name(&p.name) {
                 log::error!(
                     "Ignoring profile {}: invalid name {:?} (1-64 chars, single spaces \
                      between words only)",
@@ -208,41 +314,57 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
         .collect()
 }
 
-/// Load all profiles; an empty list when nothing has been saved yet. In
-/// keychain mode each profile's secret key is filled from its keychain entry —
-/// a missing entry loads as an empty key with a warning instead of failing.
-/// Entries duplicating another's profile id or server node id are ignored.
-pub fn load_profiles() -> Result<Vec<Profile>> {
-    match BACKEND.get() {
-        Some(Backend::File(path)) => Ok(drop_invalid(load_dev_file(path)?)),
+/// Load the whole store; empty when nothing has been saved yet. In keychain
+/// mode each key's secret is filled from its keychain entry — a missing entry
+/// loads as an empty secret with a warning instead of failing. Structurally
+/// invalid keys and profiles are ignored (see the `drop_invalid*` backstops);
+/// a profile referencing an unknown key is kept but can't connect until a key
+/// is picked.
+pub fn load_store() -> Result<Store> {
+    let mut store = match BACKEND.get() {
+        Some(Backend::File(path)) => {
+            let mut store = load_dev_file(path)?;
+            store.keys = drop_invalid_keys(store.keys);
+            store
+        }
         _ => {
-            let profiles: Vec<Profile> = match read_json(&profiles_path()?)? {
-                Some(profiles) => profiles,
-                None => return Ok(Vec::new()),
-            };
-            let mut profiles = drop_invalid(profiles);
-            for profile in &mut profiles {
-                match secret_entry(&profile.id)?.get_password() {
-                    Ok(secret) => profile.auth_key = secret,
+            let mut store: Store = read_json(&profiles_path()?)?.unwrap_or_default();
+            store.keys = drop_invalid_keys(store.keys);
+            for key in &mut store.keys {
+                match secret_entry(&key.id)?.get_password() {
+                    Ok(secret) => key.secret = secret,
                     Err(keyring_core::Error::NoEntry) => log::warn!(
-                        "No keychain key for profile \"{}\"; it must be re-entered",
-                        profile.name
+                        "No keychain entry for key \"{}\"; its secret must be re-entered",
+                        key.name
                     ),
-                    Err(e) => return Err(e).context("Failed to read a secret key from the keychain"),
+                    Err(e) => {
+                        return Err(e).context("Failed to read a secret key from the keychain")
+                    }
                 }
             }
-            Ok(profiles)
+            store
+        }
+    };
+    store.profiles = drop_invalid(store.profiles);
+    for profile in &store.profiles {
+        if !profile.auth_key_id.is_empty() && find_key(&store.keys, &profile.auth_key_id).is_none()
+        {
+            log::warn!(
+                "Profile \"{}\" references an unknown auth key; pick one to connect",
+                profile.name
+            );
         }
     }
+    Ok(store)
 }
 
-/// Persist the profile list (non-secret data only in keychain mode — secret
-/// keys are written separately by [`save_profile_secret`], so routine saves after
-/// a forward toggle never touch the keychain).
-pub fn save_profiles(profiles: &[Profile]) -> Result<()> {
+/// Persist the key list and profiles (non-secret data only in keychain mode —
+/// secrets are written separately by [`save_key_secret`], so routine saves
+/// after a forward toggle never touch the keychain).
+pub fn save_store(keys: &[AuthKey], profiles: &[Profile]) -> Result<()> {
     match BACKEND.get() {
-        Some(Backend::File(path)) => save_dev_file(path, profiles),
-        _ => write_json(&profiles_path()?, &profiles),
+        Some(Backend::File(path)) => save_dev_file(path, keys, profiles),
+        _ => write_json(&profiles_path()?, &StoreRef { keys, profiles }),
     }
 }
 
@@ -251,15 +373,16 @@ pub fn save_profiles(profiles: &[Profile]) -> Result<()> {
 const RELAY_TOKEN_FIELD: &str = "relay_auth_token";
 
 /// Export all profiles to a user-chosen file. Non-secrets only, whatever the
-/// backend: `Profile`'s serialization always skips the auth secret key, and the
-/// relay auth token is removed here. Profile and forward ids are stripped too
-/// — they are app-local keys that the import regenerates, not part of the
-/// portable data.
+/// backend: no secret ever lives in a `Profile`, and the relay auth token is
+/// removed here. Profile ids, forward ids, and the auth-key reference are
+/// stripped too — they are app-local keys that mean nothing in another
+/// install, not part of the portable data.
 pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
     let mut values = serde_json::to_value(profiles)?;
     for entry in values.as_array_mut().into_iter().flatten() {
         if let Some(profile) = entry.as_object_mut() {
             profile.remove("id");
+            profile.remove("auth_key_id");
             profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward.remove("id");
@@ -273,9 +396,10 @@ pub fn export_profiles(path: &Path, profiles: &[Profile]) -> Result<()> {
 /// load (malformed names and in-file duplicates are dropped with logs). The
 /// caller merges the result into the current profiles and assigns final ids;
 /// missing ids (the normal export shape) get placeholders here so the entries
-/// deserialize. Neither secret is imported: the auth secret key is never in the
-/// file, and any relay auth token in a hand-written one is dropped, so
-/// imported entries come back with both empty.
+/// deserialize. No secret or key reference is imported: neither is ever in an
+/// export, and a hand-written relay auth token or auth-key reference is
+/// dropped rather than trusted, so imported entries come back with all three
+/// empty.
 pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
     let mut values: serde_json::Value = read_json(path)?
         .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
@@ -284,6 +408,7 @@ pub fn import_profiles(path: &Path) -> Result<Vec<Profile>> {
             profile
                 .entry("id")
                 .or_insert_with(|| Profile::new_id().into());
+            profile.remove("auth_key_id");
             profile.remove(RELAY_TOKEN_FIELD);
             for forward in forwards_of(profile) {
                 forward
@@ -309,25 +434,25 @@ fn forwards_of(
         .filter_map(|f| f.as_object_mut())
 }
 
-/// Store one profile's secret key. Called only when the key itself changes (the
-/// profile form is saved); a no-op in dev file mode where `save_profiles`
-/// already wrote it inline.
-pub fn save_profile_secret(profile_id: &str, secret: &str) -> Result<()> {
+/// Store one key's secret. Called only when the secret itself changes (a key
+/// is added or edited); a no-op in dev file mode where `save_store` already
+/// wrote it inline.
+pub fn save_key_secret(key_id: &str, secret: &str) -> Result<()> {
     match BACKEND.get() {
         Some(Backend::File(_)) => Ok(()),
-        _ => secret_entry(profile_id)?
+        _ => secret_entry(key_id)?
             .set_password(secret)
             .context("Failed to write the secret key to the keychain"),
     }
 }
 
-/// Remove a deleted profile's keychain entry (no-op in dev file mode). Best
+/// Remove a deleted key's keychain entry (no-op in dev file mode). Best
 /// effort: a stale entry is harmless.
-pub fn delete_profile_secret(profile_id: &str) {
+pub fn delete_key_secret(key_id: &str) {
     if let Some(Backend::File(_)) = BACKEND.get() {
         return;
     }
-    match secret_entry(profile_id) {
+    match secret_entry(key_id) {
         Ok(entry) => match entry.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => {}
             Err(e) => log::warn!("Failed to delete the keychain key: {e}"),
@@ -336,28 +461,32 @@ pub fn delete_profile_secret(profile_id: &str) {
     }
 }
 
-fn load_dev_file(path: &Path) -> Result<Vec<Profile>> {
-    let stored: Vec<StoredProfile> = match read_json(path)? {
-        Some(stored) => stored,
-        None => return Ok(Vec::new()),
-    };
-    Ok(stored
-        .into_iter()
-        .map(|s| Profile {
-            auth_key: s.auth_key,
-            ..s.profile
-        })
-        .collect())
+fn load_dev_file(path: &Path) -> Result<Store> {
+    let stored: DevFile = read_json(path)?.unwrap_or_default();
+    Ok(Store {
+        keys: stored
+            .keys
+            .into_iter()
+            .map(|s| AuthKey {
+                secret: s.secret,
+                ..s.key
+            })
+            .collect(),
+        profiles: stored.profiles,
+    })
 }
 
-fn save_dev_file(path: &Path, profiles: &[Profile]) -> Result<()> {
-    let stored: Vec<StoredProfile> = profiles
-        .iter()
-        .map(|p| StoredProfile {
-            auth_key: p.auth_key.clone(),
-            profile: p.clone(),
-        })
-        .collect();
+fn save_dev_file(path: &Path, keys: &[AuthKey], profiles: &[Profile]) -> Result<()> {
+    let stored = DevFile {
+        keys: keys
+            .iter()
+            .map(|k| StoredKey {
+                secret: k.secret.clone(),
+                key: k.clone(),
+            })
+            .collect(),
+        profiles: profiles.to_vec(),
+    };
     write_json(path, &stored)
 }
 
@@ -391,14 +520,23 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn key() -> AuthKey {
+        AuthKey {
+            id: "key1".into(),
+            name: "work laptop".into(),
+            public_key: "flextunnelpubv1:abc".into(),
+            // Distinctive sentinel so the leak-check assertions match the
+            // secret *value* and don't collide with field names.
+            secret: "ftc-secret-authtok".into(),
+        }
+    }
+
     fn profile() -> Profile {
         Profile {
             id: "00000000deadbeef".into(),
             name: "prod".into(),
             server_node_id: "node".into(),
-            // Distinctive sentinel so the leak-check assertions match the token
-            // *value* and don't collide with field names like `relay_auth_token`.
-            auth_key: "ftc-secret-authtok".into(),
+            auth_key_id: "key1".into(),
             socks_port: Some(1085),
             http_port: Some(8081),
             relay_urls: vec!["https://relay.example".into()],
@@ -424,13 +562,21 @@ mod tests {
         assert_eq!(p.http_port, None);
         assert!(p.relay_urls.is_empty());
         assert!(p.forwards.is_empty());
-        assert!(p.auth_key.is_empty());
+        assert!(p.auth_key_id.is_empty());
     }
 
     #[test]
-    fn token_never_serializes_in_profile() {
-        let json = serde_json::to_string(&profile()).unwrap();
-        assert!(!json.contains("ftc-secret-authtok"), "token leaked: {json}");
+    fn secret_never_serializes_in_store() {
+        let json = serde_json::to_string(&StoreRef {
+            keys: &[key()],
+            profiles: &[profile()],
+        })
+        .unwrap();
+        assert!(!json.contains("ftc-secret-authtok"), "secret leaked: {json}");
+        // The non-secret halves of the key persist, as does the profile's
+        // reference to it.
+        assert!(json.contains("flextunnelpubv1:abc"), "public key dropped: {json}");
+        assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
         // The relay token is a secret too, but it has no keychain home yet, so
@@ -440,6 +586,54 @@ mod tests {
             json.contains("ftc-secret-relaypsk"),
             "relay token must persist in profiles.json: {json}"
         );
+    }
+
+    #[test]
+    fn is_ready_requires_a_resolvable_secret() {
+        let keys = [key()];
+        assert!(profile().is_ready(&keys));
+
+        let mut lost = key();
+        lost.secret = String::new();
+        assert!(!profile().is_ready(&[lost]), "lost keychain entry");
+
+        assert!(!profile().is_ready(&[]), "dangling key reference");
+
+        let mut unpicked = profile();
+        unpicked.auth_key_id = String::new();
+        assert!(!unpicked.is_ready(&keys), "no key picked");
+    }
+
+    #[test]
+    fn invalid_and_duplicate_keys_are_dropped() {
+        let a = key();
+        let mut same_id = key();
+        same_id.name = "other".into();
+        same_id.public_key = "flextunnelpubv1:other".into();
+        let mut same_name = key();
+        same_name.id = "key2".into();
+        same_name.public_key = "flextunnelpubv1:def".into();
+        let mut same_public = key();
+        same_public.id = "key3".into();
+        same_public.name = "same pubkey".into();
+        let mut bad_name = key();
+        bad_name.id = "key4".into();
+        bad_name.name = " padded ".into();
+        bad_name.public_key = "flextunnelpubv1:ghi".into();
+        let mut unique = key();
+        unique.id = "key5".into();
+        unique.name = "home".into();
+        unique.public_key = "flextunnelpubv1:jkl".into();
+
+        let kept = drop_invalid_keys(vec![
+            a.clone(),
+            same_id,
+            same_name,
+            same_public,
+            bad_name,
+            unique.clone(),
+        ]);
+        assert_eq!(kept, vec![a, unique]);
     }
 
     #[test]
@@ -483,8 +677,8 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("\"id\""), "ids leaked into the export: {raw}");
         assert!(
-            !raw.contains("ftc-secret-authtok"),
-            "token leaked into the export: {raw}"
+            !raw.contains("auth_key_id"),
+            "app-local key reference leaked into the export: {raw}"
         );
         assert!(
             !raw.contains("ftc-secret-relaypsk") && !raw.contains("relay_auth_token"),
@@ -497,7 +691,7 @@ mod tests {
         assert_eq!(imported.len(), 1);
         let p = &imported[0];
         assert!(!p.id.is_empty(), "placeholder profile id assigned");
-        assert!(p.auth_key.is_empty());
+        assert!(p.auth_key_id.is_empty());
         assert_eq!(p.relay_auth_token, None);
         assert_eq!(p.relay_urls, profile().relay_urls);
         assert_eq!(p.name, profile().name);
@@ -507,15 +701,16 @@ mod tests {
         assert_eq!(p.forwards[0].local_port, profile().forwards[0].local_port);
     }
 
-    /// Older exports (and hand-written files) can carry the relay token; it is
-    /// dropped rather than trusted, same as if it had never been written.
+    /// Hand-written files can carry the relay token or an auth-key reference;
+    /// both are dropped rather than trusted, same as if never written.
     #[test]
-    fn import_drops_a_relay_token_present_in_the_file() {
+    fn import_drops_untrusted_fields_present_in_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("export.json");
         std::fs::write(
             &path,
             r#"[{"name":"prod","server_node_id":"node",
+                 "auth_key_id":"key1",
                  "relay_urls":["https://relay.example"],
                  "relay_auth_token":"ftc-secret-relaypsk"}]"#,
         )
@@ -523,41 +718,46 @@ mod tests {
 
         let imported = import_profiles(&path).unwrap();
         assert_eq!(imported.len(), 1);
+        assert!(imported[0].auth_key_id.is_empty());
         assert_eq!(imported[0].relay_auth_token, None);
         assert_eq!(imported[0].relay_urls, vec!["https://relay.example"]);
     }
 
     #[test]
     fn name_format_rules() {
-        assert!(Profile::is_valid_name("prod"));
-        assert!(Profile::is_valid_name("staging aws kube"));
+        assert!(is_valid_name("prod"));
+        assert!(is_valid_name("staging aws kube"));
 
-        assert!(!Profile::is_valid_name(""));
-        assert!(!Profile::is_valid_name(" prod"));
-        assert!(!Profile::is_valid_name("prod "));
-        assert!(!Profile::is_valid_name("staging  aws"));
-        assert!(!Profile::is_valid_name("staging\taws"));
-        assert!(!Profile::is_valid_name("staging\naws"));
-        assert!(!Profile::is_valid_name(&"a".repeat(65)));
+        assert!(!is_valid_name(""));
+        assert!(!is_valid_name(" prod"));
+        assert!(!is_valid_name("prod "));
+        assert!(!is_valid_name("staging  aws"));
+        assert!(!is_valid_name("staging\taws"));
+        assert!(!is_valid_name("staging\naws"));
+        assert!(!is_valid_name(&"a".repeat(65)));
     }
 
     #[test]
-    fn dev_file_roundtrips_with_tokens_and_missing_is_empty() {
+    fn dev_file_roundtrips_with_secrets_and_missing_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("dev-profiles.json");
 
-        assert!(load_dev_file(&path).unwrap().is_empty());
+        let empty = load_dev_file(&path).unwrap();
+        assert!(empty.keys.is_empty() && empty.profiles.is_empty());
 
+        let keys = vec![key()];
         let mut profiles = vec![profile()];
-        save_dev_file(&path, &profiles).unwrap();
+        save_dev_file(&path, &keys, &profiles).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
-            raw.contains("\"auth_key\": \"ftc-secret-authtok\""),
-            "token missing: {raw}"
+            raw.contains("\"secret\": \"ftc-secret-authtok\""),
+            "secret missing: {raw}"
         );
 
         // Forward `enabled` is runtime-only: comes back off.
         profiles[0].forwards[0].enabled = false;
-        assert_eq!(load_dev_file(&path).unwrap(), profiles);
+        let loaded = load_dev_file(&path).unwrap();
+        assert_eq!(loaded.keys, keys);
+        assert_eq!(loaded.profiles, profiles);
     }
 }
