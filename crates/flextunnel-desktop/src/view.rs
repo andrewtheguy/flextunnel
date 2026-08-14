@@ -1105,6 +1105,7 @@ fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
         .map(|p| p.name.as_str())
         .collect();
     let confirming = app.confirm_delete_key.as_deref() == Some(key.id.as_str());
+    let exporting = app.confirm_export_key.as_deref() == Some(key.id.as_str());
 
     let header = row![
         text(key.name.as_str()).size(14).font(semibold()),
@@ -1113,6 +1114,16 @@ fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
             .padding([3, 10])
             .style(style::ghost)
             .on_press(Message::EditKey(key.id.clone())),
+        // Disabled while the secret is missing from the keychain — the amber
+        // line below already says why.
+        button(
+            text(if exporting { "Click again to copy secret" } else { "Export…" }).size(12)
+        )
+        .padding([3, 10])
+        .style(style::ghost)
+        .on_press_maybe(
+            (!key.secret.is_empty()).then(|| Message::ExportKey(key.id.clone())),
+        ),
         button(
             text(if confirming { "Click again to delete" } else { "Delete…" }).size(12)
         )

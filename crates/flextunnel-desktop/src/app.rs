@@ -90,6 +90,9 @@ pub enum Message {
     AddKey,
     EditKey(String),
     DeleteKey(String),
+    /// Copy the key's secret to the clipboard (two-click, like delete) so it
+    /// can be imported on another device.
+    ExportKey(String),
     KeyNameChanged(String),
     KeySecretChanged(String),
     /// Fill the key form's secret field with a freshly generated keypair.
@@ -624,6 +627,9 @@ pub struct App {
     pub confirm_delete: Option<ProfileId>,
     /// Two-click delete guard for the Keys pane.
     pub confirm_delete_key: Option<String>,
+    /// Two-click export guard for the Keys pane: the key whose Export was
+    /// clicked once; the second click copies its secret to the clipboard.
+    pub confirm_export_key: Option<String>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
     /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
@@ -682,6 +688,7 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
+            confirm_export_key: None,
             notice: None,
             conn_path_modal: None,
             io_notice: None,
@@ -773,6 +780,7 @@ impl App {
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.confirm_delete_key = None;
+                self.confirm_export_key = None;
                 self.notice = None;
                 self.conn_path_modal = None;
                 Task::none()
@@ -908,6 +916,7 @@ impl App {
             Message::AddKey => {
                 self.key_form = Some(KeyForm::default());
                 self.confirm_delete_key = None;
+                self.confirm_export_key = None;
                 self.notice = None;
                 Task::none()
             }
@@ -915,12 +924,17 @@ impl App {
                 if let Some(key) = config::find_key(&self.keys, &id) {
                     self.key_form = Some(KeyForm::edit(key));
                     self.confirm_delete_key = None;
+                    self.confirm_export_key = None;
                     self.notice = None;
                 }
                 Task::none()
             }
             Message::DeleteKey(id) => {
                 self.delete_key(id);
+                Task::none()
+            }
+            Message::ExportKey(id) => {
+                self.export_key(id);
                 Task::none()
             }
             Message::KeyNameChanged(value) => {
@@ -1356,6 +1370,7 @@ impl App {
     }
 
     fn delete_key(&mut self, id: String) {
+        self.confirm_export_key = None;
         // Shared keys never delete out from under a profile; repoint or
         // delete the profiles first.
         if let Some(user) = self.profiles.iter().find(|p| p.auth_key_id == id) {
@@ -1375,6 +1390,29 @@ impl App {
         self.keys.retain(|k| k.id != id);
         self.key_form = None;
         self.persist_store();
+    }
+
+    /// Two-click export: the second click puts the key's secret on the
+    /// clipboard, ready to paste into another install's key form (or the iOS
+    /// app's key import). The clipboard is the export channel on purpose —
+    /// no secret ever lands in a file.
+    fn export_key(&mut self, id: String) {
+        self.confirm_delete_key = None;
+        if self.confirm_export_key.as_deref() != Some(id.as_str()) {
+            self.confirm_export_key = Some(id);
+            return;
+        }
+        self.confirm_export_key = None;
+        // The view never offers export for a secretless key, but the list can
+        // change between the two clicks.
+        let Some(key) = config::find_key(&self.keys, &id).filter(|k| !k.secret.is_empty()) else {
+            return;
+        };
+        let (name, secret) = (key.name.clone(), key.secret.clone());
+        self.copy_text(secret);
+        self.notice = Some(format!(
+            "Secret key of \"{name}\" copied — paste it into the key form of another install."
+        ));
     }
 
     fn save_forward_form(&mut self) {
