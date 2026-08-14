@@ -1,4 +1,6 @@
-//! Secret key generation and management commands (iroh).
+//! Key-management commands: iroh identity keys (`generate-iroh-key` /
+//! `show-iroh-id`) and client auth keypairs (`generate-auth-private-key` /
+//! `show-auth-public-key`).
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -6,7 +8,7 @@ use iroh::SecretKey;
 use log::info;
 use std::path::{Path, PathBuf};
 
-use crate::transport::endpoint::{load_secret, load_secret_from_string, secret_to_endpoint_id};
+use crate::transport::endpoint::{load_secret, secret_to_endpoint_id};
 
 fn write_secret_to_output(
     output: &PathBuf,
@@ -90,50 +92,147 @@ fn write_secret_to_output(
     Ok(())
 }
 
-/// Generate a new secret key file (base64 encoded) and output the EndpointId to stdout
-pub fn generate_secret(output: PathBuf, force: bool) -> Result<()> {
+/// Generate a new iroh secret key file (commented header + base64 secret, same
+/// shape as the auth key file) and output the iroh id (EndpointId) to stdout.
+/// With `json`, everything printed to stdout is a single JSON object (for QA
+/// automation): created timestamp and iroh id, plus either the written file
+/// path or, for `-`, the secret itself.
+pub fn generate_iroh_key(output: PathBuf, force: bool, json: bool) -> Result<()> {
     let secret = SecretKey::generate();
     let secret_base64 = BASE64.encode(secret.to_bytes());
     let endpoint_id = secret_to_endpoint_id(&secret);
-    write_secret_to_output(
-        &output,
-        &secret_base64,
-        &format!("EndpointId: {}", endpoint_id),
-        force,
-        "Secret key",
-    )
+    let created = crate::auth::utc_timestamp();
+    let contents = format!("# created: {created}\n# public key: {endpoint_id}\n{secret_base64}\n");
+    if output.as_os_str() == std::ffi::OsStr::new("-") {
+        // Print the whole key file (comments + secret) to stdout, or one JSON
+        // object carrying the same fields. No separate EndpointId line — the
+        // `# public key:` comment already shows it.
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "created": created,
+                    "endpoint_id": endpoint_id.to_string(),
+                    "secret": secret_base64,
+                })
+            );
+        } else {
+            print!("{contents}");
+        }
+        return Ok(());
+    }
+    let public_info = if json {
+        serde_json::json!({
+            "created": created,
+            "endpoint_id": endpoint_id.to_string(),
+            "secret_file": output.display().to_string(),
+        })
+        .to_string()
+    } else {
+        format!("EndpointId: {}", endpoint_id)
+    };
+    write_secret_to_output(&output, &contents, &public_info, force, "Iroh key")
 }
 
-/// Generate a fresh ephemeral server identity, returning its base64 encoding
-/// (suitable for `ServerConfig.secret`) and derived `EndpointId`. Used by
-/// `server start --quick`, which never persists the key to disk.
-pub fn generate_ephemeral_secret() -> (String, crate::iroh::EndpointId) {
-    let secret = SecretKey::generate();
-    let endpoint_id = secret_to_endpoint_id(&secret);
-    (BASE64.encode(secret.to_bytes()), endpoint_id)
+/// Generate a new client authentication keypair (see [`crate::auth`]) as an
+/// age-style key file, printing the public key to share with the server
+/// operator. With `json`, everything printed to stdout is a single JSON object
+/// (for QA automation): created timestamp and public key, plus either the
+/// written file path or, for `-`, the secret key itself.
+pub fn generate_auth_private_key(output: PathBuf, force: bool, json: bool) -> Result<()> {
+    let key = crate::auth::ClientKey::generate();
+    let created = crate::auth::utc_timestamp();
+    let contents = key.to_key_file(&created);
+    if output.as_os_str() == std::ffi::OsStr::new("-") {
+        // Print the whole key file (comments + secret) to stdout, or one JSON
+        // object carrying the same fields. No separate public-key line — the
+        // `# public key:` comment already shows it.
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "created": created,
+                    "public_key": key.public_str(),
+                    "secret_key": key.secret_str(),
+                })
+            );
+        } else {
+            print!("{contents}");
+        }
+        return Ok(());
+    }
+    let public_info = if json {
+        serde_json::json!({
+            "created": created,
+            "public_key": key.public_str(),
+            "secret_file": output.display().to_string(),
+        })
+        .to_string()
+    } else {
+        format!("Public key: {}", key.public_str())
+    };
+    write_secret_to_output(&output, &contents, &public_info, force, "Auth private key")
 }
 
-/// Resolve a server secret key from an inline base64 string and/or a key file,
-/// exactly one of which must be provided. Shared by `flextunnel server start` and
-/// `flextunnel show-server-id` so both accept the same `secret`/`secret_file`
-/// config.
-pub fn resolve_secret_key(secret: Option<&str>, secret_file: Option<&Path>) -> Result<SecretKey> {
-    match (secret, secret_file) {
-        (Some(_), Some(_)) => anyhow::bail!("Provide only one of secret or secret_file, not both"),
-        (Some(s), None) => load_secret_from_string(s).context("Invalid inline secret key"),
-        (None, Some(path)) => load_secret(path).context("Failed to load secret key"),
+/// Show the auth public key (`flextunnelpubv1:...`) for a client auth secret
+/// resolved from an inline `auth_key` or an `auth_key_file`, exactly one of
+/// which must be provided. With `json`, prints a single JSON object instead
+/// (for QA automation).
+pub fn show_auth_public_key(
+    auth_key: Option<&str>,
+    auth_key_file: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let key = match (auth_key, auth_key_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("Provide only one of auth_key or auth_key_file, not both")
+        }
+        (Some(s), None) => {
+            crate::auth::ClientKey::from_secret_str(s.trim()).context("Invalid client secret key")?
+        }
+        (None, Some(path)) => crate::auth::load_client_key_from_file(path)
+            .context("Failed to load the client key file")?,
         (None, None) => anyhow::bail!(
+            "No auth private key given.\n\
+             Pass --auth-key-file <KEY FILE> or --auth-key <SECRET>.\n\
+             Generate one with: flextunnel generate-auth-private-key"
+        ),
+    };
+    if json {
+        println!("{}", serde_json::json!({ "public_key": key.public_str() }));
+    } else {
+        println!("{}", key.public_str());
+    }
+    Ok(())
+}
+
+/// Resolve a server secret key from its key file — the only source for a
+/// persistent identity (there is no inline variant; quick mode's ephemeral
+/// identity never goes through here). Shared by `flextunnel server start` and
+/// `flextunnel show-iroh-id`.
+pub fn resolve_secret_key(secret_file: Option<&Path>) -> Result<SecretKey> {
+    match secret_file {
+        Some(path) => load_secret(path).context("Failed to load secret key"),
+        None => anyhow::bail!(
             "No secret key configured.\n\
-             Generate one with: flextunnel generate-server-key -o <FILE>\n\
-             Then pass --secret-file <FILE> or set secret_file/secret in the config."
+             Generate one with: flextunnel generate-iroh-key -o <FILE>\n\
+             Then pass --secret-file <FILE> or set secret_file in the config."
         ),
     }
 }
 
-/// Show the EndpointId for a server secret resolved from `secret`/`secret_file`.
-pub fn show_id(secret: Option<&str>, secret_file: Option<&Path>) -> Result<()> {
-    let secret = resolve_secret_key(secret, secret_file)?;
+/// Show the iroh id (EndpointId) for a server secret key file. With `json`,
+/// prints a single JSON object instead (for QA automation).
+pub fn show_iroh_id(secret_file: Option<&Path>, json: bool) -> Result<()> {
+    let secret = resolve_secret_key(secret_file)?;
     let endpoint_id = secret_to_endpoint_id(&secret);
-    println!("{}", endpoint_id);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "endpoint_id": endpoint_id.to_string() })
+        );
+    } else {
+        println!("{}", endpoint_id);
+    }
     Ok(())
 }

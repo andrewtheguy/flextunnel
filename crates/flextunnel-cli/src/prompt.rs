@@ -11,7 +11,7 @@ use flextunnel_core::iroh::EndpointId;
 
 /// Prompt (on the terminal) for any client values still missing from `cli`,
 /// mutating it in place. Never writes a config file — the collected values live
-/// only for this session. No auth token is involved: the quick client's
+/// only for this session. No auth keypair is involved: the quick client's
 /// credential is its endpoint id, entered on the quick server.
 pub fn fill_client_config(cli: &mut ClientConfig) -> Result<()> {
     // EndpointId of the server to connect to (printed by `server start --quick`).

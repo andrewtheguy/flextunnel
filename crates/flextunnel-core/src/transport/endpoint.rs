@@ -23,7 +23,7 @@ use std::time::Duration;
 /// QUIC application close code sent when a connection is rejected by an
 /// endpoint-id allowlist — a non-allowlisted bridge on [`BRIDGE_ALPN`] or a
 /// non-allowlisted quick client on [`QUICK_ALPN`] (distinct from the in-band
-/// auth-failure code `1` and the duplicate-id code `2` used on the token
+/// auth-failure code `1` and the duplicate-id code `2` used on the keypair
 /// client path).
 pub const CLOSE_NOT_ALLOWLISTED: u32 = 3;
 
@@ -48,7 +48,7 @@ pub struct EndpointAllowlists {
 ///
 /// Only the accepting side is gated: outbound dials (this server bridging
 /// *out*) pass through, as do inbound [`ALPN`] client connections (gated by
-/// their token handshake).
+/// their keypair handshake).
 #[derive(Debug)]
 pub struct AllowlistHook {
     allowlists: EndpointAllowlists,
@@ -224,14 +224,22 @@ impl RelayConfig {
 pub fn load_secret(path: &Path) -> Result<SecretKey> {
     if !path.exists() {
         anyhow::bail!(
-            "Secret key file not found: {}\nGenerate one with: flextunnel generate-server-key --output {}",
+            "Secret key file not found: {}\nGenerate one with: flextunnel generate-iroh-key --output {}",
             path.display(),
             path.display()
         );
     }
 
     let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
-    load_secret_from_string(content.trim())
+    // Key files carry `# created:` / `# public key:` comments above the secret;
+    // the first meaningful line is the base64 secret itself.
+    let Some((_, line)) = crate::auth::meaningful_lines(&content).next() else {
+        anyhow::bail!(
+            "No secret key found in {} (only blank lines or `#` comments)",
+            path.display()
+        );
+    };
+    load_secret_from_string(line)
 }
 
 /// Load secret key from a base64-encoded string.
@@ -485,8 +493,39 @@ async fn create_client_endpoint_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     const RELAY: &str = "https://relay.example.com./";
+
+    #[test]
+    fn load_secret_skips_comment_header() {
+        // Generated iroh key files carry `# created:` / `# public key:`
+        // comments above the base64 secret; the loader must skip them (and
+        // blank lines) and read the secret line.
+        let secret = SecretKey::generate();
+        let encoded = BASE64.encode(secret.to_bytes());
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "# created: 2026-08-13T01:02:03Z\n# public key: {}\n\n{}",
+            secret.public(),
+            encoded
+        )
+        .unwrap();
+        let loaded = load_secret(file.path()).unwrap();
+        assert_eq!(loaded.public(), secret.public());
+
+        // A bare secret with no comments still loads.
+        let mut bare = tempfile::NamedTempFile::new().unwrap();
+        writeln!(bare, "{encoded}").unwrap();
+        assert_eq!(load_secret(bare.path()).unwrap().public(), secret.public());
+
+        // Comments only — no secret line — is a hard error.
+        let mut empty = tempfile::NamedTempFile::new().unwrap();
+        writeln!(empty, "# created: 2026-08-13T01:02:03Z").unwrap();
+        let err = load_secret(empty.path()).unwrap_err();
+        assert!(err.to_string().contains("No secret key found"), "{err}");
+    }
 
     #[test]
     fn empty_urls_no_token_is_default() {

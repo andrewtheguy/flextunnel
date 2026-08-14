@@ -11,7 +11,7 @@
 #
 # CLI flags override these values. Unknown keys are rejected.
 
-# EndpointId of the server to connect to (from `flextunnel show-server-id`).
+# EndpointId of the server to connect to (from `flextunnel show-iroh-id`).
 # Also the client's identity: its prefix keys the single-instance lock, the
 # control socket, and the persisted port forwards, so one client runs per
 # server (per user) and `flextunnel client control` finds it from this config.
@@ -32,9 +32,11 @@ server_node_id = "<server endpoint id>"
 # `flextunnel client control`).
 # http_port = 8081
 
-# Auth token for this client. Provide exactly one of `auth_token` or `auth_token_file`.
-auth_token = "ftcXXXXXXX"
-# auth_token_file = "~/.config/flextunnel/token.txt"
+# This client's authentication keypair — always a key file (generate with
+# `flextunnel generate-auth-private-key -o ~/.config/flextunnel/client.key`;
+# put the printed PUBLIC key on the server's authorized_keys_file). There is
+# no inline variant in the config; `--auth-key` exists only as a CLI flag.
+auth_key_file = "~/.config/flextunnel/client.key"
 
 # Optional iroh tuning and reconnect behavior.
 # Custom relay(s) for failover. Configuring custom relays disables n0 internet

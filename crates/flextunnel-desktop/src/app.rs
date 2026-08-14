@@ -8,7 +8,7 @@
 //! tray click wakes the runtime even while no window exists; a 500 ms tick
 //! keeps the snapshots and the tray state fresh the rest of the time.
 
-use crate::config::{self, Profile, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
+use crate::config::{self, AuthKey, Profile, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use flextunnel_core::forwards::{
     PortForward, disable_failed_forwards, parse_port, validate_label, validate_remote_host,
 };
@@ -29,7 +29,23 @@ use tray_icon::TrayIconEvent;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
     Profile(ProfileId),
+    Keys,
     Logs,
+}
+
+/// One entry of the profile form's auth-key picker. Keys are picked by name
+/// (names are unique — see `drop_invalid_keys`); the id travels along so the
+/// selection maps back to the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyChoice {
+    pub id: String,
+    pub name: String,
+}
+
+impl std::fmt::Display for KeyChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +76,26 @@ pub enum Message {
     // Profile form
     ProfileNameChanged(String),
     ServerNodeIdChanged(String),
-    AuthTokenChanged(String),
+    /// Pick a shared auth key for the profile being edited.
+    AuthKeyPicked(KeyChoice),
+    /// Open the profile form's "New key" prompt (a name field next to the
+    /// picker).
+    NewKeyPrompt,
+    NewKeyNameChanged(String),
+    /// Generate a keypair under the prompted name, add it to the shared list,
+    /// and select it in the profile form.
+    NewKeyCreate,
+    NewKeyCancel,
+    // Auth keys (the Keys pane)
+    AddKey,
+    EditKey(String),
+    DeleteKey(String),
+    KeyNameChanged(String),
+    KeySecretChanged(String),
+    /// Fill the key form's secret field with a freshly generated keypair.
+    KeyGenerateSecret,
+    KeyFormSave,
+    KeyFormCancel,
     SocksEnabledToggled(bool),
     SocksPortChanged(String),
     HttpEnabledToggled(bool),
@@ -125,15 +160,10 @@ fn port_owner(
     None
 }
 
-/// `desired` if no other profile (than `own_id`) uses it, else the first free
-/// "desired - 2", "desired - 3", … The base is shortened if a suffix would
-/// push past the 64-character name limit.
-fn unique_name(profiles: &[Profile], desired: String, own_id: Option<&str>) -> String {
-    let taken = |name: &str| {
-        profiles
-            .iter()
-            .any(|p| p.name == name && Some(p.id.as_str()) != own_id)
-    };
+/// `desired` if `taken` reports it free, else the first free "desired - 2",
+/// "desired - 3", … The base is shortened if a suffix would push past the
+/// 64-character name limit.
+fn unique_name(desired: String, taken: impl Fn(&str) -> bool) -> String {
     if !taken(&desired) {
         return desired;
     }
@@ -152,17 +182,22 @@ fn unique_name(profiles: &[Profile], desired: String, own_id: Option<&str>) -> S
 
 /// Merge an imported (already structurally validated) profile list into the
 /// current one. A matching server node id replaces that profile's settings
-/// and forwards but keeps its id and both secrets (auth token and relay auth
-/// token); anything else is added as a new profile with a fresh id and no
-/// secrets — imports never carry them. Colliding names get a " - N" suffix,
-/// and imported forwards get fresh ids so they stay globally unique. Returns
-/// `(added, replaced-profile ids)`.
+/// and forwards but keeps its id, auth-key reference, and relay auth token;
+/// anything else is added as a new profile with a fresh id, no key picked,
+/// and no relay token — imports never carry them. Colliding names get a
+/// " - N" suffix, and imported forwards get fresh ids so they stay globally
+/// unique. Returns `(added, replaced-profile ids)`.
 fn merge_imported(
     profiles: &mut Vec<Profile>,
     imported: Vec<Profile>,
 ) -> (usize, Vec<ProfileId>) {
     let mut added = 0;
     let mut replaced = Vec::new();
+    let profile_name_taken = |profiles: &[Profile], name: &str, own_id: Option<&str>| {
+        profiles
+            .iter()
+            .any(|p| p.name == name && Some(p.id.as_str()) != own_id)
+    };
     for mut incoming in imported {
         for forward in &mut incoming.forwards {
             forward.id = PortForward::new_id();
@@ -173,17 +208,21 @@ fn merge_imported(
         {
             Some(pos) => {
                 incoming.id = profiles[pos].id.clone();
-                incoming.auth_token = profiles[pos].auth_token.clone();
+                incoming.auth_key_id = profiles[pos].auth_key_id.clone();
                 incoming.relay_auth_token = profiles[pos].relay_auth_token.clone();
-                incoming.name = unique_name(profiles, incoming.name, Some(&incoming.id));
+                incoming.name = unique_name(incoming.name.clone(), |name| {
+                    profile_name_taken(profiles, name, Some(&incoming.id))
+                });
                 profiles[pos] = incoming;
                 replaced.push(profiles[pos].id.clone());
             }
             None => {
                 incoming.id = Profile::new_id();
-                incoming.auth_token = String::new();
+                incoming.auth_key_id = String::new();
                 incoming.relay_auth_token = None;
-                incoming.name = unique_name(profiles, incoming.name, None);
+                incoming.name = unique_name(incoming.name.clone(), |name| {
+                    profile_name_taken(profiles, name, None)
+                });
                 profiles.push(incoming);
                 added += 1;
             }
@@ -209,7 +248,10 @@ pub struct ProfileForm {
     editing_id: Option<ProfileId>,
     pub name: String,
     pub server_node_id: String,
-    pub auth_token: String,
+    /// The picked shared key ([`AuthKey::id`]); empty while none is picked.
+    pub auth_key_id: String,
+    /// The "New key" prompt's name buffer; `None` while the prompt is closed.
+    pub new_key_name: Option<String>,
     pub socks_enabled: bool,
     pub socks_port: String,
     pub http_enabled: bool,
@@ -237,7 +279,8 @@ impl ProfileForm {
             editing_id: Some(profile.id.clone()),
             name: profile.name.clone(),
             server_node_id: profile.server_node_id.clone(),
-            auth_token: profile.auth_token.clone(),
+            auth_key_id: profile.auth_key_id.clone(),
+            new_key_name: None,
             socks_enabled: profile.socks_port.is_some(),
             socks_port: profile
                 .socks_port
@@ -253,7 +296,7 @@ impl ProfileForm {
         }
     }
 
-    pub fn validate(&self, profiles: &[Profile]) -> Result<Profile, String> {
+    pub fn validate(&self, profiles: &[Profile], keys: &[AuthKey]) -> Result<Profile, String> {
         // Normalize into the stored shape (see `Profile::is_valid_name`):
         // words separated by single spaces, nothing leading or trailing.
         let name = self.name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -286,12 +329,9 @@ impl ProfileForm {
                 other.name
             ));
         }
-        let auth_token = self.auth_token.trim();
-        if auth_token.is_empty() {
-            return Err("Auth token is required".into());
+        if config::find_key(keys, &self.auth_key_id).is_none() {
+            return Err("Pick an auth key (or create one with New key)".into());
         }
-        flextunnel_core::auth::validate_client_token(auth_token)
-            .map_err(|e| format!("Invalid auth token: {e}"))?;
         let editing = self.editing_id.as_deref();
         let socks_port = if self.socks_enabled {
             let port = parse_port(&self.socks_port, "SOCKS5 port")?;
@@ -339,7 +379,7 @@ impl ProfileForm {
             id: self.editing_id.clone().unwrap_or_else(Profile::new_id),
             name,
             server_node_id: server_node_id.into(),
-            auth_token: auth_token.into(),
+            auth_key_id: self.auth_key_id.clone(),
             socks_port,
             http_port,
             relay_urls,
@@ -347,6 +387,90 @@ impl ProfileForm {
             forwards,
         })
     }
+}
+
+/// Editable buffers for one shared auth key (the Keys pane's add/edit form).
+/// `editing_id` is `None` when adding.
+#[derive(Default)]
+pub struct KeyForm {
+    editing_id: Option<String>,
+    pub name: String,
+    pub secret: String,
+}
+
+impl KeyForm {
+    pub fn is_edit(&self) -> bool {
+        self.editing_id.is_some()
+    }
+
+    fn edit(key: &AuthKey) -> Self {
+        Self {
+            editing_id: Some(key.id.clone()),
+            name: key.name.clone(),
+            secret: key.secret.clone(),
+        }
+    }
+
+    /// The public key derived from the form's secret, when it parses. The
+    /// public half is never a secret — the UI shows it unmasked so it can be
+    /// copied onto the server's authorized-keys file.
+    pub fn public_key(&self) -> Option<String> {
+        flextunnel_core::auth::ClientKey::from_secret_str(self.secret.trim())
+            .ok()
+            .map(|key| key.public_str())
+    }
+
+    pub fn validate(&self, keys: &[AuthKey]) -> Result<AuthKey, String> {
+        let name = validate_key_name(&self.name, keys, self.editing_id.as_deref())?;
+        let secret = self.secret.trim();
+        if secret.is_empty() {
+            return Err(
+                "Secret key is required (generate one, or paste a flextunnelsecretv1: key)".into(),
+            );
+        }
+        let client_key = flextunnel_core::auth::ClientKey::from_secret_str(secret)
+            .map_err(|e| format!("Invalid secret key: {e}"))?;
+        let public_key = client_key.public_str();
+        // The same keypair twice under two names is an accidental re-add, not
+        // a use case — profiles share one entry instead.
+        if let Some(other) = keys
+            .iter()
+            .find(|k| k.public_key == public_key && Some(k.id.as_str()) != self.editing_id.as_deref())
+        {
+            return Err(format!("Key \"{}\" already holds this secret", other.name));
+        }
+        Ok(AuthKey {
+            id: self.editing_id.clone().unwrap_or_else(AuthKey::new_id),
+            name,
+            public_key,
+            secret: secret.into(),
+        })
+    }
+}
+
+/// Normalize and validate a key name (same shape as profile names — see
+/// `config::is_valid_name`), rejecting duplicates of any key other than
+/// `own_id`. Shared by the Keys form and the profile form's New key prompt;
+/// unique names keep the profile form's picker unambiguous.
+pub fn validate_key_name(
+    name: &str,
+    keys: &[AuthKey],
+    own_id: Option<&str>,
+) -> Result<String, String> {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return Err("Key name is required".into());
+    }
+    if name.chars().count() > 64 {
+        return Err("Key name must be 64 characters or fewer".into());
+    }
+    if keys
+        .iter()
+        .any(|k| k.name == name && Some(k.id.as_str()) != own_id)
+    {
+        return Err(format!("Another key is already named \"{name}\""));
+    }
+    Ok(name)
 }
 
 /// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
@@ -486,14 +610,20 @@ pub struct App {
     controller: Controller,
     tray: Option<Tray>,
     window: Option<window::Id>,
-    /// Ordered source of truth; persisted via `config::save_profiles`.
+    /// Ordered source of truth; persisted via `config::save_store`.
     pub profiles: Vec<Profile>,
+    /// The shared auth keys profiles reference into; persisted alongside.
+    pub keys: Vec<AuthKey>,
     pub selection: Selection,
     pub profile_form: Option<ProfileForm>,
+    /// The Keys pane's open add/edit form.
+    pub key_form: Option<KeyForm>,
     /// The open forward form and the profile it belongs to.
     pub forward_form: Option<(ProfileId, ForwardForm)>,
     /// Two-click delete guard: the profile whose Delete was clicked once.
     pub confirm_delete: Option<ProfileId>,
+    /// Two-click delete guard for the Keys pane.
+    pub confirm_delete_key: Option<String>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
     /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
@@ -525,29 +655,33 @@ impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let controller = Controller::start();
 
-        let profiles = match config::load_profiles() {
-            Ok(profiles) => profiles,
+        let store = match config::load_store() {
+            Ok(store) => store,
             Err(e) => {
                 log::error!("{e:#}");
-                Vec::new()
+                config::Store::default()
             }
         };
-        let selection = profiles
+        let selection = store
+            .profiles
             .first()
             .map(|p| Selection::Profile(p.id.clone()))
             .unwrap_or(Selection::Logs);
         // First run: go straight to creating a profile.
-        let profile_form = profiles.is_empty().then(|| ProfileForm::add(&[]));
+        let profile_form = store.profiles.is_empty().then(|| ProfileForm::add(&[]));
 
         let mut app = Self {
             controller,
             tray: None,
             window: None,
-            profiles,
+            profiles: store.profiles,
+            keys: store.keys,
             selection,
             profile_form,
+            key_form: None,
             forward_form: None,
             confirm_delete: None,
+            confirm_delete_key: None,
             notice: None,
             conn_path_modal: None,
             io_notice: None,
@@ -635,8 +769,10 @@ impl App {
             Message::Select(selection) => {
                 self.selection = selection;
                 self.profile_form = None;
+                self.key_form = None;
                 self.forward_form = None;
                 self.confirm_delete = None;
+                self.confirm_delete_key = None;
                 self.notice = None;
                 self.conn_path_modal = None;
                 Task::none()
@@ -662,6 +798,7 @@ impl App {
             }
             Message::AddProfile => {
                 self.profile_form = Some(ProfileForm::add(&self.profiles));
+                self.key_form = None;
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.notice = None;
@@ -670,6 +807,7 @@ impl App {
             Message::EditProfile(id) => {
                 if let Some(profile) = self.profiles.iter().find(|p| p.id == id) {
                     self.profile_form = Some(ProfileForm::edit(profile));
+                    self.key_form = None;
                     self.forward_form = None;
                     self.notice = None;
                 }
@@ -735,10 +873,80 @@ impl App {
                 }
                 Task::none()
             }
-            Message::AuthTokenChanged(value) => {
+            Message::AuthKeyPicked(choice) => {
                 if let Some(form) = &mut self.profile_form {
-                    form.auth_token = value;
+                    form.auth_key_id = choice.id;
                 }
+                Task::none()
+            }
+            Message::NewKeyPrompt => {
+                if let Some(form) = &mut self.profile_form
+                    && form.new_key_name.is_none()
+                {
+                    form.new_key_name = Some(String::new());
+                }
+                Task::none()
+            }
+            Message::NewKeyNameChanged(value) => {
+                if let Some(form) = &mut self.profile_form
+                    && let Some(buffer) = &mut form.new_key_name
+                {
+                    *buffer = value;
+                }
+                Task::none()
+            }
+            Message::NewKeyCreate => {
+                self.create_key_for_profile_form();
+                Task::none()
+            }
+            Message::NewKeyCancel => {
+                if let Some(form) = &mut self.profile_form {
+                    form.new_key_name = None;
+                }
+                Task::none()
+            }
+            Message::AddKey => {
+                self.key_form = Some(KeyForm::default());
+                self.confirm_delete_key = None;
+                self.notice = None;
+                Task::none()
+            }
+            Message::EditKey(id) => {
+                if let Some(key) = config::find_key(&self.keys, &id) {
+                    self.key_form = Some(KeyForm::edit(key));
+                    self.confirm_delete_key = None;
+                    self.notice = None;
+                }
+                Task::none()
+            }
+            Message::DeleteKey(id) => {
+                self.delete_key(id);
+                Task::none()
+            }
+            Message::KeyNameChanged(value) => {
+                if let Some(form) = &mut self.key_form {
+                    form.name = value;
+                }
+                Task::none()
+            }
+            Message::KeySecretChanged(value) => {
+                if let Some(form) = &mut self.key_form {
+                    form.secret = value;
+                }
+                Task::none()
+            }
+            Message::KeyGenerateSecret => {
+                if let Some(form) = &mut self.key_form {
+                    form.secret = flextunnel_core::auth::ClientKey::generate().secret_str();
+                }
+                Task::none()
+            }
+            Message::KeyFormSave => {
+                self.save_key_form();
+                Task::none()
+            }
+            Message::KeyFormCancel => {
+                self.key_form = None;
                 Task::none()
             }
             Message::SocksEnabledToggled(enabled) => {
@@ -916,15 +1124,38 @@ impl App {
         let Some(profile) = self.profile(id).cloned() else {
             return Task::none();
         };
-        if profile.is_ready() {
-            self.controller.connect(profile);
-            Task::none()
-        } else {
-            // The token's keychain entry was lost — re-enter it.
-            self.selection = Selection::Profile(profile.id.clone());
-            self.profile_form = Some(ProfileForm::edit(&profile));
-            self.notice = Some("Enter the auth token to connect.".into());
-            self.show_window()
+        match config::find_key(&self.keys, &profile.auth_key_id) {
+            Some(key) if !key.secret.is_empty() && !profile.server_node_id.is_empty() => {
+                let secret = key.secret.clone();
+                self.controller.connect(profile, secret);
+                Task::none()
+            }
+            Some(key) if key.secret.is_empty() => {
+                // The key's keychain entry was lost — re-enter its secret.
+                let (key_name, key_form) = (key.name.clone(), KeyForm::edit(key));
+                self.selection = Selection::Keys;
+                self.profile_form = None;
+                self.key_form = Some(key_form);
+                self.notice = Some(format!(
+                    "Re-enter the secret of key \"{key_name}\" to connect."
+                ));
+                self.show_window()
+            }
+            key => {
+                // `Some` here means the key is usable (the empty-secret case
+                // was caught above) and the server node id is empty (only a
+                // hand-edited file gets there); `None` is no key picked (fresh
+                // import) or a dangling reference.
+                let notice = if key.is_some() {
+                    "Enter the server node id to connect."
+                } else {
+                    "Pick an auth key to connect."
+                };
+                self.selection = Selection::Profile(profile.id.clone());
+                self.profile_form = Some(ProfileForm::edit(&profile));
+                self.notice = Some(notice.into());
+                self.show_window()
+            }
         }
     }
 
@@ -938,7 +1169,7 @@ impl App {
             return;
         };
         self.controller.remove_profile(&id);
-        config::delete_profile_secret(&id);
+        // The referenced auth key stays — it's shared, managed in the Keys pane.
         let removed = self.profiles.remove(pos);
         for forward in &removed.forwards {
             self.forward_errors.remove(&forward.id);
@@ -950,7 +1181,7 @@ impl App {
             self.log_filter = None;
             self.rebuild_log_text();
         }
-        self.persist_profiles();
+        self.persist_store();
         if self.selection == Selection::Profile(id) {
             self.selection = self
                 .profiles
@@ -1015,7 +1246,7 @@ impl App {
             }
         }
         if !failed_in.is_empty() {
-            self.persist_profiles();
+            self.persist_store();
         }
 
         let revision = logging::revision();
@@ -1025,7 +1256,7 @@ impl App {
         }
 
         if let Some(tray) = &mut self.tray {
-            tray.sync(&self.profiles, &self.snapshots);
+            tray.sync(&self.profiles, &self.keys, &self.snapshots);
         }
     }
 
@@ -1033,14 +1264,9 @@ impl App {
         let Some(form) = &self.profile_form else {
             return;
         };
-        let Ok(profile) = form.validate(&self.profiles) else {
+        let Ok(profile) = form.validate(&self.profiles, &self.keys) else {
             return;
         };
-        if let Err(e) = config::save_profile_secret(&profile.id, &profile.auth_token) {
-            log::error!("{e:#}");
-            self.notice = Some(format!("{e:#}"));
-            return;
-        }
         let id = profile.id.clone();
         let running = self.snapshots.get(&id).is_some_and(|s| {
             matches!(s.phase, Phase::Connecting | Phase::Connected | Phase::Reconnecting)
@@ -1060,7 +1286,7 @@ impl App {
             }
             None => self.profiles.push(profile),
         }
-        self.persist_profiles();
+        self.persist_store();
         if self.notice.is_none() {
             self.notice = Some(if running {
                 "Saved — reconnect to apply.".into()
@@ -1070,6 +1296,85 @@ impl App {
         }
         self.selection = Selection::Profile(id);
         self.profile_form = None;
+    }
+
+    /// The profile form's "New key" prompt: generate a keypair under the
+    /// entered name, add it to the shared list, and select it in the form.
+    /// (Cancelling the profile form afterwards keeps the key — it's in the
+    /// list, deletable from the Keys pane.)
+    fn create_key_for_profile_form(&mut self) {
+        let Some(name) = self.profile_form.as_ref().and_then(|f| f.new_key_name.clone()) else {
+            return;
+        };
+        // The view disables Create on an invalid name; this is the backstop.
+        let Ok(name) = validate_key_name(&name, &self.keys, None) else {
+            return;
+        };
+        let client_key = flextunnel_core::auth::ClientKey::generate();
+        let key = AuthKey {
+            id: AuthKey::new_id(),
+            name,
+            public_key: client_key.public_str(),
+            secret: client_key.secret_str(),
+        };
+        if let Err(e) = config::save_key_secret(&key.id, &key.secret) {
+            log::error!("{e:#}");
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        let id = key.id.clone();
+        self.keys.push(key);
+        self.persist_store();
+        if let Some(form) = &mut self.profile_form {
+            form.auth_key_id = id;
+            form.new_key_name = None;
+        }
+    }
+
+    fn save_key_form(&mut self) {
+        let Some(form) = &self.key_form else {
+            return;
+        };
+        let Ok(key) = form.validate(&self.keys) else {
+            return;
+        };
+        if let Err(e) = config::save_key_secret(&key.id, &key.secret) {
+            log::error!("{e:#}");
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        match self.keys.iter_mut().find(|k| k.id == key.id) {
+            Some(slot) => *slot = key,
+            None => self.keys.push(key),
+        }
+        self.persist_store();
+        if self.notice.is_none() {
+            // An edited secret reaches running sessions on their next connect.
+            self.notice = Some("Saved — profiles using this key apply it on reconnect.".into());
+        }
+        self.key_form = None;
+    }
+
+    fn delete_key(&mut self, id: String) {
+        // Shared keys never delete out from under a profile; repoint or
+        // delete the profiles first.
+        if let Some(user) = self.profiles.iter().find(|p| p.auth_key_id == id) {
+            self.notice = Some(format!(
+                "This key is used by profile \"{}\" — repoint or delete that profile first.",
+                user.name
+            ));
+            self.confirm_delete_key = None;
+            return;
+        }
+        if self.confirm_delete_key.as_deref() != Some(id.as_str()) {
+            self.confirm_delete_key = Some(id);
+            return;
+        }
+        self.confirm_delete_key = None;
+        config::delete_key_secret(&id);
+        self.keys.retain(|k| k.id != id);
+        self.key_form = None;
+        self.persist_store();
     }
 
     fn save_forward_form(&mut self) {
@@ -1099,7 +1404,7 @@ impl App {
     /// Persist all profiles and push one profile's forwards to its session
     /// (live apply).
     fn commit_forwards(&mut self, profile_id: &str) {
-        self.persist_profiles();
+        self.persist_store();
         if let Some(profile) = self.profile(profile_id) {
             self.controller
                 .set_forwards(profile_id, profile.forwards.clone());
@@ -1123,13 +1428,13 @@ impl App {
                 self.controller.set_forwards(id, profile.forwards.clone());
             }
         }
-        self.persist_profiles();
+        self.persist_store();
         self.io_notice = Some(format!(
             "Imported: {added} added, {} replaced.",
             replaced.len()
         ));
         // Land somewhere sensible if nothing (or a since-removed profile) was
-        // selected; added profiles still need their tokens entered.
+        // selected; added profiles still need an auth key picked.
         if !matches!(&self.selection, Selection::Profile(id) if self.profile(id).is_some())
             && let Some(profile) = self.profiles.first()
         {
@@ -1156,8 +1461,8 @@ impl App {
         };
     }
 
-    fn persist_profiles(&mut self) {
-        if let Err(e) = config::save_profiles(&self.profiles) {
+    fn persist_store(&mut self) {
+        if let Err(e) = config::save_store(&self.keys, &self.profiles) {
             log::error!("Failed to save profiles: {e:#}");
             self.notice = Some(format!("Failed to save profiles: {e:#}"));
         }
@@ -1210,12 +1515,22 @@ fn tray_events() -> impl Stream<Item = Message> {
 mod tests {
     use super::*;
 
+    fn test_keys() -> Vec<AuthKey> {
+        vec![AuthKey {
+            id: "k1".into(),
+            name: "work laptop".into(),
+            public_key: "flextunnelpubv1:abc".into(),
+            secret: "flextunnelsecretv1:xyz".into(),
+        }]
+    }
+
     fn valid_form() -> ProfileForm {
         ProfileForm {
             editing_id: None,
             name: " prod ".into(),
             server_node_id: " node-id ".into(),
-            auth_token: flextunnel_core::auth::generate_client_token(),
+            auth_key_id: "k1".into(),
+            new_key_name: None,
             socks_enabled: true,
             socks_port: "1080".into(),
             http_enabled: false,
@@ -1252,7 +1567,7 @@ mod tests {
             id: id.into(),
             name: format!("profile-{id}"),
             server_node_id: "node".into(),
-            auth_token: "token".into(),
+            auth_key_id: "k1".into(),
             socks_port: Some(socks_port),
             http_port: None,
             relay_urls: Vec::new(),
@@ -1324,7 +1639,7 @@ mod tests {
             existing_profile("p2", 1081, vec![]),
         ];
         current[1].server_node_id = "node-2".into();
-        current[0].auth_token = "secret".into();
+        current[0].auth_key_id = "key-ref".into();
         current[0].relay_auth_token = Some("relay-psk".into());
 
         // Same server as p1: replaces settings/forwards, keeps id + secrets.
@@ -1345,7 +1660,7 @@ mod tests {
 
         let p1 = &current[0];
         assert_eq!(p1.id, "p1", "id kept");
-        assert_eq!(p1.auth_token, "secret", "token kept");
+        assert_eq!(p1.auth_key_id, "key-ref", "key reference kept");
         assert_eq!(
             p1.relay_auth_token.as_deref(),
             Some("relay-psk"),
@@ -1358,7 +1673,7 @@ mod tests {
 
         let new = &current[2];
         assert_eq!(new.name, "profile-p2 - 2");
-        assert!(new.auth_token.is_empty(), "no secret in imports");
+        assert!(new.auth_key_id.is_empty(), "no key reference in imports");
         assert_eq!(new.relay_auth_token, None, "no relay secret in imports");
         assert_ne!(new.id, "y", "imported profile ids are fresh");
 
@@ -1378,31 +1693,32 @@ mod tests {
         let mut long = existing_profile("p2", 1081, vec![]);
         long.name = "a".repeat(64);
         let profiles = [taken, long.clone()];
+        let is_taken = |name: &str| profiles.iter().any(|p| p.name == name);
 
         assert_eq!(
-            unique_name(&profiles, "fresh".into(), None),
+            unique_name("fresh".into(), is_taken),
             "fresh",
             "free names pass through"
         );
-        let bumped = unique_name(&profiles, long.name.clone(), None);
+        let bumped = unique_name(long.name.clone(), is_taken);
         assert_eq!(bumped, format!("{} - 2", "a".repeat(60)));
         assert!(bumped.len() <= 64);
         assert!(bumped.ends_with(" - 2"));
-        assert!(Profile::is_valid_name(&bumped));
+        assert!(config::is_valid_name(&bumped));
     }
 
     #[test]
     fn name_whitespace_is_normalized() {
         let mut form = valid_form();
         form.name = "  staging   aws \t kube  ".into();
-        let profile = form.validate(&[]).expect("valid");
+        let profile = form.validate(&[], &test_keys()).expect("valid");
         assert_eq!(profile.name, "staging aws kube");
-        assert!(Profile::is_valid_name(&profile.name));
+        assert!(config::is_valid_name(&profile.name));
     }
 
     #[test]
     fn validate_trims_and_parses() {
-        let profile = valid_form().validate(&[]).expect("valid");
+        let profile = valid_form().validate(&[], &test_keys()).expect("valid");
         assert_eq!(profile.name, "prod");
         assert_eq!(profile.server_node_id, "node-id");
         assert_eq!(profile.socks_port, Some(1080));
@@ -1417,73 +1733,142 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_input() {
+        let keys = test_keys();
         let mut form = valid_form();
         form.name = "  ".into();
-        assert!(form.validate(&[]).is_err());
+        assert!(form.validate(&[], &keys).is_err());
 
+        // No key picked, and a reference to a key that doesn't exist.
         let mut form = valid_form();
-        form.auth_token = "not-a-token".into();
-        assert!(form.validate(&[]).is_err());
+        form.auth_key_id = String::new();
+        assert!(form.validate(&[], &keys).is_err());
+        form.auth_key_id = "missing".into();
+        assert!(form.validate(&[], &keys).is_err());
 
         let mut form = valid_form();
         form.socks_port = "0".into();
-        assert!(form.validate(&[]).is_err());
+        assert!(form.validate(&[], &keys).is_err());
 
         let mut form = valid_form();
         form.http_enabled = true;
         form.http_port = form.socks_port.clone();
-        assert!(form.validate(&[]).is_err());
+        assert!(form.validate(&[], &keys).is_err());
 
         let mut form = valid_form();
         form.server_node_id = "  ".into();
-        assert!(form.validate(&[]).is_err());
+        assert!(form.validate(&[], &keys).is_err());
 
         // Duplicate profile name (they key tray submenus and log threads)…
         let existing = [existing_profile("p1", 2080, vec![])];
         let mut form = valid_form();
         form.name = " profile-p1 ".into();
-        assert!(form.validate(&existing).is_err());
+        assert!(form.validate(&existing, &keys).is_err());
         // …unless it is the profile being edited.
         form.editing_id = Some("p1".into());
-        assert!(form.validate(&existing).is_ok());
+        assert!(form.validate(&existing, &keys).is_ok());
 
         // Duplicate server node id…
         let mut form = valid_form();
         form.server_node_id = "node".into();
-        assert!(form.validate(&existing).is_err());
+        assert!(form.validate(&existing, &keys).is_err());
         // …unless it is the profile being edited.
         form.editing_id = Some("p1".into());
-        assert!(form.validate(&existing).is_ok());
+        assert!(form.validate(&existing, &keys).is_ok());
+    }
+
+    #[test]
+    fn key_form_validates() {
+        let keys = test_keys();
+        let secret = flextunnel_core::auth::ClientKey::generate().secret_str();
+
+        let form = KeyForm {
+            editing_id: None,
+            name: "  home   nas ".into(),
+            secret: format!(" {secret} "),
+        };
+        let key = form.validate(&keys).expect("valid");
+        assert_eq!(key.name, "home nas");
+        assert_eq!(key.secret, secret);
+        assert!(!key.id.is_empty());
+        assert_eq!(
+            Some(key.public_key.clone()),
+            form.public_key(),
+            "stored public key matches the derived one"
+        );
+
+        // Empty name, empty secret, unparsable secret.
+        let mut bad = KeyForm {
+            editing_id: None,
+            name: String::new(),
+            secret: secret.clone(),
+        };
+        assert!(bad.validate(&keys).is_err());
+        bad.name = "ok".into();
+        bad.secret = String::new();
+        assert!(bad.validate(&keys).is_err());
+        bad.secret = "not-a-key".into();
+        assert!(bad.validate(&keys).is_err());
+
+        // Duplicate name…
+        let mut dup = KeyForm {
+            editing_id: None,
+            name: "work laptop".into(),
+            secret: secret.clone(),
+        };
+        assert!(dup.validate(&keys).is_err());
+        // …unless it is the key being edited.
+        dup.editing_id = Some("k1".into());
+        let edited = dup.validate(&keys).expect("editing the same key");
+        assert_eq!(edited.id, "k1");
+
+        // The same keypair under a second name is an accidental re-add.
+        let mut existing_pair = keys.clone();
+        existing_pair.push(KeyForm {
+            editing_id: None,
+            name: "first".into(),
+            secret: secret.clone(),
+        }
+        .validate(&keys)
+        .unwrap());
+        let readd = KeyForm {
+            editing_id: None,
+            name: "second".into(),
+            secret,
+        };
+        assert!(readd.validate(&existing_pair).is_err());
     }
 
     #[test]
     fn profile_ports_share_one_namespace() {
+        let keys = test_keys();
         let existing = [existing_profile("p1", 1080, vec![existing_forward("f1", 5000)])];
 
         // Another profile's SOCKS port.
         let form = valid_form();
-        assert!(form.validate(&existing).is_err());
+        assert!(form.validate(&existing, &keys).is_err());
 
         // Another profile's forward local port (as SOCKS or HTTP).
         let mut form = valid_form();
         form.socks_port = "5000".into();
-        assert!(form.validate(&existing).is_err());
+        assert!(form.validate(&existing, &keys).is_err());
         let mut form = valid_form();
         form.socks_port = "1090".into();
         form.http_enabled = true;
         form.http_port = "5000".into();
-        assert!(form.validate(&existing).is_err());
+        assert!(form.validate(&existing, &keys).is_err());
 
         // A free port is fine.
         let mut form = valid_form();
         form.socks_port = "1081".into();
-        assert!(form.validate(&existing).is_ok());
+        assert!(form.validate(&existing, &keys).is_ok());
 
         // Editing a profile skips its own proxy ports but keeps its forwards.
         let mut form = valid_form();
         form.editing_id = Some("p1".into());
         form.socks_port = "1080".into();
-        let edited = form.validate(&existing).expect("own port is not a clash");
+        let edited = form
+            .validate(&existing, &keys)
+            .expect("own port is not a clash");
         assert_eq!(edited.id, "p1");
         assert_eq!(edited.forwards, existing[0].forwards);
 

@@ -170,7 +170,7 @@ fn conn_path_lines(snapshot: &WireConnSnapshot) -> Vec<Line<'static>> {
     }
 
     // Custom-relay health (empty with the default relays). /healthz is
-    // unauthenticated — it confirms the relay is up, not that a token is accepted.
+    // unauthenticated — it confirms the relay is up, not that a relay auth token is accepted.
     if !snapshot.custom_relays.is_empty() {
         lines.push(Line::default());
         lines.push(section("Custom relays:".to_string()));

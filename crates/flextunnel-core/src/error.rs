@@ -44,7 +44,7 @@ pub enum ProxyError {
     #[error("Signaling error: {0}")]
     Signaling(String),
 
-    /// Authentication failed (permanent, e.g., invalid token, server rejected).
+    /// Authentication failed (permanent, e.g., unauthorized key, server rejected).
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
@@ -72,8 +72,8 @@ impl ProxyError {
     ///
     /// Transient (recoverable): `ConnectionLost`, `Network`, `Signaling` — a
     /// dropped/failed connection that a retry might fix. Permanent: `Config`
-    /// (bad input) and `AuthenticationFailed` (the server rejected the token —
-    /// retrying with the same token is pointless).
+    /// (bad input) and `AuthenticationFailed` (the server rejected the credential —
+    /// retrying with the same key is pointless).
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,

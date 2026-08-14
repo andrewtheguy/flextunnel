@@ -7,7 +7,7 @@
 //! Per-profile menu item ids carry the profile id after a prefix
 //! (`connect:<id>`), parsed by `App::handle_menu_event`.
 
-use crate::config::Profile;
+use crate::config::{AuthKey, Profile};
 use crate::icon::{self, TrayState};
 use crate::tunnel::{Phase, Snapshot};
 use anyhow::Result;
@@ -197,7 +197,12 @@ impl Tray {
 
     /// Reflect the tunnel states in the icon/menu. Native calls only happen on
     /// a change; called every UI frame.
-    pub fn sync(&mut self, profiles: &[Profile], snapshots: &HashMap<String, Snapshot>) {
+    pub fn sync(
+        &mut self,
+        profiles: &[Profile],
+        keys: &[AuthKey],
+        snapshots: &HashMap<String, Snapshot>,
+    ) {
         let phases: Vec<Phase> = profiles
             .iter()
             .map(|p| profile_phase(snapshots, &p.id))
@@ -214,7 +219,7 @@ impl Tray {
                     let copyable = snapshots
                         .get(&p.id)
                         .is_some_and(|s| s.socks_addr.is_some());
-                    (p.id.clone(), p.name.clone(), *phase, p.is_ready(), copyable)
+                    (p.id.clone(), p.name.clone(), *phase, p.is_ready(keys), copyable)
                 })
                 .collect(),
         );
@@ -243,7 +248,7 @@ impl Tray {
             let phase = profile_phase(snapshots, &profile.id);
             items.status.set_text(status_line(phase));
             items.connect.set_enabled(
-                matches!(phase, Phase::Idle | Phase::Failed) && profile.is_ready(),
+                matches!(phase, Phase::Idle | Phase::Failed) && profile.is_ready(keys),
             );
             items.disconnect.set_enabled(matches!(
                 phase,

@@ -5,14 +5,16 @@
 #
 # CLI flags override these values. Unknown keys are rejected.
 
-# Server identity key. Provide exactly one of `secret_file` or `secret`.
+# Server identity key — always a file (generate with `flextunnel
+# generate-iroh-key -o server.key`); there is no inline variant.
 secret_file = "./server.key"
-# secret = "<base64-encoded 32-byte key>"   # inline alternative to secret_file
 
-# Accepted client auth tokens (prefix `ftc`, from `flextunnel generate-auth-token`).
-# Within this config file, inline tokens and a token file combine.
-auth_tokens = ["ftcXXXXXXX"]
-# auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
+# Authorized client public keys — always a file (ssh authorized_keys style).
+# One `flextunnelpubv1:...` per line, optional trailing comment; `#` lines
+# ignored. Clients generate a keypair with `flextunnel generate-auth-private-key`
+# and you paste the printed PUBLIC key here (the secret never leaves the
+# client).
+authorized_keys_file = "./authorized_keys"
 
 # Optional iroh tuning.
 # Custom relay(s) for failover. Configuring custom relays disables n0 internet

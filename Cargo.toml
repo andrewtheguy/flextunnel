@@ -46,6 +46,11 @@ url = "2"
 tempfile = "3.24.0"
 flextunnel-core = { path = "crates/flextunnel-core" }
 
+# block 0.1.6 (iced → wgpu → metal, macOS only) with its future-incompat
+# "static of uninhabited type" soundness bug fixed — see vendor/block/README.md.
+[patch.crates-io]
+block = { path = "vendor/block" }
+
 # Profiles are only honored in the workspace root manifest.
 [profile.release]
 strip = true

@@ -36,7 +36,7 @@ local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g.
   disabled unless explicitly configured. Any local user or process that can reach
   them can use the tunnel, so they **bind `127.0.0.1` only** (you configure just
   the port, like the desktop client) and flextunnel assumes a **trusted,
-  single-user host**. The QUIC auth token authenticates the client *process* to
+  single-user host**. The client keypair authenticates the client *process* to
   the server; it does **not** authenticate local callers of the proxy
   front-ends, and is no substitute for OS-level access control on a shared
   machine.
@@ -45,22 +45,28 @@ local app ──SOCKS5/HTTP──► flextunnel client (optional listeners, e.g.
 
 flextunnel lets a set of **trusted clients** reach resources on the **server's**
 side of the network. Both ends are run by the same trusted party: whoever runs
-the server decides which clients get tokens. It is **not** a multi-tenant service
-and does not defend the server against the clients it admits — a client with a
-valid token can, by design, reach whatever the server's network can reach
-(including the server's own `localhost`). Distribute tokens accordingly, and
+the server decides which client keys it authorizes. It is **not** a multi-tenant
+service and does not defend the server against the clients it admits — a client
+with an authorized key can, by design, reach whatever the server's network can
+reach (including the server's own `localhost`). Authorize keys accordingly, and
 scope the server's network access if that reach is too broad. The threats it does
-address are on-path attackers (encryption + per-client tokens) and accidental
+address are on-path attackers (encryption + per-client keypairs) and accidental
 misconfiguration (e.g. duplicate-id detection catching two clients or servers
 started with the same identity — an operator guard rail, not an adversary
 defense).
 
-A per-client auth token gates every connection:
+A per-client ed25519 keypair gates every connection:
 
-- **Auth token** — sent in the connection handshake and checked against the
-  server's accepted set. Per-client, like an API key.
+- **Client keypair** — each client generates an age-style keypair
+  (`flextunnel generate-auth-private-key`); the server keeps the public keys in an
+  ssh-style authorized-keys file. In the handshake the client sends its public
+  key, its (ephemeral) iroh endpoint id, and a signature over that id; the
+  server accepts only if the claimed id matches the connection's
+  TLS-authenticated id, the signature verifies, and the key is authorized —
+  the secret never leaves the client, and a captured handshake cannot be
+  replayed from another endpoint.
 
-(The tokenless exceptions are server-to-server bridges and `--quick` sessions,
+(The keyless exceptions are server-to-server bridges and `--quick` sessions,
 whose credential is the peer's TLS-authenticated **EndpointId**, checked
 natively against an allowlist at the handshake — the `authorized_keys` model.)
 
@@ -197,13 +203,29 @@ Docker, use `./build-linux.sh`.
 ### 1. Generate credentials (once)
 
 ```sh
-flextunnel generate-server-key -o server.key   # prints the server's EndpointId
-flextunnel show-server-id --secret-file server.key   # re-print the EndpointId
-flextunnel generate-auth-token                  # a client auth token
+flextunnel generate-iroh-key -o server.key   # prints the server's EndpointId
+flextunnel show-iroh-id --secret-file server.key   # re-print the EndpointId
+
+# On each client machine: generate that client's keypair (age-style file).
+flextunnel generate-auth-private-key -o client.key   # prints the PUBLIC key
+flextunnel show-auth-public-key --auth-key-file client.key   # re-print it
 ```
 
-Keep `server.key` private (written `0600` on Unix). Share the **EndpointId**
-and the **auth token** with clients.
+Without `-o`, the generate commands print the key file to stdout instead.
+Keep `server.key` and each `client.key` private (written `0600` on Unix; both
+key files carry `# created:` / `# public key:` comments). Share
+the server's **EndpointId** with clients, and collect each client's printed
+**public key** (`flextunnelpubv1:…` — not a secret) into the server's
+authorized-keys file, one per line with an optional trailing comment, ssh
+`authorized_keys` style:
+
+```text
+# ./authorized_keys
+flextunnelpubv1:XXXXXXXX alice laptop
+flextunnelpubv1:YYYYYYYY build server
+```
+
+All commands above accept `--json` for machine-readable output (QA automation).
 
 ### 2. Configure and run the server (no root needed)
 
@@ -214,10 +236,8 @@ tunneling.
 ```toml
 secret_file = "./server.key"
 
-# Accepted client auth tokens (prefix `ftc`, from `flextunnel generate-auth-token`).
-# Within this config file, inline tokens and a token file combine.
-auth_tokens = ["ftcXXXXXXX"]
-# auth_tokens_file = "/etc/flextunnel/auth_tokens.txt"
+# Authorized client public keys — always a file (ssh authorized_keys style).
+authorized_keys_file = "./authorized_keys"
 
 routed_domains = ["*"]
 routed_cidrs = ["0.0.0.0/0", "::/0"]
@@ -237,7 +257,7 @@ It prints `flextunnel server Node ID: <ENDPOINT_ID>` — give that to clients.
 ```sh
 flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
-    --auth-token     <AUTH_TOKEN> \
+    --auth-key-file  client.key \
     --socks-port     1080            # SOCKS5 on 127.0.0.1:1080 (loopback only)
 ```
 
@@ -260,8 +280,8 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@internal-host
 #### Quick ephemeral tunnel (no setup)
 
 For a throwaway "route everything through this box for a few minutes" session,
-`--quick` skips all of the above — no key file, no token, no config. There is
-no token auth at all: each side enters the **other side's EndpointId**. The
+`--quick` skips all of the above — no key files, no config. There is
+no keypair auth at all: each side enters the **other side's EndpointId**. The
 client's id becomes the server's one-entry allowlist (enforced natively at the
 TLS handshake, like bridge allowlisting), and dialing the server's id is itself
 what authenticates the server:
@@ -335,7 +355,7 @@ still happens on the server.
 ```sh
 flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
-    --auth-token     <AUTH_TOKEN> \
+    --auth-key-file  client.key \
     --socks-port     1080 \
     --http-port      8081
 
@@ -355,9 +375,10 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `client start` | Run the proxy client (optional SOCKS5 and HTTP proxy listeners, port forwards). |
 | `client control` | Attach the terminal control panel to a running client. |
 | `client help` | Show the client subcommands and their help. |
-| `generate-server-key -o <FILE> [--force]` | Generate the server identity key. |
-| `show-server-id --secret-file <FILE>` | Print the EndpointId for a key. |
-| `generate-auth-token [-c N]` | Generate N client auth tokens (prefix `ftc`). |
+| `generate-iroh-key [-o <FILE>] [--force] [--json]` | Generate the server's iroh identity key (stdout without `-o`). |
+| `show-iroh-id --secret-file <FILE> [--json]` | Print the iroh id (EndpointId) for a key. |
+| `generate-auth-private-key [-o <FILE>] [--force] [--json]` | Generate a client auth keypair (age-style file, stdout without `-o`); prints the public key. |
+| `show-auth-public-key --auth-key-file <FILE> [--json]` | Print the auth public key for a private key (or `--auth-key <SECRET>`). |
 
 ### `server start`
 
@@ -366,11 +387,10 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
-| `--auth-token <TOKEN>` | Accepted client token (repeatable). |
-| `--auth-tokens-file <FILE>` | File of accepted client tokens, one per line. |
+| `--authorized-keys-file <FILE>` | File of authorized client public keys, one `flextunnelpubv1:…` per line (optional trailing comment, ssh `authorized_keys` style). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
-| `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth token — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--auth-token(s)`. |
+| `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
 ### `client start`
 
@@ -380,19 +400,19 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
-| `--auth-token <TOKEN>` / `--auth-token-file <FILE>` | Client auth token (one required). |
+| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `flextunnelsecretv1:…` secret, or the key file from `generate-auth-private-key`. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
 | `--max-reconnect-attempts <N>` | Cap reconnect attempts between successful connections (unlimited if unset). |
-| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth token), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-token(-file)`. |
+| `--quick` | Self-contained ephemeral session (pairs with `server start --quick`): ignore any saved config, print this client's EndpointId (enter it at the quick server's prompt — that allowlist entry is the credential; no auth keypair), prompt for the server EndpointId, then run the live control panel in this terminal. Needs an interactive terminal. Takes no lock and opens no control socket; quitting the panel disconnects. Nothing is persisted. Conflicts with `-c`/`--auth-key(-file)`. |
 
 `flextunnel client start` needs at least one flag — run with no arguments and it
 prints help. With a flag but no `-c`, it loads `~/.config/flextunnel/client.toml`
 if it exists (so `flextunnel client start --socks-port 1080` runs off the default
 config). `--quick` ignores any saved config, prints this client's EndpointId
-(its credential — enter it on the quick server; there is no auth token), and
+(its credential — enter it on the quick server; there is no auth keypair), and
 prompts (on an interactive terminal) for the server EndpointId and optional
 proxy ports, then
 runs the self-contained control panel described under [`client control`](#client-control)
@@ -449,8 +469,8 @@ flextunnel client start --socks-port 1080  # loads ~/.config/flextunnel/client.t
 
 Precedence is **CLI flag > config file > built-in default**, so you can keep a
 file and override settings on the command line. Credential groups are replaced
-as a unit: for example, if the CLI supplies either `--auth-token` or
-`--auth-token-file`, the config file's client token fields are ignored. Unknown
+as a unit: for example, if the CLI supplies either `--auth-key` or
+`--auth-key-file`, the config file's `auth_key_file` is ignored. Unknown
 or misspelled keys are rejected (`deny_unknown_fields`) rather than silently
 ignored. Paths support `~` expansion.
 
@@ -461,16 +481,17 @@ client file:
 ```toml
 server_node_id = "<server endpoint id>"
 socks_port     = 1080          # SOCKS5 on 127.0.0.1:1080 (loopback only)
-auth_token     = "ftc…"        # or: auth_token_file = "~/.config/flextunnel/token.txt"
+auth_key_file  = "~/.config/flextunnel/client.key"
 ```
 
-Secrets may be inline (as above) or kept in separate files via the `*_file`
-keys. CLI flags still work and override any of these.
+Private keys are always file references in a config (`secret_file`,
+`auth_key_file`) — there are no inline-key config keys. CLI flags still work
+and override any of these (`--auth-key` exists only as a CLI flag).
 
 Server-only routing keys include `host_aliases`,
 `dns_forwards`, outbound `[bridges.<name>]`, and inbound
 `allowed_bridge_servers`; these are config-file only because they describe the
-server's routing policy. Bridges carry no token: a bridging server
+server's routing policy. Bridges carry no keypair: a bridging server
 authenticates by its TLS-authenticated endpoint id, which the receiving server
 must list in `allowed_bridge_servers` (enforced natively at the handshake).
 
@@ -618,7 +639,7 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 ## How it relates to ezvpn
 
 flextunnel is modeled on the sibling project **ezvpn** (an IP-over-QUIC VPN),
-reusing its iroh transport, auth-token scheme, and secret-key
-identity. The difference: ezvpn creates a TUN device and ships IP packets over
+reusing its iroh transport and secret-key identity (client access control is
+flextunnel's own ed25519 keypair scheme). The difference: ezvpn creates a TUN device and ships IP packets over
 unreliable QUIC datagrams (and needs root); flextunnel exposes SOCKS5/HTTP proxy
 listeners and tunnels TCP over reliable QUIC streams (and needs no root).

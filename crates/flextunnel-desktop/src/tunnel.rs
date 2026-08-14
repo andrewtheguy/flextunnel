@@ -74,7 +74,9 @@ impl Snapshot {
 }
 
 enum Command {
-    Connect(Box<Profile>),
+    /// Start a session for the profile, authenticating with the given secret
+    /// key (resolved by the UI from the profile's shared auth-key reference).
+    Connect(Box<Profile>, String),
     Disconnect(ProfileId),
     /// Replace one profile's desired forward list (the UI sends the full list
     /// after every add/edit/delete/toggle); applied live mid-session.
@@ -152,8 +154,10 @@ impl Controller {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
-    pub fn connect(&self, profile: Profile) {
-        let _ = self.tx.blocking_send(Command::Connect(Box::new(profile)));
+    pub fn connect(&self, profile: Profile, auth_key: String) {
+        let _ = self
+            .tx
+            .blocking_send(Command::Connect(Box::new(profile), auth_key));
     }
 
     pub fn disconnect(&self, id: &str) {
@@ -224,7 +228,11 @@ struct SessionHandle {
 /// threads named `tunnel-<profile>` so the logger can attribute every line
 /// the session emits. `None` when the thread could not be spawned (the
 /// snapshot is set to Failed instead).
-fn spawn_session(profile: Profile, shared: &SharedSnapshots) -> Option<SessionHandle> {
+fn spawn_session(
+    profile: Profile,
+    auth_key: String,
+    shared: &SharedSnapshots,
+) -> Option<SessionHandle> {
     let (tx, session_rx) = mpsc::channel(8);
     let (done_tx, done) = tokio::sync::oneshot::channel();
     let slot = SnapshotSlot {
@@ -246,7 +254,7 @@ fn spawn_session(profile: Profile, shared: &SharedSnapshots) -> Option<SessionHa
             .enable_all()
             .build();
         match runtime {
-            Ok(rt) => rt.block_on(run_session(profile, session_rx, slot)),
+            Ok(rt) => rt.block_on(run_session(profile, auth_key, session_rx, slot)),
             Err(e) => {
                 log::error!("Failed to build the session runtime: {e:#}");
                 slot.update(|s| {
@@ -283,7 +291,7 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
         // An ended session drops its receiver, closing the sender.
         sessions.retain(|_, handle| !handle.tx.is_closed());
         match cmd {
-            Some(Command::Connect(profile)) => {
+            Some(Command::Connect(profile, auth_key)) => {
                 if sessions.contains_key(&profile.id) {
                     log::warn!("Profile \"{}\" is already running a session", profile.name);
                     continue;
@@ -313,7 +321,7 @@ async fn run_loop(mut rx: mpsc::Receiver<Command>, shared: SharedSnapshots) {
                     continue;
                 }
                 let id = profile.id.clone();
-                if let Some(handle) = spawn_session(*profile, &shared) {
+                if let Some(handle) = spawn_session(*profile, auth_key, &shared) {
                     sessions.insert(id, handle);
                 }
             }
@@ -378,7 +386,12 @@ fn refresh_forward_statuses(slot: &SnapshotSlot, fwd_mgr: &ForwardManager) {
     slot.update(|s| s.forwards = statuses);
 }
 
-async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot: SnapshotSlot) {
+async fn run_session(
+    profile: Profile,
+    auth_key: String,
+    mut rx: mpsc::Receiver<SessionCmd>,
+    slot: SnapshotSlot,
+) {
     let mut forwards = profile.forwards.clone();
     let socks_addr = profile
         .socks_port
@@ -410,6 +423,20 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
             slot.update(|s| {
                 s.phase = Phase::Failed;
                 s.last_error = Some(format!("{e:#}"));
+            });
+            return;
+        }
+    };
+    // The key form validated the secret on save, but a corrupted keychain
+    // entry can still surface here — fail the session cleanly rather than
+    // panic.
+    let client_key = match flextunnel_core::auth::ClientKey::from_secret_str(auth_key.trim()) {
+        Ok(key) => key,
+        Err(e) => {
+            log::error!("Invalid client auth key: {e:#}");
+            slot.update(|s| {
+                s.phase = Phase::Failed;
+                s.last_error = Some(format!("Invalid client auth key: {e:#}"));
             });
             return;
         }
@@ -479,7 +506,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
 
     let client = ProxyClient::new(ClientConfig {
         server_node_id: profile.server_node_id.clone(),
-        auth: ClientAuth::Token(profile.auth_token.clone()),
+        auth: ClientAuth::Key(Box::new(client_key)),
         socks_listen: socks_addr,
         http_listen: http_addr,
         relay_urls: profile.relay_urls.clone(),

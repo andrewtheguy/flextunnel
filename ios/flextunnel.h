@@ -45,12 +45,35 @@ typedef struct FlextunnelHandle FlextunnelHandle;
 void flextunnel_init_logging(void);
 
 /*
+ * Generate a fresh client authentication keypair. Writes
+ *   {"created":"<UTC>","public_key":"flextunnelpubv1:...",
+ *    "secret_key":"flextunnelsecretv1:..."}
+ * to out_buf. Store the secret key in the keychain; show the public key (never
+ * a secret) for the user to put on the server's authorized-keys file.
+ * Returns 1 on success, 0 if out_buf is too small.
+ */
+int flextunnel_generate_client_key(char *out_buf, size_t out_len);
+
+/*
+ * Derive the public key ("flextunnelpubv1:...") of a stored secret key, so the
+ * app can display it unmasked without persisting it separately. On success
+ * writes the public key to out_buf and returns 1. For an invalid secret it
+ * writes an error message and returns 0. If out_buf is too small it also
+ * returns 0, but out_buf then holds the truncated (NUL-terminated) output —
+ * no diagnostic text — so retry with a larger buffer.
+ */
+int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t out_len);
+
+/*
  * Start the in-process tunnel: create the iroh endpoint, optionally bind a
  * loopback SOCKS5 listener, and spawn the connect/auth/serve loop.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
- *   {"server_node_id":"<id>","auth_token":"<token>",
+ *   {"server_node_id":"<id>","auth_key":"flextunnelsecretv1:...",
  *    "socks_port":0,"relay_urls":[],"relay_auth_token":null}
+ *   auth_key is this client's secret key (from flextunnel_generate_client_key
+ *   or `flextunnel generate-auth-private-key`); its public half must be on the
+ *   server's authorized_keys_file.
  *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
  *   OS-assigned port (read it from the result JSON). relay_auth_token is
  *   optional: a shared bearer token sent to every custom relay's WebSocket

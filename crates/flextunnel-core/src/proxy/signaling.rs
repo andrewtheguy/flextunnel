@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -46,22 +46,39 @@ pub const REP_CONN_REFUSED: u8 = 0x05;
 pub const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// Client → server auth handshake (first bi-stream of the connection).
+/// Public-key credential of a regular client's `Hello` (see [`crate::auth`]).
 ///
-/// `Debug` is implemented manually to redact `auth_token` (a bearer credential)
-/// so it can never leak into logs or error context.
-#[derive(Clone, Serialize, Deserialize)]
+/// Nothing in it is secret: the public key is meant to be displayed, the
+/// endpoint id is already TLS-visible, and the signature reveals nothing
+/// about the secret key — so `Debug` derives plainly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientAuthPayload {
+    /// The client's authentication public key (`flextunnelpubv1:...`), which
+    /// must be on the server's authorized-keys file.
+    pub public_key: String,
+    /// The iroh endpoint id this client claims to be connecting from (its
+    /// ephemeral endpoint identity). The server checks it against the
+    /// connection's TLS-authenticated `remote_id()`.
+    pub endpoint_id: String,
+    /// base64url ed25519 signature over the domain-separated `endpoint_id`
+    /// (see `auth::verify_endpoint_id_signature`), binding the credential to
+    /// this connection so a captured `Hello` cannot be replayed elsewhere.
+    pub signature: String,
+}
+
+/// Client → server auth handshake (first bi-stream of the connection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u16,
-    /// Bearer token for a regular [`ALPN`] client. `None` for a quick-mode
-    /// [`QUICK_ALPN`] client, whose sole credential is its TLS-authenticated
-    /// endpoint id — already checked against the server's allowlist natively
-    /// before the connection reaches the accept loop.
+    /// Public-key credential for a regular [`ALPN`] client. `None` for a
+    /// quick-mode [`QUICK_ALPN`] client, whose sole credential is its
+    /// TLS-authenticated endpoint id — already checked against the server's
+    /// allowlist natively before the connection reaches the accept loop.
     ///
     /// [`ALPN`]: crate::transport::ALPN
     /// [`QUICK_ALPN`]: crate::transport::QUICK_ALPN
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
+    pub auth: Option<ClientAuthPayload>,
     /// Random per-process identity of the *client process*, distinct from its
     /// (ephemeral) iroh node id. Lets the server tell a benign reconnect of one
     /// client (same nonce) apart from two distinct processes presenting the same
@@ -73,20 +90,6 @@ pub struct Hello {
     /// not a command; the server decides whether to self-block on it.
     #[serde(default)]
     pub duplicate_server_observed: bool,
-}
-
-impl std::fmt::Debug for Hello {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Hello")
-            .field("version", &self.version)
-            .field(
-                "auth_token",
-                &self.auth_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("client_instance_nonce", &self.client_instance_nonce)
-            .field("duplicate_server_observed", &self.duplicate_server_observed)
-            .finish()
-    }
 }
 
 /// Server → client auth handshake response.
@@ -134,12 +137,12 @@ pub struct HelloResponse {
 }
 
 impl Hello {
-    /// A client `Hello`. `auth_token` is `Some` for a token client, `None` for
+    /// A client `Hello`. `auth` is `Some` for a keypair client, `None` for
     /// a quick-mode client (see the field docs).
-    pub fn new(auth_token: Option<String>, client_instance_nonce: u128) -> Self {
+    pub fn new(auth: Option<ClientAuthPayload>, client_instance_nonce: u128) -> Self {
         Self {
             version: PROTOCOL_VERSION,
-            auth_token,
+            auth,
             client_instance_nonce,
             duplicate_server_observed: false,
         }
@@ -493,12 +496,19 @@ mod tests {
     #[test]
     fn hello_roundtrip() {
         let hello = Hello::new(
-            Some("token".to_string()),
+            Some(ClientAuthPayload {
+                public_key: "flextunnelpubv1:abc".to_string(),
+                endpoint_id: "endpointid".to_string(),
+                signature: "sig".to_string(),
+            }),
             0x1234_5678_9abc_def0_1122_3344_5566_7788,
         );
         let encoded = encode_hello(&hello).unwrap();
         let decoded = decode_hello(&encoded).unwrap();
-        assert_eq!(decoded.auth_token.as_deref(), Some("token"));
+        let auth = decoded.auth.expect("auth payload present");
+        assert_eq!(auth.public_key, "flextunnelpubv1:abc");
+        assert_eq!(auth.endpoint_id, "endpointid");
+        assert_eq!(auth.signature, "sig");
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(
             decoded.client_instance_nonce,
@@ -506,12 +516,12 @@ mod tests {
         );
         assert!(!decoded.duplicate_server_observed);
 
-        // A quick-mode hello carries no token (the endpoint-id allowlist is
-        // the credential); the field is omitted on the wire entirely.
+        // A quick-mode hello carries no credential (the endpoint-id allowlist
+        // is the credential); the field is omitted on the wire entirely.
         let quick = Hello::new(None, 7);
         let encoded = encode_hello(&quick).unwrap();
-        assert!(!String::from_utf8_lossy(&encoded).contains("auth_token"));
-        assert_eq!(decode_hello(&encoded).unwrap().auth_token, None);
+        assert!(!String::from_utf8_lossy(&encoded).contains("auth"));
+        assert!(decode_hello(&encoded).unwrap().auth.is_none());
     }
 
     #[test]
