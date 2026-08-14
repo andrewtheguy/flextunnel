@@ -99,7 +99,7 @@ fn resolve_client_key(r: &config::ResolvedClient) -> Result<auth::ClientKey> {
     } else {
         anyhow::bail!(
             "The client requires an authentication keypair.\n\
-             Generate one with: flextunnel generate-client-key -o <FILE>\n\
+             Generate one with: flextunnel generate-auth-private-key -o <FILE>\n\
              Then pass --auth-key-file <FILE> (or --auth-key <SECRET>), or set \
              auth_key_file/auth_key in the config, and put the printed public key \
              on the server's authorized_keys_file."

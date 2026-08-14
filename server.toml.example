@@ -5,13 +5,13 @@
 #
 # CLI flags override these values. Unknown keys are rejected.
 
-# Server identity key. Provide exactly one of `secret_file` or `secret`.
+# Server identity key — always a file (generate with `flextunnel
+# generate-iroh-key -o server.key`); there is no inline variant.
 secret_file = "./server.key"
-# secret = "<base64-encoded 32-byte key>"   # inline alternative to secret_file
 
 # Authorized client public keys — always a file (ssh authorized_keys style).
 # One `flextunnelpubv1:...` per line, optional trailing comment; `#` lines
-# ignored. Clients generate a keypair with `flextunnel generate-client-key`
+# ignored. Clients generate a keypair with `flextunnel generate-auth-private-key`
 # and you paste the printed PUBLIC key here (the secret never leaves the
 # client).
 authorized_keys_file = "/etc/flextunnel/authorized_keys"

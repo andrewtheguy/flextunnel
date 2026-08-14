@@ -59,10 +59,10 @@ enum Command {
         #[command(subcommand)]
         action: ClientAction,
     },
-    /// Generate a new private key for persistent server identity.
-    GenerateServerKey {
-        /// Path where to save the private key file ("-" for stdout).
-        #[arg(short, long)]
+    /// Generate a new iroh private key for persistent server identity.
+    GenerateIrohKey {
+        /// Path where to save the private key file. Defaults to stdout ("-").
+        #[arg(short, long, default_value = "-")]
         output: PathBuf,
         /// Overwrite existing file if it exists.
         #[arg(long)]
@@ -71,9 +71,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show the server's public EndpointId derived from a private key.
+    /// Show the public iroh id (EndpointId) derived from an iroh private key.
     #[command(arg_required_else_help = true)]
-    ShowServerId {
+    ShowIrohId {
         /// Config file path (TOML). CLI flags override file values.
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
@@ -87,16 +87,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Generate a client authentication keypair (age-style key file). Share the
-    /// printed PUBLIC key with the server operator (it goes on the server's
+    /// Generate a client auth keypair (age-style key file). Share the printed
+    /// PUBLIC key with the server operator (it goes on the server's
     /// authorized_keys_file); the secret stays on the client.
-    GenerateClientKey {
-        /// Path where to save the key file ("-" for stdout).
-        #[arg(short, long)]
+    GenerateAuthPrivateKey {
+        /// Path where to save the key file. Defaults to stdout ("-").
+        #[arg(short, long, default_value = "-")]
         output: PathBuf,
         /// Overwrite existing file if it exists.
         #[arg(long)]
         force: bool,
+        /// Print machine-readable JSON to stdout (for automation).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the auth public key derived from an auth private key.
+    #[command(arg_required_else_help = true)]
+    ShowAuthPublicKey {
+        /// Inline client secret key (`flextunnelsecretv1:...`).
+        #[arg(long, conflicts_with = "auth_key_file")]
+        auth_key: Option<String>,
+        /// File containing the client secret key (from `flextunnel
+        /// generate-auth-private-key`).
+        #[arg(long)]
+        auth_key_file: Option<PathBuf>,
         /// Print machine-readable JSON to stdout (for automation).
         #[arg(long)]
         json: bool,
@@ -176,7 +190,7 @@ enum ClientAction {
         #[arg(long)]
         auth_key: Option<String>,
         /// File containing the client secret key (from `flextunnel
-        /// generate-client-key`).
+        /// generate-auth-private-key`).
         #[arg(long)]
         auth_key_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
@@ -354,22 +368,20 @@ mod cli_tests {
 
     #[test]
     fn quick_server_config_is_full_tunnel_without_client_keys() {
-        let (cli, endpoint_id) = quick_server_config(Vec::new(), None);
+        let (cli, _secret) = quick_server_config(Vec::new(), None);
         // No keypair auth in quick mode: the allowlisted client endpoint id is
-        // the sole credential.
+        // the sole credential. The ephemeral identity is returned alongside —
+        // never through the config, which carries no key at all.
         assert_eq!(cli.authorized_keys_file, None);
+        assert_eq!(cli.secret_file, None);
         // Full tunnel: the catch-alls for domains and both IP families.
         assert_eq!(cli.routed_domains.as_deref(), Some(["*".to_string()].as_slice()));
         assert_eq!(
             cli.routed_cidrs.as_deref(),
             Some(["0.0.0.0/0".to_string(), "::/0".to_string()].as_slice())
         );
-        // The config resolves (validation passes) and re-derives the same id
-        // from the inline secret it carries.
-        let resolved = config::resolve_server(cli, None).expect("quick config must resolve");
-        let secret = secret::resolve_secret_key(resolved.secret.as_deref(), None)
-            .expect("inline secret must resolve");
-        assert_eq!(secret_to_endpoint_id(&secret), endpoint_id);
+        // The config resolves (validation passes).
+        config::resolve_server(cli, None).expect("quick config must resolve");
     }
 
     #[test]
@@ -421,10 +433,10 @@ fn main() -> Result<()> {
                     server_node_id,
                 },
         } => tui::run(config, server_node_id),
-        Command::GenerateServerKey { output, force, json } => {
-            secret::generate_secret(output, force, json)
+        Command::GenerateIrohKey { output, force, json } => {
+            secret::generate_iroh_key(output, force, json)
         }
-        Command::ShowServerId {
+        Command::ShowIrohId {
             config,
             default_config,
             secret_file,
@@ -440,11 +452,16 @@ fn main() -> Result<()> {
             };
             let file = config::load_server_config(config.as_deref(), default_config)?;
             let r = config::resolve_server(cli, file)?;
-            secret::show_id(r.secret.as_deref(), r.secret_file.as_deref(), json)
+            secret::show_iroh_id(r.secret_file.as_deref(), json)
         }
-        Command::GenerateClientKey { output, force, json } => {
-            secret::generate_client_key(output, force, json)
+        Command::GenerateAuthPrivateKey { output, force, json } => {
+            secret::generate_auth_private_key(output, force, json)
         }
+        Command::ShowAuthPublicKey {
+            auth_key,
+            auth_key_file,
+            json,
+        } => secret::show_auth_public_key(auth_key.as_deref(), auth_key_file.as_deref(), json),
         command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
@@ -493,17 +510,16 @@ async fn run_async(command: Command) -> Result<()> {
                     )
                 })
                 .await??;
-                let (cli, endpoint_id) = quick_server_config(relay_urls, relay_auth_token);
-                print_quick_server_bootstrap(&endpoint_id);
+                let (cli, secret) = quick_server_config(relay_urls, relay_auth_token);
+                print_quick_server_bootstrap(&secret_to_endpoint_id(&secret));
                 return run_server(
                     config::resolve_server(cli, None)?,
-                    Some(QuickServer { client_id }),
+                    Some(QuickServer { client_id, secret }),
                 )
                 .await;
             }
             let cli = config::ServerConfig {
                 secret_file,
-                secret: None, // no inline-secret CLI flag; config file only
                 authorized_keys_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
@@ -624,6 +640,9 @@ struct QuickServer {
     /// The single client endpoint id allowed to connect (over the quick ALPN);
     /// entered at the prompt, enforced by the endpoint's allowlist hook.
     client_id: EndpointId,
+    /// The server's ephemeral in-memory identity. Carried here — never through
+    /// the config, which quick mode does not use for keys.
+    secret: SecretKey,
 }
 
 /// How long to wait for a graceful `endpoint.close()` during shutdown before
@@ -631,26 +650,26 @@ struct QuickServer {
 /// relay/connection teardown must never leave the process unkillable.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Build the ephemeral `ServerConfig` for `server start --quick`: a freshly
-/// generated in-memory identity and a full-tunnel routed set
-/// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). No
-/// client keys — the allowlisted client endpoint id is the sole credential. Returns
-/// the config plus the EndpointId to print. Nothing is written to disk.
-/// `--relay-url` stays compatible with `--quick`, so any relays are kept.
+/// Build the ephemeral `ServerConfig` for `server start --quick`: a full-tunnel
+/// routed set (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`)
+/// plus a freshly generated in-memory identity, returned *alongside* the config —
+/// quick mode never goes through config files, so no key rides in the config.
+/// No client keys — the allowlisted client endpoint id is the sole credential.
+/// Nothing is written to disk. `--relay-url` stays compatible with `--quick`,
+/// so any relays are kept.
 fn quick_server_config(
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
-) -> (config::ServerConfig, EndpointId) {
-    let (secret, endpoint_id) = secret::generate_ephemeral_secret();
+) -> (config::ServerConfig, SecretKey) {
+    let secret = SecretKey::generate();
     let cli = config::ServerConfig {
-        secret: Some(secret),
         routed_domains: Some(vec!["*".to_string()]),
         routed_cidrs: Some(vec!["0.0.0.0/0".to_string(), "::/0".to_string()]),
         relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
         relay_auth_token,
         ..Default::default()
     };
-    (cli, endpoint_id)
+    (cli, secret)
 }
 
 /// Print the bootstrap line for a quick-mode server: the EndpointId to enter at
@@ -683,7 +702,7 @@ async fn run_server(
     if authorized_keys.is_empty() && quick.is_none() {
         anyhow::bail!(
             "The server requires at least one authorized client public key.\n\
-             Each client generates a keypair with: flextunnel generate-client-key -o <FILE>\n\
+             Each client generates a keypair with: flextunnel generate-auth-private-key -o <FILE>\n\
              Put the printed public keys (one `flextunnelpubv1:...` per line) in a file and \
              pass --authorized-keys-file <FILE> or set authorized_keys_file in the config."
         );
@@ -696,7 +715,12 @@ async fn run_server(
         None => log::info!("Loaded {} authorized client key(s)", authorized_keys.len()),
     }
 
-    let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
+    // A quick server's identity is the ephemeral in-memory key it carries;
+    // a regular server's comes from its key file.
+    let secret_key = match &quick {
+        Some(q) => q.secret.clone(),
+        None => secret::resolve_secret_key(r.secret_file.as_deref())?,
+    };
     let own_id = secret_to_endpoint_id(&secret_key);
 
     // Load the duplicate-id blocklist and refuse to start if this server's own id

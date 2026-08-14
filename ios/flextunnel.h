@@ -70,7 +70,7 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   {"server_node_id":"<id>","auth_key":"flextunnelsecretv1:...",
  *    "socks_port":0,"relay_urls":[],"relay_auth_token":null}
  *   auth_key is this client's secret key (from flextunnel_generate_client_key
- *   or `flextunnel generate-client-key`); its public half must be on the
+ *   or `flextunnel generate-auth-private-key`); its public half must be on the
  *   server's authorized_keys_file.
  *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
  *   OS-assigned port (read it from the result JSON). relay_auth_token is

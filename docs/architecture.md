@@ -41,7 +41,7 @@ server.
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
 | `auth.rs` | client keypair auth (ed25519): age-style key generation/parsing (`flextunnelpubv1:`/`flextunnelsecretv1:`), ssh-style authorized-keys file loading, endpoint-id-bound sign/verify |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
-| `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
+| `secret.rs` | key-management commands: iroh identity keys (`generate-iroh-key`/`show-iroh-id`) and client auth keypairs (`generate-auth-private-key`/`show-auth-public-key`) |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
 | `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients) |

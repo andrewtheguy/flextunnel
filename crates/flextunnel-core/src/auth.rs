@@ -33,7 +33,7 @@
 //! their TLS-authenticated iroh endpoint id, checked against the receiving
 //! server's allowlist at the handshake.
 //!
-//! Generate client keys with `flextunnel generate-client-key`.
+//! Generate client keys with `flextunnel generate-auth-private-key`.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -196,7 +196,7 @@ pub fn load_client_key_from_file(path: &Path) -> Result<ClientKey> {
 ///
 /// # Example file:
 /// ```text
-/// # Authorized client keys (generate with: flextunnel generate-client-key)
+/// # Authorized client keys (generate with: flextunnel generate-auth-private-key)
 /// flextunnelpubv1:vGm7hYQz... alice laptop
 /// flextunnelpubv1:h9SwOUD1... build server
 /// ```
@@ -217,8 +217,9 @@ pub fn load_authorized_keys(path: &Path) -> Result<HashSet<PublicKey>> {
 
 /// Yield the meaningful `(line_num, line)` pairs of a key file: 1-based line
 /// numbers, empty lines and `#` comment lines skipped, surrounding whitespace
-/// trimmed. Shared by the key-file loaders so their parsing stays identical.
-fn meaningful_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
+/// trimmed. Shared by the key-file loaders (including the iroh secret key
+/// loader in `transport::endpoint`) so their parsing stays identical.
+pub(crate) fn meaningful_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
     content.lines().enumerate().filter_map(|(i, line)| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
