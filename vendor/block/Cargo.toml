@@ -1,0 +1,15 @@
+[package]
+name = "block"
+version = "0.1.6"
+authors = ["Steven Sheldon"]
+
+description = "Rust interface for Apple's C language extension of blocks."
+keywords = ["blocks", "osx", "ios", "objective-c"]
+readme = "README.md"
+repository = "http://github.com/SSheldon/rust-block"
+documentation = "http://ssheldon.github.io/rust-objc/block/"
+license = "MIT"
+
+# Vendored: see README.md. The upstream dev-dependency (objc_test_utils, a
+# path dependency not shipped in the published crate) is dropped so the
+# manifest parses; this copy's tests are never built.
