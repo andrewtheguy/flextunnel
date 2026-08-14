@@ -3,10 +3,15 @@
 //! each profile references one by [`AuthKey::id`]. The non-secret data (key
 //! names and public halves, profile names, server ids, ports, forwards) lives
 //! in a plaintext `profiles.json` under the local data dir — same treatment
-//! as the iOS app's `forwards.json`. The secret halves are stored one
-//! keychain entry per key (macOS Keychain / Windows Credential Manager,
-//! account = key id), which keeps every blob tiny — Windows caps credential
-//! blobs at ~2.5 KB.
+//! as the iOS app's `forwards.json`. The secret halves ride in the same file,
+//! sealed the way Chrome/Slack/Notion store their secrets: a single keychain
+//! entry ("Flextunnel Safe Storage", macOS Keychain / Windows Credential
+//! Manager) holds a random 256-bit master key, and the key-id → secret map is
+//! AES-256-GCM-encrypted with it into the file's `sealed_keys` blob. The
+//! keychain holds one small fixed-size entry regardless of how many keys
+//! exist, so a fresh install (or a rebuilt, differently-signed binary)
+//! triggers at most one macOS keychain prompt per run — and none at all
+//! until a key secret actually needs sealing or unsealing.
 //!
 //! Development escape hatch: setting `FLEXTUNNEL_DEV_CONFIG` swaps all of the
 //! above for a single plaintext JSON file with the secret keys inline, so a rebuild
@@ -14,7 +19,11 @@
 //! Never set it for a real install — the auth secret keys are stored unencrypted.
 
 use flextunnel_core::forwards::PortForward;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -25,7 +34,12 @@ pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// choice of 18080 for its SOCKS default).
 pub const DEFAULT_HTTP_PORT: u16 = 18080;
 
-const KEYCHAIN_SERVICE: &str = "flextunnel-desktop";
+/// The one keychain entry: it holds the random master key that seals the
+/// auth-key secrets in `profiles.json` — never the secrets themselves. Named
+/// after the "Chrome Safe Storage" / "Slack Safe Storage" convention so it's
+/// recognizable in Keychain Access.
+const SAFE_STORAGE_SERVICE: &str = "Flextunnel Safe Storage";
+const SAFE_STORAGE_USER: &str = "Flextunnel";
 
 /// Set this (to `1`/`true` for the default dev path, or to an explicit file
 /// path) to store profiles as plaintext JSON instead of the system keychain.
@@ -33,8 +47,8 @@ const KEYCHAIN_SERVICE: &str = "flextunnel-desktop";
 const DEV_CONFIG_ENV: &str = "FLEXTUNNEL_DEV_CONFIG";
 
 /// Chosen once by `init_store`; `File` when the dev env var is set, otherwise
-/// the platform keychain via `keyring-core` for secret keys + `profiles.json` for
-/// the rest.
+/// `profiles.json` with its secrets sealed under the Safe Storage master key
+/// held by the platform keychain via `keyring-core`.
 enum Backend {
     Keychain,
     File(PathBuf),
@@ -54,9 +68,9 @@ pub struct AuthKey {
     /// file), and keeping it here lets the UI identify the key even when its
     /// keychain entry is lost.
     pub public_key: String,
-    /// The secret half. Never serialized here: in keychain mode it lives in a
-    /// per-key keychain entry; the dev file backend re-adds it via
-    /// [`StoredKey`].
+    /// The secret half. Never serialized here: in keychain mode it rides in
+    /// the store's encrypted `sealed_keys` blob; the dev file backend re-adds
+    /// it via [`StoredKey`].
     #[serde(skip)]
     pub secret: String,
 }
@@ -142,6 +156,11 @@ pub struct Store {
     pub keys: Vec<AuthKey>,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// The key-id → secret map, sealed under the Safe Storage master key:
+    /// base64 of 12-byte nonce ‖ AES-256-GCM ciphertext. Empty when no key
+    /// has a secret (and always in dev file mode, where secrets are inline).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sealed_keys: String,
 }
 
 /// Borrowing twin of [`Store`] so saves don't clone the app state.
@@ -149,6 +168,8 @@ pub struct Store {
 struct StoreRef<'a> {
     keys: &'a [AuthKey],
     profiles: &'a [Profile],
+    #[serde(skip_serializing_if = "String::is_empty")]
+    sealed_keys: String,
 }
 
 /// Serialization wrapper for the dev file backend only: the secret rides along
@@ -227,8 +248,78 @@ pub fn init_store() -> bool {
     false
 }
 
-fn secret_entry(key_id: &str) -> Result<keyring_core::Entry> {
-    keyring_core::Entry::new(KEYCHAIN_SERVICE, key_id).context("Failed to open keychain entry")
+/// The Safe Storage master key: read from its keychain entry, generated (and
+/// stored) on first use, and cached for the process lifetime — so the
+/// keychain is touched at most once per run, which on macOS means at most
+/// one authorization prompt no matter how often the store saves.
+fn safe_storage_key() -> Result<[u8; 32]> {
+    static CACHE: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    if let Some(key) = *cache {
+        return Ok(key);
+    }
+    let entry = keyring_core::Entry::new(SAFE_STORAGE_SERVICE, SAFE_STORAGE_USER)
+        .context("Failed to open the Safe Storage keychain entry")?;
+    let key = match entry.get_password() {
+        Ok(b64) => BASE64
+            .decode(&b64)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("The {SAFE_STORAGE_SERVICE} entry is not a base64 32-byte key")
+            })?,
+        Err(keyring_core::Error::NoEntry) => {
+            let key: [u8; 32] = rand::random();
+            entry
+                .set_password(&BASE64.encode(key))
+                .context("Failed to store the Safe Storage key in the keychain")?;
+            key
+        }
+        Err(e) => return Err(e).context("Failed to read the Safe Storage key from the keychain"),
+    };
+    *cache = Some(key);
+    Ok(key)
+}
+
+/// Seal the key-id → secret map of `keys` into the `sealed_keys` blob.
+/// Secretless keys (lost secrets) are left out so a later load warns about
+/// them again instead of loading an empty secret; an all-secretless list
+/// seals to the empty string, which `open_key_secrets` never sees.
+fn seal_key_secrets(master: &[u8; 32], keys: &[AuthKey]) -> Result<String> {
+    let map: std::collections::BTreeMap<&str, &str> = keys
+        .iter()
+        .filter(|k| !k.secret.is_empty())
+        .map(|k| (k.id.as_str(), k.secret.as_str()))
+        .collect();
+    if map.is_empty() {
+        return Ok(String::new());
+    }
+    let cipher = Aes256Gcm::new(master.into());
+    let nonce: [u8; 12] = rand::random();
+    let ciphertext = cipher
+        .encrypt((&nonce).into(), serde_json::to_vec(&map)?.as_slice())
+        .map_err(|_| anyhow::anyhow!("Failed to encrypt the secret keys"))?;
+    Ok(BASE64.encode([&nonce[..], &ciphertext].concat()))
+}
+
+/// Decrypt a non-empty `sealed_keys` blob back into the key-id → secret map.
+/// Fails when the blob is malformed or was sealed under a different master
+/// key (i.e. the Safe Storage keychain entry was lost and regenerated).
+fn open_key_secrets(
+    master: &[u8; 32],
+    sealed: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let blob = BASE64
+        .decode(sealed)
+        .context("The sealed_keys blob is not base64")?;
+    let (nonce, ciphertext) = blob
+        .split_at_checked(12)
+        .context("The sealed_keys blob is too short")?;
+    let cipher = Aes256Gcm::new(master.into());
+    let plain = cipher
+        .decrypt(aes_gcm::Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| anyhow::anyhow!("Failed to decrypt the sealed secret keys"))?;
+    serde_json::from_slice(&plain).context("Failed to parse the unsealed secret keys")
 }
 
 /// Drop structurally invalid keys from a (possibly hand-edited) store,
@@ -321,7 +412,8 @@ fn drop_invalid(profiles: Vec<Profile>) -> Vec<Profile> {
 }
 
 /// Load the whole store; empty when nothing has been saved yet. In keychain
-/// mode each key's secret is filled from its keychain entry — a missing entry
+/// mode each key's secret is filled from the unsealed `sealed_keys` blob — a
+/// missing secret (or a blob the current Safe Storage key can't decrypt)
 /// loads as an empty secret with a warning instead of failing. Structurally
 /// invalid keys and profiles are ignored (see the `drop_invalid*` backstops);
 /// a profile referencing an unknown key is kept but can't connect until a key
@@ -336,16 +428,29 @@ pub fn load_store() -> Result<Store> {
         _ => {
             let mut store: Store = read_json(&profiles_path()?)?.unwrap_or_default();
             store.keys = drop_invalid_keys(store.keys);
+            // No sealed blob → nothing to unseal, and crucially no keychain
+            // access: a store without key secrets never prompts.
+            let secrets = if store.sealed_keys.is_empty() {
+                Default::default()
+            } else {
+                match open_key_secrets(&safe_storage_key()?, &store.sealed_keys) {
+                    Ok(map) => map,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to unseal the stored secret keys (was the \
+                             \"{SAFE_STORAGE_SERVICE}\" keychain entry replaced?): {e:#}"
+                        );
+                        Default::default()
+                    }
+                }
+            };
             for key in &mut store.keys {
-                match secret_entry(&key.id)?.get_password() {
-                    Ok(secret) => key.secret = secret,
-                    Err(keyring_core::Error::NoEntry) => log::warn!(
-                        "No keychain entry for key \"{}\"; its secret must be re-entered",
+                match secrets.get(&key.id) {
+                    Some(secret) => key.secret = secret.clone(),
+                    None => log::warn!(
+                        "No keychain secret for key \"{}\"; its secret must be re-entered",
                         key.name
                     ),
-                    Err(e) => {
-                        return Err(e).context("Failed to read a secret key from the keychain")
-                    }
                 }
             }
             store
@@ -364,13 +469,22 @@ pub fn load_store() -> Result<Store> {
     Ok(store)
 }
 
-/// Persist the key list and profiles (non-secret data only in keychain mode —
-/// secrets are written separately by [`save_key_secret`], so routine saves
-/// after a forward toggle never touch the keychain).
+/// Persist the key list and profiles, key secrets sealed. This is the whole
+/// save: one atomic file write covers key adds, edits, and deletions alike.
+/// The Safe Storage key is cached after its first use, so routine saves after
+/// a forward toggle never touch the keychain (and a store whose keys hold no
+/// secrets skips it entirely).
 pub fn save_store(keys: &[AuthKey], profiles: &[Profile]) -> Result<()> {
     match BACKEND.get() {
         Some(Backend::File(path)) => save_dev_file(path, keys, profiles),
-        _ => write_json(&profiles_path()?, &StoreRef { keys, profiles }),
+        _ => {
+            let sealed_keys = if keys.iter().all(|k| k.secret.is_empty()) {
+                String::new()
+            } else {
+                seal_key_secrets(&safe_storage_key()?, keys)?
+            };
+            write_json(&profiles_path()?, &StoreRef { keys, profiles, sealed_keys })
+        }
     }
 }
 
@@ -440,33 +554,6 @@ fn forwards_of(
         .filter_map(|f| f.as_object_mut())
 }
 
-/// Store one key's secret. Called only when the secret itself changes (a key
-/// is added or edited); a no-op in dev file mode where `save_store` already
-/// wrote it inline.
-pub fn save_key_secret(key_id: &str, secret: &str) -> Result<()> {
-    match BACKEND.get() {
-        Some(Backend::File(_)) => Ok(()),
-        _ => secret_entry(key_id)?
-            .set_password(secret)
-            .context("Failed to write the secret key to the keychain"),
-    }
-}
-
-/// Remove a deleted key's keychain entry (no-op in dev file mode). Best
-/// effort: a stale entry is harmless.
-pub fn delete_key_secret(key_id: &str) {
-    if let Some(Backend::File(_)) = BACKEND.get() {
-        return;
-    }
-    match secret_entry(key_id) {
-        Ok(entry) => match entry.delete_credential() {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => {}
-            Err(e) => log::warn!("Failed to delete the keychain key: {e}"),
-        },
-        Err(e) => log::warn!("{e:#}"),
-    }
-}
-
 fn load_dev_file(path: &Path) -> Result<Store> {
     let stored: DevFile = read_json(path)?.unwrap_or_default();
     Ok(Store {
@@ -479,6 +566,7 @@ fn load_dev_file(path: &Path) -> Result<Store> {
             })
             .collect(),
         profiles: stored.profiles,
+        sealed_keys: String::new(),
     })
 }
 
@@ -530,7 +618,7 @@ mod tests {
         AuthKey {
             id: "key1".into(),
             name: "work laptop".into(),
-            public_key: "flextunnelpubv1:abc".into(),
+            public_key: "flxtpubv1:abc".into(),
             // Distinctive sentinel so the leak-check assertions match the
             // secret *value* and don't collide with field names.
             secret: "ftc-secret-authtok".into(),
@@ -576,12 +664,13 @@ mod tests {
         let json = serde_json::to_string(&StoreRef {
             keys: &[key()],
             profiles: &[profile()],
+            sealed_keys: String::new(),
         })
         .unwrap();
         assert!(!json.contains("ftc-secret-authtok"), "secret leaked: {json}");
         // The non-secret halves of the key persist, as does the profile's
         // reference to it.
-        assert!(json.contains("flextunnelpubv1:abc"), "public key dropped: {json}");
+        assert!(json.contains("flxtpubv1:abc"), "public key dropped: {json}");
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
@@ -592,6 +681,43 @@ mod tests {
             json.contains("ftc-secret-relaypsk"),
             "relay token must persist in profiles.json: {json}"
         );
+    }
+
+    #[test]
+    fn sealed_secrets_roundtrip_without_leaking_plaintext() {
+        let master = [7u8; 32];
+        let sealed = seal_key_secrets(&master, &[key()]).unwrap();
+        assert!(!sealed.contains("ftc-secret-authtok"), "secret leaked: {sealed}");
+        let map = open_key_secrets(&master, &sealed).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("key1").map(String::as_str), Some("ftc-secret-authtok"));
+    }
+
+    /// Secretless keys stay out of the seal (so a load warns about them),
+    /// and an all-secretless list seals to the no-blob marker.
+    #[test]
+    fn secretless_keys_are_not_sealed() {
+        let master = [7u8; 32];
+        let mut lost = key();
+        lost.secret = String::new();
+
+        assert_eq!(seal_key_secrets(&master, &[lost.clone()]).unwrap(), "");
+
+        let mut other = key();
+        other.id = "key2".into();
+        let sealed = seal_key_secrets(&master, &[lost, other]).unwrap();
+        let map = open_key_secrets(&master, &sealed).unwrap();
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["key2"]);
+    }
+
+    /// A blob sealed under a different master key (a replaced Safe Storage
+    /// entry) or malformed base64 must fail loudly, not decrypt to garbage.
+    #[test]
+    fn unsealing_rejects_wrong_key_and_malformed_blobs() {
+        let sealed = seal_key_secrets(&[7u8; 32], &[key()]).unwrap();
+        assert!(open_key_secrets(&[8u8; 32], &sealed).is_err(), "wrong master key");
+        assert!(open_key_secrets(&[7u8; 32], "not base64!").is_err());
+        assert!(open_key_secrets(&[7u8; 32], "AAAA").is_err(), "shorter than a nonce");
     }
 
     #[test]
@@ -615,25 +741,25 @@ mod tests {
         let a = key();
         let mut same_id = key();
         same_id.name = "other".into();
-        same_id.public_key = "flextunnelpubv1:other".into();
+        same_id.public_key = "flxtpubv1:other".into();
         let mut same_name = key();
         same_name.id = "key2".into();
-        same_name.public_key = "flextunnelpubv1:def".into();
+        same_name.public_key = "flxtpubv1:def".into();
         let mut same_public = key();
         same_public.id = "key3".into();
         same_public.name = "same pubkey".into();
         let mut bad_name = key();
         bad_name.id = "key4".into();
         bad_name.name = " padded ".into();
-        bad_name.public_key = "flextunnelpubv1:ghi".into();
+        bad_name.public_key = "flxtpubv1:ghi".into();
         let mut empty_id = key();
         empty_id.id = String::new();
         empty_id.name = "no id".into();
-        empty_id.public_key = "flextunnelpubv1:mno".into();
+        empty_id.public_key = "flxtpubv1:mno".into();
         let mut unique = key();
         unique.id = "key5".into();
         unique.name = "home".into();
-        unique.public_key = "flextunnelpubv1:jkl".into();
+        unique.public_key = "flxtpubv1:jkl".into();
 
         let kept = drop_invalid_keys(vec![
             a.clone(),

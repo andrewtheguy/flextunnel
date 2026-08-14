@@ -104,7 +104,7 @@ enum Command {
     /// Show the auth public key derived from an auth private key.
     #[command(arg_required_else_help = true)]
     ShowAuthPublicKey {
-        /// Inline client secret key (`flextunnelsecretv1:...`).
+        /// Inline client secret key (`flxtsecretv1:...`).
         #[arg(long, conflicts_with = "auth_key_file")]
         auth_key: Option<String>,
         /// File containing the client secret key (from `flextunnel
@@ -135,7 +135,7 @@ enum ServerAction {
         #[arg(long)]
         secret_file: Option<PathBuf>,
         /// File of authorized client public keys (ssh authorized_keys style:
-        /// one `flextunnelpubv1:...` per line, optional trailing comment).
+        /// one `flxtpubv1:...` per line, optional trailing comment).
         #[arg(long)]
         authorized_keys_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
@@ -185,7 +185,7 @@ enum ClientAction {
         /// EndpointId of the server to connect to.
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
-        /// Inline client secret key (`flextunnelsecretv1:...`) used to
+        /// Inline client secret key (`flxtsecretv1:...`) used to
         /// authenticate to the server.
         #[arg(long, conflicts_with = "auth_key_file")]
         auth_key: Option<String>,
@@ -255,7 +255,7 @@ mod cli_tests {
             "--server-node-id",
             "server-id",
             "--auth-key",
-            "flextunnelsecretv1:XXXX",
+            "flxtsecretv1:XXXX",
         ])
         .unwrap_or_else(|error| panic!("client start should parse: {error}"));
 
@@ -355,7 +355,7 @@ mod cli_tests {
             vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
             // Quick mode has no keypair auth at all (the credential is the
             // client's endpoint id), so key flags are rejected too.
-            vec!["flextunnel", "client", "start", "--quick", "--auth-key", "flextunnelsecretv1:X"],
+            vec!["flextunnel", "client", "start", "--quick", "--auth-key", "flxtsecretv1:X"],
             vec!["flextunnel", "client", "start", "--quick", "--auth-key-file", "c.key"],
         ];
         for case in cases {
@@ -703,7 +703,7 @@ async fn run_server(
         anyhow::bail!(
             "The server requires at least one authorized client public key.\n\
              Each client generates a keypair with: flextunnel generate-auth-private-key -o <FILE>\n\
-             Put the printed public keys (one `flextunnelpubv1:...` per line) in a file and \
+             Put the printed public keys (one `flxtpubv1:...` per line) in a file and \
              pass --authorized-keys-file <FILE> or set authorized_keys_file in the config."
         );
     }

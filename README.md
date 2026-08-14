@@ -215,14 +215,14 @@ Without `-o`, the generate commands print the key file to stdout instead.
 Keep `server.key` and each `client.key` private (written `0600` on Unix; both
 key files carry `# created:` / `# public key:` comments). Share
 the server's **EndpointId** with clients, and collect each client's printed
-**public key** (`flextunnelpubv1:…` — not a secret) into the server's
+**public key** (`flxtpubv1:…` — not a secret) into the server's
 authorized-keys file, one per line with an optional trailing comment, ssh
 `authorized_keys` style:
 
 ```text
 # ./authorized_keys
-flextunnelpubv1:XXXXXXXX alice laptop
-flextunnelpubv1:YYYYYYYY build server
+flxtpubv1:XXXXXXXX alice laptop
+flxtpubv1:YYYYYYYY build server
 ```
 
 All commands above accept `--json` for machine-readable output (QA automation).
@@ -387,7 +387,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
-| `--authorized-keys-file <FILE>` | File of authorized client public keys, one `flextunnelpubv1:…` per line (optional trailing comment, ssh `authorized_keys` style). |
+| `--authorized-keys-file <FILE>` | File of authorized client public keys, one `flxtpubv1:…` per line (optional trailing comment, ssh `authorized_keys` style). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
@@ -400,7 +400,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
-| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `flextunnelsecretv1:…` secret, or the key file from `generate-auth-private-key`. |
+| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `flxtsecretv1:…` secret, or the key file from `generate-auth-private-key`. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |

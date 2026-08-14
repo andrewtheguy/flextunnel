@@ -10,7 +10,7 @@
 secret_file = "./server.key"
 
 # Authorized client public keys — always a file (ssh authorized_keys style).
-# One `flextunnelpubv1:...` per line, optional trailing comment; `#` lines
+# One `flxtpubv1:...` per line, optional trailing comment; `#` lines
 # ignored. Clients generate a keypair with `flextunnel generate-auth-private-key`
 # and you paste the printed PUBLIC key here (the secret never leaves the
 # client).

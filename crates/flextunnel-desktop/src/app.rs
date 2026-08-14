@@ -90,6 +90,9 @@ pub enum Message {
     AddKey,
     EditKey(String),
     DeleteKey(String),
+    /// Copy the key's secret to the clipboard (two-click, like delete) so it
+    /// can be imported on another device.
+    ExportKey(String),
     KeyNameChanged(String),
     KeySecretChanged(String),
     /// Fill the key form's secret field with a freshly generated keypair.
@@ -403,6 +406,12 @@ impl KeyForm {
         self.editing_id.is_some()
     }
 
+    /// The id of the key being edited (`None` when adding), so the Keys pane
+    /// can hide that key's card while its form is open.
+    pub fn editing_id(&self) -> Option<&str> {
+        self.editing_id.as_deref()
+    }
+
     fn edit(key: &AuthKey) -> Self {
         Self {
             editing_id: Some(key.id.clone()),
@@ -425,7 +434,7 @@ impl KeyForm {
         let secret = self.secret.trim();
         if secret.is_empty() {
             return Err(
-                "Secret key is required (generate one, or paste a flextunnelsecretv1: key)".into(),
+                "Secret key is required (generate one, or paste a flxtsecretv1: key)".into(),
             );
         }
         let client_key = flextunnel_core::auth::ClientKey::from_secret_str(secret)
@@ -624,6 +633,9 @@ pub struct App {
     pub confirm_delete: Option<ProfileId>,
     /// Two-click delete guard for the Keys pane.
     pub confirm_delete_key: Option<String>,
+    /// Two-click export guard for the Keys pane: the key whose Export was
+    /// clicked once; the second click copies its secret to the clipboard.
+    pub confirm_export_key: Option<String>,
     /// Transient status line in the detail pane (save results/failures).
     pub notice: Option<String>,
     /// Open connection-path modal: a point-in-time path snapshot (`ezvpn
@@ -682,6 +694,7 @@ impl App {
             forward_form: None,
             confirm_delete: None,
             confirm_delete_key: None,
+            confirm_export_key: None,
             notice: None,
             conn_path_modal: None,
             io_notice: None,
@@ -773,6 +786,7 @@ impl App {
                 self.forward_form = None;
                 self.confirm_delete = None;
                 self.confirm_delete_key = None;
+                self.confirm_export_key = None;
                 self.notice = None;
                 self.conn_path_modal = None;
                 Task::none()
@@ -908,6 +922,7 @@ impl App {
             Message::AddKey => {
                 self.key_form = Some(KeyForm::default());
                 self.confirm_delete_key = None;
+                self.confirm_export_key = None;
                 self.notice = None;
                 Task::none()
             }
@@ -915,12 +930,17 @@ impl App {
                 if let Some(key) = config::find_key(&self.keys, &id) {
                     self.key_form = Some(KeyForm::edit(key));
                     self.confirm_delete_key = None;
+                    self.confirm_export_key = None;
                     self.notice = None;
                 }
                 Task::none()
             }
             Message::DeleteKey(id) => {
                 self.delete_key(id);
+                Task::none()
+            }
+            Message::ExportKey(id) => {
+                self.export_key(id);
                 Task::none()
             }
             Message::KeyNameChanged(value) => {
@@ -1317,11 +1337,6 @@ impl App {
             public_key: client_key.public_str(),
             secret: client_key.secret_str(),
         };
-        if let Err(e) = config::save_key_secret(&key.id, &key.secret) {
-            log::error!("{e:#}");
-            self.notice = Some(format!("{e:#}"));
-            return;
-        }
         let id = key.id.clone();
         self.keys.push(key);
         self.persist_store();
@@ -1338,11 +1353,6 @@ impl App {
         let Ok(key) = form.validate(&self.keys) else {
             return;
         };
-        if let Err(e) = config::save_key_secret(&key.id, &key.secret) {
-            log::error!("{e:#}");
-            self.notice = Some(format!("{e:#}"));
-            return;
-        }
         match self.keys.iter_mut().find(|k| k.id == key.id) {
             Some(slot) => *slot = key,
             None => self.keys.push(key),
@@ -1356,6 +1366,7 @@ impl App {
     }
 
     fn delete_key(&mut self, id: String) {
+        self.confirm_export_key = None;
         // Shared keys never delete out from under a profile; repoint or
         // delete the profiles first.
         if let Some(user) = self.profiles.iter().find(|p| p.auth_key_id == id) {
@@ -1371,10 +1382,37 @@ impl App {
             return;
         }
         self.confirm_delete_key = None;
-        config::delete_key_secret(&id);
         self.keys.retain(|k| k.id != id);
         self.key_form = None;
+        // The sealed blob is rebuilt from the retained keys, so this also
+        // erases the deleted key's secret.
         self.persist_store();
+    }
+
+    /// Two-click export: the second click puts the key's secret on the
+    /// clipboard, ready to paste into another install's key form (or the iOS
+    /// app's key import). The clipboard is the export channel on purpose —
+    /// no secret ever lands in a file.
+    fn export_key(&mut self, id: String) {
+        self.confirm_delete_key = None;
+        if self.confirm_export_key.as_deref() != Some(id.as_str()) {
+            self.confirm_export_key = Some(id);
+            return;
+        }
+        self.confirm_export_key = None;
+        // The view never offers export for a secretless key, but the list can
+        // change between the two clicks.
+        let Some(key) = config::find_key(&self.keys, &id).filter(|k| !k.secret.is_empty()) else {
+            return;
+        };
+        let (name, secret) = (key.name.clone(), key.secret.clone());
+        // Announce "copied" only when the clipboard write actually took —
+        // a false success here would have the user paste nothing elsewhere.
+        self.notice = Some(if self.copy_text(secret) {
+            format!("Secret key of \"{name}\" copied — paste it into the key form of another install.")
+        } else {
+            "Clipboard unavailable — the secret key was not copied.".into()
+        });
     }
 
     fn save_forward_form(&mut self) {
@@ -1468,20 +1506,27 @@ impl App {
         }
     }
 
-    fn copy_text(&mut self, text: String) {
+    /// Copy `text` to the clipboard; false (with a log) when the clipboard is
+    /// unavailable or rejects the write.
+    fn copy_text(&mut self, text: String) -> bool {
         if self.clipboard.is_none() {
             match arboard::Clipboard::new() {
                 Ok(clipboard) => self.clipboard = Some(clipboard),
                 Err(e) => {
                     log::error!("Clipboard unavailable: {e}");
-                    return;
+                    return false;
                 }
             }
         }
-        if let Some(clipboard) = &mut self.clipboard
-            && let Err(e) = clipboard.set_text(text)
-        {
-            log::error!("Failed to copy to the clipboard: {e}");
+        let Some(clipboard) = &mut self.clipboard else {
+            return false;
+        };
+        match clipboard.set_text(text) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("Failed to copy to the clipboard: {e}");
+                false
+            }
         }
     }
 }
@@ -1519,8 +1564,8 @@ mod tests {
         vec![AuthKey {
             id: "k1".into(),
             name: "work laptop".into(),
-            public_key: "flextunnelpubv1:abc".into(),
-            secret: "flextunnelsecretv1:xyz".into(),
+            public_key: "flxtpubv1:abc".into(),
+            secret: "flxtsecretv1:xyz".into(),
         }]
     }
 

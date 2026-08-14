@@ -3,20 +3,20 @@
 //! Regular clients authenticate with an ed25519 keypair (age-style):
 //!
 //! ## Key format
-//! - Public key: `flextunnelpubv1:` + base64url (no padding) of the 32-byte
+//! - Public key: `flxtpubv1:` + base64url (no padding) of the 32-byte
 //!   ed25519 verifying key. Not a secret — always shown unmasked in UIs.
-//! - Secret key: `flextunnelsecretv1:` + base64url (no padding) of the 32-byte
+//! - Secret key: `flxtsecretv1:` + base64url (no padding) of the 32-byte
 //!   ed25519 secret key.
 //!
 //! A generated client key file looks like:
 //! ```text
 //! # created: 2026-08-13T01:02:03Z
-//! # public key: flextunnelpubv1:...
-//! flextunnelsecretv1:...
+//! # public key: flxtpubv1:...
+//! flxtsecretv1:...
 //! ```
 //!
 //! The server keeps its accepted client keys in an ssh-`authorized_keys`-style
-//! file: one `flextunnelpubv1:...` per line, an optional free-form comment
+//! file: one `flxtpubv1:...` per line, an optional free-form comment
 //! after the key, `#` lines and blank lines ignored.
 //!
 //! ## Handshake
@@ -42,10 +42,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Prefix of an encoded client public key.
-pub const PUBLIC_KEY_PREFIX: &str = "flextunnelpubv1:";
+pub const PUBLIC_KEY_PREFIX: &str = "flxtpubv1:";
 
 /// Prefix of an encoded client secret key.
-pub const SECRET_KEY_PREFIX: &str = "flextunnelsecretv1:";
+pub const SECRET_KEY_PREFIX: &str = "flxtsecretv1:";
 
 /// Domain-separation context prepended to the signed message, so a client-auth
 /// signature can never be confused with any other ed25519 signature made by
@@ -76,7 +76,7 @@ impl ClientKey {
         }
     }
 
-    /// Parse an encoded secret key (`flextunnelsecretv1:...`).
+    /// Parse an encoded secret key (`flxtsecretv1:...`).
     pub fn from_secret_str(s: &str) -> Result<Self> {
         let encoded = s
             .strip_prefix(SECRET_KEY_PREFIX)
@@ -93,7 +93,7 @@ impl ClientKey {
         })
     }
 
-    /// The encoded secret key (`flextunnelsecretv1:...`).
+    /// The encoded secret key (`flxtsecretv1:...`).
     pub fn secret_str(&self) -> String {
         format!(
             "{}{}",
@@ -102,7 +102,7 @@ impl ClientKey {
         )
     }
 
-    /// The encoded public key (`flextunnelpubv1:...`).
+    /// The encoded public key (`flxtpubv1:...`).
     pub fn public_str(&self) -> String {
         encode_public_key(&self.secret.public())
     }
@@ -139,12 +139,12 @@ fn auth_message(endpoint_id: &EndpointId) -> Vec<u8> {
     msg
 }
 
-/// Encode a public key as `flextunnelpubv1:...`.
+/// Encode a public key as `flxtpubv1:...`.
 pub fn encode_public_key(key: &PublicKey) -> String {
     format!("{}{}", PUBLIC_KEY_PREFIX, URL_SAFE_NO_PAD.encode(key.as_bytes()))
 }
 
-/// Parse an encoded public key (`flextunnelpubv1:...`).
+/// Parse an encoded public key (`flxtpubv1:...`).
 pub fn parse_public_key(s: &str) -> Result<PublicKey> {
     let encoded = s
         .strip_prefix(PUBLIC_KEY_PREFIX)
@@ -175,7 +175,7 @@ pub fn verify_endpoint_id_signature(
 }
 
 /// Load a client secret key from a generated key file: the first non-empty,
-/// non-`#` line must be the `flextunnelsecretv1:...` secret.
+/// non-`#` line must be the `flxtsecretv1:...` secret.
 pub fn load_client_key_from_file(path: &Path) -> Result<ClientKey> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read client key file: {}", path.display()))?;
@@ -190,15 +190,15 @@ pub fn load_client_key_from_file(path: &Path) -> Result<ClientKey> {
 /// Load the server's authorized client public keys.
 ///
 /// # File format (ssh `authorized_keys` style)
-/// - One `flextunnelpubv1:...` key per line; anything after the key (separated
+/// - One `flxtpubv1:...` key per line; anything after the key (separated
 ///   by whitespace) is a free-form comment
 /// - Lines starting with `#` and empty lines are ignored
 ///
 /// # Example file:
 /// ```text
 /// # Authorized client keys (generate with: flextunnel generate-auth-private-key)
-/// flextunnelpubv1:vGm7hYQz... alice laptop
-/// flextunnelpubv1:h9SwOUD1... build server
+/// flxtpubv1:vGm7hYQz... alice laptop
+/// flxtpubv1:h9SwOUD1... build server
 /// ```
 pub fn load_authorized_keys(path: &Path) -> Result<HashSet<PublicKey>> {
     let content = std::fs::read_to_string(path)
@@ -299,7 +299,7 @@ mod tests {
         let key = ClientKey::generate();
         assert!(ClientKey::from_secret_str(&key.public_str()).is_err());
         // Bad base64.
-        assert!(ClientKey::from_secret_str("flextunnelsecretv1:!!!").is_err());
+        assert!(ClientKey::from_secret_str("flxtsecretv1:!!!").is_err());
         // Wrong length.
         let short = format!("{}{}", SECRET_KEY_PREFIX, URL_SAFE_NO_PAD.encode([0u8; 16]));
         assert!(ClientKey::from_secret_str(&short).is_err());
@@ -307,8 +307,8 @@ mod tests {
 
     #[test]
     fn public_key_rejects_bad_inputs() {
-        assert!(parse_public_key("flextunnelsecretv1:abc").is_err());
-        assert!(parse_public_key("flextunnelpubv1:!!!").is_err());
+        assert!(parse_public_key("flxtsecretv1:abc").is_err());
+        assert!(parse_public_key("flxtpubv1:!!!").is_err());
         let short = format!("{}{}", PUBLIC_KEY_PREFIX, URL_SAFE_NO_PAD.encode([0u8; 8]));
         assert!(parse_public_key(&short).is_err());
     }
@@ -398,7 +398,7 @@ mod tests {
     fn authorized_keys_invalid_key_is_rejected() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# header").unwrap();
-        writeln!(file, "flextunnelpubv1:short").unwrap();
+        writeln!(file, "flxtpubv1:short").unwrap();
         let err = load_authorized_keys(file.path()).unwrap_err();
         assert!(err.to_string().contains(":2"), "{err}");
 

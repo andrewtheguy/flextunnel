@@ -174,7 +174,7 @@ pub fn generate_auth_private_key(output: PathBuf, force: bool, json: bool) -> Re
     write_secret_to_output(&output, &contents, &public_info, force, "Auth private key")
 }
 
-/// Show the auth public key (`flextunnelpubv1:...`) for a client auth secret
+/// Show the auth public key (`flxtpubv1:...`) for a client auth secret
 /// resolved from an inline `auth_key` or an `auth_key_file`, exactly one of
 /// which must be provided. With `json`, prints a single JSON object instead
 /// (for QA automation).

@@ -1085,6 +1085,12 @@ fn keys_pane(app: &App) -> Element<'_, Message> {
         );
     }
     for key in &app.keys {
+        // The edited key is represented by the open form above, not its card.
+        if let Some(form) = &app.key_form
+            && form.editing_id() == Some(key.id.as_str())
+        {
+            continue;
+        }
         col = col.push(key_card(app, key));
     }
     col = col.push(
@@ -1105,6 +1111,7 @@ fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
         .map(|p| p.name.as_str())
         .collect();
     let confirming = app.confirm_delete_key.as_deref() == Some(key.id.as_str());
+    let exporting = app.confirm_export_key.as_deref() == Some(key.id.as_str());
 
     let header = row![
         text(key.name.as_str()).size(14).font(semibold()),
@@ -1113,6 +1120,16 @@ fn key_card<'a>(app: &'a App, key: &'a AuthKey) -> Element<'a, Message> {
             .padding([3, 10])
             .style(style::ghost)
             .on_press(Message::EditKey(key.id.clone())),
+        // Disabled while the secret is missing from the keychain — the amber
+        // line below already says why.
+        button(
+            text(if exporting { "Click again to copy secret" } else { "Export…" }).size(12)
+        )
+        .padding([3, 10])
+        .style(style::ghost)
+        .on_press_maybe(
+            (!key.secret.is_empty()).then(|| Message::ExportKey(key.id.clone())),
+        ),
         button(
             text(if confirming { "Click again to delete" } else { "Delete…" }).size(12)
         )
@@ -1159,7 +1176,7 @@ fn key_form_view<'a>(app: &'a App, form: &'a KeyForm) -> Element<'a, Message> {
     // and is always shown unmasked (it's what goes on the server's
     // authorized-keys file).
     let secret = row![
-        input("flextunnelsecretv1:…", &form.secret, Message::KeySecretChanged)
+        input("flxtsecretv1:…", &form.secret, Message::KeySecretChanged)
             .secure(true)
             .width(240),
         button(text("Generate").size(12))

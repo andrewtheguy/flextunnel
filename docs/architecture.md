@@ -39,7 +39,7 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | client keypair auth (ed25519): age-style key generation/parsing (`flextunnelpubv1:`/`flextunnelsecretv1:`), ssh-style authorized-keys file loading, endpoint-id-bound sign/verify |
+| `auth.rs` | client keypair auth (ed25519): age-style key generation/parsing (`flxtpubv1:`/`flxtsecretv1:`), ssh-style authorized-keys file loading, endpoint-id-bound sign/verify |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
 | `secret.rs` | key-management commands: iroh identity keys (`generate-iroh-key`/`show-iroh-id`) and client auth keypairs (`generate-auth-private-key`/`show-auth-public-key`) |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
@@ -256,7 +256,7 @@ self-blocked server's restart. These are guard rails for operators, not adversar
 defenses.
 
 - **Credentials:** client keypairs are ed25519 — the public key travels as
-  `flextunnelpubv1:` + base64url, the secret as `flextunnelsecretv1:` +
+  `flxtpubv1:` + base64url, the secret as `flxtsecretv1:` +
   base64url — verified in the handshake via a signature bound to the
   connection's endpoint id. Bridges and quick-mode clients
   carry no keypair: their credential is their TLS-authenticated endpoint id,
