@@ -53,7 +53,7 @@ pub const LIVENESS_WINDOW: Duration =
 /// A plain protocol-negotiation label, sent unencrypted in the TLS/QUIC
 /// handshake — it is not a secret and provides no access control. Both peers
 /// must offer the same ALPN or negotiation fails; access control is enforced by
-/// the auth-token handshake, not by this value.
+/// the keypair auth handshake, not by this value.
 pub const ALPN: &[u8] = b"flextunnel/1";
 
 /// QUIC ALPN protocol identifier for server-to-server **bridge** connections.
@@ -72,9 +72,9 @@ pub const BRIDGE_ALPN: &[u8] = b"flextunnel-bridge/1";
 /// Same trust model as [`BRIDGE_ALPN`]: the ALPN only carries the peer's role;
 /// the credential is the server's endpoint-id allowlist (the single client id
 /// entered on the quick server), enforced natively at the TLS handshake by
-/// [`endpoint::AllowlistHook`]. No auth token is involved — the
+/// [`endpoint::AllowlistHook`]. No auth keypair is involved — the
 /// TLS-authenticated endpoint id needs no further proof. After the handshake a
-/// quick client is served exactly like a token client.
+/// quick client is served exactly like a keypair client.
 pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 
 /// Build a QUIC transport config with keep-alive, idle timeout, and a larger

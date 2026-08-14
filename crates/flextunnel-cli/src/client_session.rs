@@ -38,7 +38,10 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     // A profile's server id never changes, so its prefix is the client's
     // on-disk identity: lock, control socket, and forwards file.
     let key = instance::instance_key(&server_node_id)?;
-    let token = resolve_token(&r)?;
+    let client_key = resolve_client_key(&r)?;
+    // The public half is what the server operator needs on their
+    // authorized-keys file — never a secret, so log it plainly.
+    log::info!("Client auth public key: {}", client_key.public_str());
 
     // Held for the process lifetime; also what makes removing a stale control
     // socket safe (see ipc.rs).
@@ -64,7 +67,7 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     let runtime = build_session(
         r,
         server_node_id,
-        SessionAuth::Token(token),
+        SessionAuth::Key(client_key),
         key.clone(),
         forwards,
         true,
@@ -82,24 +85,24 @@ pub async fn run(r: config::ResolvedClient) -> Result<()> {
     .await
 }
 
-/// Resolve the client auth token: exactly one of the inline token or the token
-/// file. Normal sessions only — quick mode has no token (its credential is the
-/// client's endpoint id, allowlisted on the quick server).
-fn resolve_token(r: &config::ResolvedClient) -> Result<String> {
-    if r.auth_token.is_some() && r.auth_token_file.is_some() {
-        anyhow::bail!("Provide only one of auth_token or auth_token_file, not both");
+/// Resolve the client auth keypair: exactly one of the inline secret or the
+/// key file. Normal sessions only — quick mode has no keypair (its credential
+/// is the client's endpoint id, allowlisted on the quick server).
+fn resolve_client_key(r: &config::ResolvedClient) -> Result<auth::ClientKey> {
+    if r.auth_key.is_some() && r.auth_key_file.is_some() {
+        anyhow::bail!("Provide only one of auth_key or auth_key_file, not both");
     }
-    if let Some(token) = &r.auth_token {
-        auth::validate_client_token(token).context("Invalid authentication token")?;
-        Ok(token.clone())
-    } else if let Some(path) = &r.auth_token_file {
-        auth::load_auth_token_from_file(path, auth::CLIENT_TOKEN_PREFIX)
-            .context("Failed to load authentication token from file")
+    if let Some(secret) = &r.auth_key {
+        auth::ClientKey::from_secret_str(secret.trim()).context("Invalid client secret key")
+    } else if let Some(path) = &r.auth_key_file {
+        auth::load_client_key_from_file(path).context("Failed to load the client key file")
     } else {
         anyhow::bail!(
-            "The client requires an authentication token.\n\
-             Use --auth-token <TOKEN>, --auth-token-file <FILE>, or set \
-             auth_token/auth_token_file in the config."
+            "The client requires an authentication keypair.\n\
+             Generate one with: flextunnel generate-client-key -o <FILE>\n\
+             Then pass --auth-key-file <FILE> (or --auth-key <SECRET>), or set \
+             auth_key_file/auth_key in the config, and put the printed public key \
+             on the server's authorized_keys_file."
         )
     }
 }
@@ -114,7 +117,7 @@ fn resolve_token(r: &config::ResolvedClient) -> Result<String> {
 ///
 /// `client_secret` is the session's pre-generated identity, whose endpoint id
 /// the caller already printed for the user to allowlist on the quick server —
-/// that id (not a token) is the quick client's credential, so the endpoint must
+/// that id (not a keypair) is the quick client's credential, so the endpoint must
 /// bind with exactly this secret.
 pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> Result<()> {
     let server_node_id = r.server_node_id.clone().context(
@@ -164,14 +167,14 @@ struct SessionRuntime {
 }
 
 /// How a session authenticates, coupling the credential to the endpoint
-/// identity it requires so the two cannot be mixed and matched: a token
+/// identity it requires so the two cannot be mixed and matched: a keypair
 /// session dials from an anonymous ephemeral endpoint, while a quick session
 /// must bind its endpoint to the fixed secret whose id the quick server
 /// allowlisted — the id *is* the credential.
 enum SessionAuth {
-    /// Normal session: bearer token over the client ALPN.
-    Token(String),
-    /// Quick session: no token; the endpoint binds to this secret and its
+    /// Normal session: signed keypair credential over the client ALPN.
+    Key(auth::ClientKey),
+    /// Quick session: no keypair; the endpoint binds to this secret and its
     /// endpoint id is checked against the quick server's allowlist.
     Quick(SecretKey),
 }
@@ -194,9 +197,9 @@ async fn build_session(
     let relay_config = RelayConfig::from_urls_with_token(&r.relay_urls, r.relay_auth_token.clone())
         .context("Invalid relay configuration")?;
     let (endpoint, auth) = match auth {
-        SessionAuth::Token(token) => (
+        SessionAuth::Key(client_key) => (
             create_client_endpoint(&relay_config).await,
-            ClientAuth::Token(token),
+            ClientAuth::Key(Box::new(client_key)),
         ),
         SessionAuth::Quick(secret) => (
             create_quick_client_endpoint(&relay_config, secret).await,

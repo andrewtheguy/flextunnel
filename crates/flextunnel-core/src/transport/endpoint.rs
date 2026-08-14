@@ -23,7 +23,7 @@ use std::time::Duration;
 /// QUIC application close code sent when a connection is rejected by an
 /// endpoint-id allowlist — a non-allowlisted bridge on [`BRIDGE_ALPN`] or a
 /// non-allowlisted quick client on [`QUICK_ALPN`] (distinct from the in-band
-/// auth-failure code `1` and the duplicate-id code `2` used on the token
+/// auth-failure code `1` and the duplicate-id code `2` used on the keypair
 /// client path).
 pub const CLOSE_NOT_ALLOWLISTED: u32 = 3;
 
@@ -48,7 +48,7 @@ pub struct EndpointAllowlists {
 ///
 /// Only the accepting side is gated: outbound dials (this server bridging
 /// *out*) pass through, as do inbound [`ALPN`] client connections (gated by
-/// their token handshake).
+/// their keypair handshake).
 #[derive(Debug)]
 pub struct AllowlistHook {
     allowlists: EndpointAllowlists,

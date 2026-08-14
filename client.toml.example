@@ -32,9 +32,13 @@ server_node_id = "<server endpoint id>"
 # `flextunnel client control`).
 # http_port = 8081
 
-# Auth token for this client. Provide exactly one of `auth_token` or `auth_token_file`.
-auth_token = "ftcXXXXXXX"
-# auth_token_file = "~/.config/flextunnel/token.txt"
+# This client's authentication keypair (generate with
+# `flextunnel generate-client-key -o ~/.config/flextunnel/client.key`; put the
+# printed PUBLIC key on the server's authorized_keys_file). Provide exactly one
+# of `auth_key_file` (the generated key file) or `auth_key` (the inline
+# `flextunnelsecretv1:...` secret).
+auth_key_file = "~/.config/flextunnel/client.key"
+# auth_key = "flextunnelsecretv1:XXXX"
 
 # Optional iroh tuning and reconnect behavior.
 # Custom relay(s) for failover. Configuring custom relays disables n0 internet

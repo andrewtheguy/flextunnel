@@ -127,8 +127,9 @@ pub struct ProxyServer {
     /// server instances that share this identity — how a duplicate server is
     /// detected client-side.
     server_instance_nonce: u128,
-    /// Accepted **client** auth tokens (`ftc` prefix).
-    valid_tokens: HashSet<String>,
+    /// Authorized **client** public keys (`flextunnelpubv1:`), loaded from the
+    /// server's authorized-keys file at startup.
+    authorized_keys: HashSet<iroh::PublicKey>,
     /// Endpoint ids of servers allowed to bridge into this server, mirrored
     /// here for the status page only. Enforcement is native: the endpoint's
     /// `AllowlistHook` rejects a non-allowlisted bridge at the TLS
@@ -173,7 +174,7 @@ pub struct ProxyServer {
 /// same-typed collections can't be swapped positionally.
 pub struct ProxyServerParams {
     pub own_id: EndpointId,
-    pub valid_tokens: HashSet<String>,
+    pub authorized_keys: HashSet<iroh::PublicKey>,
     /// For the status page's inbound-bridge list only; enforcement lives in
     /// the endpoint's `AllowlistHook` (see `create_server_endpoint`).
     pub allowed_bridge_servers: HashSet<EndpointId>,
@@ -198,7 +199,7 @@ impl ProxyServer {
         Arc::new(Self {
             own_id: params.own_id,
             server_instance_nonce: rand::rng().random(),
-            valid_tokens: params.valid_tokens,
+            authorized_keys: params.authorized_keys,
             allowed_bridge_servers: params.allowed_bridge_servers,
             bridges,
             host_aliases: params.host_aliases,
@@ -444,6 +445,52 @@ impl ProxyServer {
         Ok(())
     }
 
+    /// Verify a regular client's public-key credential: the claimed endpoint
+    /// id must equal the connection's TLS-authenticated `remote_id`, the
+    /// signature must verify under the presented public key, and the key must
+    /// be on the authorized-keys set. Failures are logged (with the reason)
+    /// but the wire rejection stays generic.
+    fn verify_client_auth(
+        &self,
+        auth: &signaling::ClientAuthPayload,
+        remote_id: &EndpointId,
+    ) -> bool {
+        let claimed = match auth.endpoint_id.parse::<EndpointId>() {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                log::warn!("Client {remote_id} sent an unparseable claimed endpoint id: {e}");
+                return false;
+            }
+        };
+        if claimed != *remote_id {
+            log::warn!(
+                "Client {remote_id} claimed a different endpoint id ({claimed}) in its \
+                 auth payload"
+            );
+            return false;
+        }
+        let public = match crate::auth::parse_public_key(&auth.public_key) {
+            Ok(public) => public,
+            Err(e) => {
+                log::warn!("Client {remote_id} sent an invalid public key: {e}");
+                return false;
+            }
+        };
+        if !self.authorized_keys.contains(&public) {
+            log::warn!(
+                "Client {remote_id} presented a key that is not on the authorized-keys \
+                 file: {}",
+                auth.public_key
+            );
+            return false;
+        }
+        if !crate::auth::verify_endpoint_id_signature(&public, remote_id, &auth.signature) {
+            log::warn!("Client {remote_id} sent an invalid auth signature");
+            return false;
+        }
+        true
+    }
+
     /// Authenticate a connection, then serve its multiplexed SOCKS5 streams and
     /// its heartbeat control stream.
     async fn handle_connection(self: Arc<Self>, incoming: Incoming) -> ProxyResult<()> {
@@ -491,21 +538,21 @@ impl ProxyServer {
         // quick-mode client (QUICK_ALPN) is already authenticated: the endpoint's
         // `AllowlistHook` checked its TLS-authenticated id against the quick
         // allowlist at the handshake, so a non-allowlisted one never gets here.
-        // For a token client the ALPN is not a credential, so without the token
-        // gate an unauthenticated peer could trip self-block + shutdown.
+        // For a keypair client the ALPN is not a credential, so without the
+        // signature gate an unauthenticated peer could trip self-block + shutdown.
         let auth_ok = connection.alpn() == crate::transport::QUICK_ALPN
             || hello
-                .auth_token
+                .auth
                 .as_ref()
-                .is_some_and(|token| self.valid_tokens.contains(token));
+                .is_some_and(|auth| self.verify_client_auth(auth, &remote_id));
         let blocked = self.is_client_blocked(&remote_id);
         if !auth_ok || blocked {
             let reason = if blocked {
                 log::warn!("Rejecting {remote_id}: node id is blocklisted (duplicate id)");
                 "node id is blocklisted (duplicate id previously detected)"
             } else {
-                log::warn!("Rejecting {remote_id}: invalid auth token");
-                "Invalid authentication token"
+                log::warn!("Rejecting {remote_id}: public-key authentication failed");
+                "public-key authentication failed"
             };
             let resp = HelloResponse::rejected(self.server_instance_nonce, reason);
             signaling::write_message(&mut send, &signaling::encode_hello_response(&resp)?).await?;

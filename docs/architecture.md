@@ -18,7 +18,7 @@ local app ──SOCKS5/HTTP──► flextunnel client                    flextu
                           │   one iroh QUIC Connection               │
                           │   (fixed ALPN + TLS 1.3)                 │
                           │                                          │
-                          ├── control bi-stream ───────────────────►│  validate auth token
+                          ├── control bi-stream ───────────────────►│  verify client keypair
                           │      Hello / HelloResponse               │
                           │                                          │
    per routed request ────┼── data bi-stream #1 ───────────────────►│  resolve DNS, TcpStream::connect
@@ -39,7 +39,7 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | client auth-token generation/validation/file-loading (CRC16-checksummed Base64URL tokens, `ftc` prefix) |
+| `auth.rs` | client keypair auth (ed25519): age-style key generation/parsing (`flextunnelpubv1:`/`flextunnelsecretv1:`), ssh-style authorized-keys file loading, endpoint-id-bound sign/verify |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
 | `secret.rs` | server secret-key (iroh identity) generation and loading; prints the `EndpointId` |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
@@ -76,7 +76,7 @@ bridging servers connect with `flextunnel-bridge/1` (`transport::BRIDGE_ALPN`);
 quick-mode clients connect with `flextunnel-quick/1` (`transport::QUICK_ALPN`).
 The ALPN is a protocol-negotiation label sent **unencrypted** in the TLS/QUIC
 handshake, not a secret: it carries the peer's *role*, never a credential.
-Token-client access control is the auth handshake below; bridge and quick-client
+Keypair-client access control is the auth handshake below; bridge and quick-client
 access control is an endpoint-id allowlist (`allowed_bridge_servers`, or the
 single client id entered on a quick server), enforced **natively at the TLS
 handshake** by an iroh `EndpointHooks::after_handshake` hook
@@ -87,20 +87,26 @@ handshake authenticates it. An empty set disables its ALPN entirely (a normal
 server rejects every quick dial; a no-bridging server rejects every bridge).
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 11`. On the first bi-stream a
+The protocol version is `PROTOCOL_VERSION = 12`. On the first bi-stream a
 client sends
-`Hello { version, auth_token?, client_instance_nonce, duplicate_server_observed }`
+`Hello { version, auth?, client_instance_nonce, duplicate_server_observed }`
+where `auth` is `ClientAuthPayload { public_key, endpoint_id, signature }`
 (a bridge sends the minimal `BridgeHello { version }` — its authentication
 already happened at the TLS handshake) and the server replies
 `HelloResponse { version, accepted, reject_reason, server_instance_nonce, routed_*, host_aliases, dns_forwards, bridges }`,
 both length-prefixed JSON via `signaling::write_message` / `read_message` (4-byte
 big-endian length + payload, capped at `MAX_HANDSHAKE_SIZE` = 64 KiB). On the
-client ALPN `auth_token` is required and checked against the accepted `ftc`
-set; on the quick ALPN it is absent — the allowlist hook already authenticated
-the endpoint id, and everything after the handshake (routed set, duplicate
-detection, heartbeats, data streams) is identical for both. On rejection the
-server closes the connection gracefully (with a short drain) carrying the
-reason. `Hello`'s `Debug` impl redacts `auth_token`.
+client ALPN `auth` is required: the server checks that the claimed
+`endpoint_id` equals the connection's TLS-authenticated `remote_id()`, that the
+ed25519 `signature` (over a domain-separated hash of that id) verifies under
+`public_key`, and that `public_key` is on the server's authorized-keys file —
+binding the credential to this connection so a captured `Hello` cannot be
+replayed from another endpoint. On the quick ALPN `auth` is absent — the
+allowlist hook already authenticated the endpoint id, and everything after the
+handshake (routed set, duplicate detection, heartbeats, data streams) is
+identical for both. On rejection the server closes the connection gracefully
+(with a short drain) carrying the reason. Nothing in the payload is secret, so
+`Hello` derives `Debug` plainly.
 
 The `*_instance_nonce` fields are random per-process ids (distinct from the iroh
 node id) that drive duplicate-id detection (see below); `duplicate_server_observed`
@@ -205,7 +211,7 @@ atomically (temp + rename) and loaded at startup.
 - **Server:** one tokio task per accepted iroh connection (`handle_connection`,
   capped at `MAX_CONCURRENT_CONNECTIONS`), and within it one task per accepted
   data bi-stream (`handle_socks_stream`). No shared mutable state on the data
-  path; the accepted-token set is read-only.
+  path; the authorized-keys set is read-only (loaded at startup).
 - **Client:** one task per accepted local TCP connection (`handle_local_conn`),
   from the SOCKS5 listener and optional HTTP listener. All tunneled requests
   share the single `Connection` clone; off-list requests direct-connect locally.
@@ -239,27 +245,29 @@ release profile's `panic = "abort"`).
 reach resources on the **server's** side of the network — names and addresses that
 only resolve or route from where the server sits. Both ends of the deployment are
 operated by the same trusted party: whoever runs the server also decides which
-clients get tokens. flextunnel is *not* a multi-tenant service and does not defend
-the server against the clients it admits — a client with a valid token is, by
+clients' keys get authorized. flextunnel is *not* a multi-tenant service and does not defend
+the server against the clients it admits — a client with an authorized key is, by
 design, allowed to reach whatever the server's network can reach. The threats it
 does address are **on-path attackers** (defeated by QUIC/TLS 1.3 encryption and
-per-client tokens) and **accidental misconfiguration** — the duplicate-id
+per-client keypairs) and **accidental misconfiguration** — the duplicate-id
 detection (see "Duplicate-id detection" above) catches, e.g., two clients or two
 servers started with the same identity, blocking the conflicted id and refusing a
 self-blocked server's restart. These are guard rails for operators, not adversary
 defenses.
 
-- **Credentials:** client auth tokens (`ftc`) are CRC16-checksummed Base64URL
-  bearer credentials checked in the handshake. Bridges and quick-mode clients
-  carry no token: their credential is their TLS-authenticated endpoint id,
+- **Credentials:** client keypairs are ed25519 — the public key travels as
+  `flextunnelpubv1:` + base64url, the secret as `flextunnelsecretv1:` +
+  base64url — verified in the handshake via a signature bound to the
+  connection's endpoint id. Bridges and quick-mode clients
+  carry no keypair: their credential is their TLS-authenticated endpoint id,
   checked natively against the matching allowlist — `allowed_bridge_servers`,
   or the single client id entered on a quick server (the `authorized_keys`
   model). The QUIC ALPNs (`flextunnel/1`, `flextunnel-bridge/1`,
   `flextunnel-quick/1`) are fixed protocol/role identifiers, not credentials.
   All payload is encrypted by QUIC/TLS 1.3.
-- **The server is the exit point.** Anyone with valid tokens can reach whatever
-  the server's network can reach (including its `localhost`). Treat token
-  distribution accordingly; scope server network access if needed.
+- **The server is the exit point.** Anyone with an authorized key can reach whatever
+  the server's network can reach (including its `localhost`). Authorize keys
+  accordingly; scope server network access if needed.
 - **The local SOCKS5/HTTP proxy listeners are unauthenticated** and bind to
   loopback by default — access control lives at the QUIC layer, not in the local
   proxy front-ends. Binding them off-loopback exposes an open proxy on the LAN;
@@ -288,14 +296,14 @@ defenses.
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
 | `PROTOCOL_VERSION` | 11 | `proxy/signaling.rs` |
-| auth token length | 49 chars | `auth.rs` |
+| client key encoding | ed25519, base64url (32-byte keys, 64-byte sigs) | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 | `BRIDGE_ALPN` | `flextunnel-bridge/1` | `transport/mod.rs` |
 | `QUICK_ALPN` | `flextunnel-quick/1` | `transport/mod.rs` |
 
 ## Relation to ezvpn
 
-flextunnel reuses ezvpn's iroh transport, auth-token scheme, and
+flextunnel reuses ezvpn's iroh transport and
 secret-key identity, but replaces the IP-over-QUIC-datagrams + TUN data path
 (which needs root) with SOCKS5/HTTP proxy front-ends over reliable QUIC streams
 (which don't). See the project `README.md` for the user-facing comparison.

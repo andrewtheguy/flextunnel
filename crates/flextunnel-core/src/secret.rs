@@ -90,18 +90,74 @@ fn write_secret_to_output(
     Ok(())
 }
 
-/// Generate a new secret key file (base64 encoded) and output the EndpointId to stdout
-pub fn generate_secret(output: PathBuf, force: bool) -> Result<()> {
+/// Generate a new secret key file (base64 encoded) and output the EndpointId to
+/// stdout. With `json`, everything printed to stdout is a single JSON object
+/// (for QA automation): the endpoint id plus either the written file path or,
+/// for `-`, the secret itself.
+pub fn generate_secret(output: PathBuf, force: bool, json: bool) -> Result<()> {
     let secret = SecretKey::generate();
     let secret_base64 = BASE64.encode(secret.to_bytes());
     let endpoint_id = secret_to_endpoint_id(&secret);
-    write_secret_to_output(
-        &output,
-        &secret_base64,
-        &format!("EndpointId: {}", endpoint_id),
-        force,
-        "Secret key",
-    )
+    if json && output.as_os_str() == std::ffi::OsStr::new("-") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "endpoint_id": endpoint_id.to_string(),
+                "secret": secret_base64,
+            })
+        );
+        return Ok(());
+    }
+    let public_info = if json {
+        serde_json::json!({
+            "endpoint_id": endpoint_id.to_string(),
+            "secret_file": output.display().to_string(),
+        })
+        .to_string()
+    } else {
+        format!("EndpointId: {}", endpoint_id)
+    };
+    write_secret_to_output(&output, &secret_base64, &public_info, force, "Secret key")
+}
+
+/// Generate a new client authentication keypair (see [`crate::auth`]) as an
+/// age-style key file, printing the public key to share with the server
+/// operator. With `json`, everything printed to stdout is a single JSON object
+/// (for QA automation): created timestamp and public key, plus either the
+/// written file path or, for `-`, the secret key itself.
+pub fn generate_client_key(output: PathBuf, force: bool, json: bool) -> Result<()> {
+    let key = crate::auth::ClientKey::generate();
+    let created = crate::auth::utc_timestamp();
+    let contents = key.to_key_file(&created);
+    if output.as_os_str() == std::ffi::OsStr::new("-") {
+        // Print the whole key file (comments + secret) to stdout like
+        // age-keygen, or one JSON object carrying the same fields.
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "created": created,
+                    "public_key": key.public_str(),
+                    "secret_key": key.secret_str(),
+                })
+            );
+        } else {
+            print!("{contents}");
+            eprintln!("Public key: {}", key.public_str());
+        }
+        return Ok(());
+    }
+    let public_info = if json {
+        serde_json::json!({
+            "created": created,
+            "public_key": key.public_str(),
+            "secret_file": output.display().to_string(),
+        })
+        .to_string()
+    } else {
+        format!("Public key: {}", key.public_str())
+    };
+    write_secret_to_output(&output, &contents, &public_info, force, "Client key")
 }
 
 /// Generate a fresh ephemeral server identity, returning its base64 encoding
@@ -131,9 +187,17 @@ pub fn resolve_secret_key(secret: Option<&str>, secret_file: Option<&Path>) -> R
 }
 
 /// Show the EndpointId for a server secret resolved from `secret`/`secret_file`.
-pub fn show_id(secret: Option<&str>, secret_file: Option<&Path>) -> Result<()> {
+/// With `json`, prints a single JSON object instead (for QA automation).
+pub fn show_id(secret: Option<&str>, secret_file: Option<&Path>, json: bool) -> Result<()> {
     let secret = resolve_secret_key(secret, secret_file)?;
     let endpoint_id = secret_to_endpoint_id(&secret);
-    println!("{}", endpoint_id);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "endpoint_id": endpoint_id.to_string() })
+        );
+    } else {
+        println!("{}", endpoint_id);
+    }
     Ok(())
 }

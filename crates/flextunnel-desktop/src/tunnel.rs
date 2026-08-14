@@ -414,6 +414,21 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
             return;
         }
     };
+    // The form validated the key on save, but a lost/corrupted keychain entry
+    // can still surface here — fail the session cleanly rather than panic.
+    let client_key = match flextunnel_core::auth::ClientKey::from_secret_str(
+        profile.auth_key.trim(),
+    ) {
+        Ok(key) => key,
+        Err(e) => {
+            log::error!("Invalid client auth key: {e:#}");
+            slot.update(|s| {
+                s.phase = Phase::Failed;
+                s.last_error = Some(format!("Invalid client auth key: {e:#}"));
+            });
+            return;
+        }
+    };
     let mut create = tokio::spawn({
         let relay_config = relay_config.clone();
         async move { create_client_endpoint(&relay_config).await }
@@ -479,7 +494,7 @@ async fn run_session(profile: Profile, mut rx: mpsc::Receiver<SessionCmd>, slot:
 
     let client = ProxyClient::new(ClientConfig {
         server_node_id: profile.server_node_id.clone(),
-        auth: ClientAuth::Token(profile.auth_token.clone()),
+        auth: ClientAuth::Key(Box::new(client_key)),
         socks_listen: socks_addr,
         http_listen: http_addr,
         relay_urls: profile.relay_urls.clone(),

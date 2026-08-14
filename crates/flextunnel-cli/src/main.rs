@@ -5,8 +5,8 @@
 //! port forwards (managed live from `flextunnel client control`); routed
 //! targets are tunneled as reliable QUIC bi-streams to the server, which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
-//! protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
-//! encryption. Neither side needs admin/root (no TUN device).
+//! protocol selection, client keypairs (ed25519) for access control, and TLS
+//! 1.3/QUIC for encryption. Neither side needs admin/root (no TUN device).
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -67,6 +67,9 @@ enum Command {
         /// Overwrite existing file if it exists.
         #[arg(long)]
         force: bool,
+        /// Print machine-readable JSON to stdout (for automation).
+        #[arg(long)]
+        json: bool,
     },
     /// Show the server's public EndpointId derived from a private key.
     #[command(arg_required_else_help = true)]
@@ -80,12 +83,23 @@ enum Command {
         /// Path to the private key file (overrides secret_file/secret in the config).
         #[arg(short, long)]
         secret_file: Option<PathBuf>,
+        /// Print machine-readable JSON to stdout (for automation).
+        #[arg(long)]
+        json: bool,
     },
-    /// Generate client authentication token(s).
-    GenerateAuthToken {
-        /// Number of tokens to generate.
-        #[arg(short, long, default_value = "1")]
-        count: usize,
+    /// Generate a client authentication keypair (age-style key file). Share the
+    /// printed PUBLIC key with the server operator (it goes on the server's
+    /// authorized_keys_file); the secret stays on the client.
+    GenerateClientKey {
+        /// Path where to save the key file ("-" for stdout).
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Overwrite existing file if it exists.
+        #[arg(long)]
+        force: bool,
+        /// Print machine-readable JSON to stdout (for automation).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -106,12 +120,10 @@ enum ServerAction {
         /// Secret key file for the server's persistent identity.
         #[arg(long)]
         secret_file: Option<PathBuf>,
-        /// Accepted client auth token (repeatable).
-        #[arg(long = "auth-token")]
-        auth_tokens: Vec<String>,
-        /// File of accepted client auth tokens (one per line).
+        /// File of authorized client public keys (ssh authorized_keys style:
+        /// one `flextunnelpubv1:...` per line, optional trailing comment).
         #[arg(long)]
-        auth_tokens_file: Option<PathBuf>,
+        authorized_keys_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -120,15 +132,15 @@ enum ServerAction {
         relay_auth_token: Option<String>,
         /// Ephemeral one-off server. Run `client start --quick` FIRST — it
         /// prints the client's EndpointId; enter that id at this server's
-        /// prompt to allowlist it as the only allowed client (no auth token).
-        /// Generates an in-memory identity, full-tunnels all traffic, prints
-        /// this server's EndpointId to enter back at the client's prompt, and
-        /// exits if the client doesn't connect within 5 minutes. Needs an
-        /// interactive terminal. Nothing is persisted.
+        /// prompt to allowlist it as the only allowed client (no auth
+        /// keypair). Generates an in-memory identity, full-tunnels all
+        /// traffic, prints this server's EndpointId to enter back at the
+        /// client's prompt, and exits if the client doesn't connect within 5
+        /// minutes. Needs an interactive terminal. Nothing is persisted.
         #[arg(
             long,
-            conflicts_with_all = ["config", "default_config", "secret_file", "auth_tokens",
-                "auth_tokens_file"]
+            conflicts_with_all = ["config", "default_config", "secret_file",
+                "authorized_keys_file"]
         )]
         quick: bool,
     },
@@ -159,12 +171,14 @@ enum ClientAction {
         /// EndpointId of the server to connect to.
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
-        /// Authentication token to send to the server.
+        /// Inline client secret key (`flextunnelsecretv1:...`) used to
+        /// authenticate to the server.
         #[arg(long)]
-        auth_token: Option<String>,
-        /// File containing the authentication token.
+        auth_key: Option<String>,
+        /// File containing the client secret key (from `flextunnel
+        /// generate-client-key`).
         #[arg(long)]
-        auth_token_file: Option<PathBuf>,
+        auth_key_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
@@ -181,10 +195,10 @@ enum ClientAction {
         #[arg(long)]
         max_reconnect_attempts: Option<NonZeroU32>,
         /// Ignore any saved config, print this client's EndpointId (enter it on
-        /// the quick server, which allowlists it — no auth token), and prompt
-        /// for the server EndpointId (pairs with `server start --quick`).
-        /// Nothing is persisted.
-        #[arg(long, conflicts_with_all = ["config", "auth_token", "auth_token_file"])]
+        /// the quick server, which allowlists it — no auth keypair), and
+        /// prompt for the server EndpointId (pairs with `server start
+        /// --quick`). Nothing is persisted.
+        #[arg(long, conflicts_with_all = ["config", "auth_key", "auth_key_file"])]
         quick: bool,
     },
     /// Attach the control panel to the running client for a profile: live
@@ -226,8 +240,8 @@ mod cli_tests {
             "start",
             "--server-node-id",
             "server-id",
-            "--auth-token",
-            "token",
+            "--auth-key",
+            "flextunnelsecretv1:XXXX",
         ])
         .unwrap_or_else(|error| panic!("client start should parse: {error}"));
 
@@ -319,16 +333,16 @@ mod cli_tests {
     #[test]
     fn quick_conflicts_with_config_and_secret() {
         // `--quick` mints everything ephemerally, so it is mutually exclusive
-        // with the config/secret/token flags on both sides.
+        // with the config/secret/key flags on both sides.
         let cases = [
             vec!["flextunnel", "server", "start", "--quick", "-c", "server.toml"],
             vec!["flextunnel", "server", "start", "--quick", "--secret-file", "k.key"],
-            vec!["flextunnel", "server", "start", "--quick", "--auth-token", "ftcXXX"],
+            vec!["flextunnel", "server", "start", "--quick", "--authorized-keys-file", "ak.txt"],
             vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
-            // Quick mode has no token auth at all (the credential is the
-            // client's endpoint id), so token flags are rejected too.
-            vec!["flextunnel", "client", "start", "--quick", "--auth-token", "ftcXXX"],
-            vec!["flextunnel", "client", "start", "--quick", "--auth-token-file", "t.txt"],
+            // Quick mode has no keypair auth at all (the credential is the
+            // client's endpoint id), so key flags are rejected too.
+            vec!["flextunnel", "client", "start", "--quick", "--auth-key", "flextunnelsecretv1:X"],
+            vec!["flextunnel", "client", "start", "--quick", "--auth-key-file", "c.key"],
         ];
         for case in cases {
             let Err(error) = Args::try_parse_from(&case) else {
@@ -339,12 +353,11 @@ mod cli_tests {
     }
 
     #[test]
-    fn quick_server_config_is_full_tunnel_without_tokens() {
+    fn quick_server_config_is_full_tunnel_without_client_keys() {
         let (cli, endpoint_id) = quick_server_config(Vec::new(), None);
-        // No token auth in quick mode: the allowlisted client endpoint id is
+        // No keypair auth in quick mode: the allowlisted client endpoint id is
         // the sole credential.
-        assert_eq!(cli.auth_tokens, None);
-        assert_eq!(cli.auth_tokens_file, None);
+        assert_eq!(cli.authorized_keys_file, None);
         // Full tunnel: the catch-alls for domains and both IP families.
         assert_eq!(cli.routed_domains.as_deref(), Some(["*".to_string()].as_slice()));
         assert_eq!(
@@ -408,11 +421,14 @@ fn main() -> Result<()> {
                     server_node_id,
                 },
         } => tui::run(config, server_node_id),
-        Command::GenerateServerKey { output, force } => secret::generate_secret(output, force),
+        Command::GenerateServerKey { output, force, json } => {
+            secret::generate_secret(output, force, json)
+        }
         Command::ShowServerId {
             config,
             default_config,
             secret_file,
+            json,
         } => {
             // Resolve the secret the same way the server does: an explicit
             // --secret-file wins, otherwise fall back to secret_file/secret in
@@ -424,13 +440,10 @@ fn main() -> Result<()> {
             };
             let file = config::load_server_config(config.as_deref(), default_config)?;
             let r = config::resolve_server(cli, file)?;
-            secret::show_id(r.secret.as_deref(), r.secret_file.as_deref())
+            secret::show_id(r.secret.as_deref(), r.secret_file.as_deref(), json)
         }
-        Command::GenerateAuthToken { count } => {
-            for _ in 0..count {
-                println!("{}", auth::generate_client_token());
-            }
-            Ok(())
+        Command::GenerateClientKey { output, force, json } => {
+            secret::generate_client_key(output, force, json)
         }
         command => app::build_runtime()?.block_on(run_async(command)),
     }
@@ -448,8 +461,7 @@ async fn run_async(command: Command) -> Result<()> {
                     config: config_path,
                     default_config,
                     secret_file,
-                    auth_tokens,
-                    auth_tokens_file,
+                    authorized_keys_file,
                     relay_urls,
                     relay_auth_token,
                     quick,
@@ -459,7 +471,7 @@ async fn run_async(command: Command) -> Result<()> {
             if quick {
                 // Ephemeral one-off server: prompt for the client's endpoint id
                 // and natively allowlist it as the only allowed (quick) client —
-                // no auth token — then mint an in-memory identity, full-tunnel
+                // no auth keypair — then mint an in-memory identity, full-tunnel
                 // everything, print the bootstrap, and exit if no client
                 // connects within QUICK_IDLE_TIMEOUT. `--quick` conflicts with
                 // the config/secret/token flags (clap-enforced), so the
@@ -492,8 +504,7 @@ async fn run_async(command: Command) -> Result<()> {
             let cli = config::ServerConfig {
                 secret_file,
                 secret: None, // no inline-secret CLI flag; config file only
-                auth_tokens: (!auth_tokens.is_empty()).then_some(auth_tokens),
-                auth_tokens_file,
+                authorized_keys_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
                 host_aliases: None, // config-file only; no CLI flag
@@ -513,8 +524,8 @@ async fn run_async(command: Command) -> Result<()> {
                     socks_port,
                     http_port,
                     server_node_id,
-                    auth_token,
-                    auth_token_file,
+                    auth_key,
+                    auth_key_file,
                     relay_urls,
                     relay_auth_token,
                     auto_reconnect,
@@ -539,8 +550,8 @@ async fn run_async(command: Command) -> Result<()> {
                 name: None, // display name is config-file only; no CLI flag
                 socks_port,
                 http_port,
-                auth_token,
-                auth_token_file,
+                auth_key,
+                auth_key_file,
                 relay_urls: (!relay_urls.is_empty()).then_some(relay_urls),
                 relay_auth_token,
                 auto_reconnect,
@@ -549,7 +560,7 @@ async fn run_async(command: Command) -> Result<()> {
             // `--quick` is a self-contained ephemeral session: it ignores any
             // saved config, mints a session identity whose EndpointId is the
             // credential (printed here for the user to allowlist on the quick
-            // server — no auth token), prompts for the remaining connection
+            // server — no auth keypair), prompts for the remaining connection
             // details, and then runs a live control panel in this terminal
             // (pairs with `server start --quick`). Both the prompt and the
             // panel need a TTY, so a piped `--quick` fails fast instead of
@@ -568,7 +579,7 @@ async fn run_async(command: Command) -> Result<()> {
                 );
                 println!(
                     "Enter it at the `flextunnel server start --quick` prompt — it is this \
-                     client's credential (no auth token)."
+                     client's credential (no auth keypair)."
                 );
                 cli = tokio::task::spawn_blocking(move || {
                     prompt::fill_client_config(&mut cli).map(|()| cli)
@@ -622,8 +633,8 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the ephemeral `ServerConfig` for `server start --quick`: a freshly
 /// generated in-memory identity and a full-tunnel routed set
-/// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). No auth
-/// tokens — the allowlisted client endpoint id is the sole credential. Returns
+/// (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`). No
+/// client keys — the allowlisted client endpoint id is the sole credential. Returns
 /// the config plus the EndpointId to print. Nothing is written to disk.
 /// `--relay-url` stays compatible with `--quick`, so any relays are kept.
 fn quick_server_config(
@@ -662,28 +673,27 @@ async fn run_server(
     // it can run alongside a real server (or another quick one).
     let _lock = quick.is_none().then(lock::acquire).transpose()?;
 
-    let valid_tokens = auth::load_auth_tokens(
-        &r.auth_tokens,
-        r.auth_tokens_file.as_deref(),
-        auth::CLIENT_TOKEN_PREFIX,
-    )
-    .context("Failed to load client authentication tokens")?;
-    // A quick server runs without tokens: its single allowlisted client id is
-    // the whole credential set (enforced natively by the endpoint's hook).
-    if valid_tokens.is_empty() && quick.is_none() {
+    // A quick server runs without client keys: its single allowlisted client
+    // id is the whole credential set (enforced natively by the endpoint's hook).
+    let authorized_keys = match &r.authorized_keys_file {
+        Some(path) => auth::load_authorized_keys(path)
+            .context("Failed to load the authorized client keys")?,
+        None => std::collections::HashSet::new(),
+    };
+    if authorized_keys.is_empty() && quick.is_none() {
         anyhow::bail!(
-            "The server requires at least one client authentication token.\n\
-             Generate one with: flextunnel generate-auth-token\n\
-             Then pass --auth-token <TOKEN>, --auth-tokens-file <FILE>, or set \
-             auth_tokens/auth_tokens_file in the config."
+            "The server requires at least one authorized client public key.\n\
+             Each client generates a keypair with: flextunnel generate-client-key -o <FILE>\n\
+             Put the printed public keys (one `flextunnelpubv1:...` per line) in a file and \
+             pass --authorized-keys-file <FILE> or set authorized_keys_file in the config."
         );
     }
     match &quick {
         Some(q) => log::info!(
-            "Quick mode: client {} allowlisted (endpoint-id credential; no tokens)",
+            "Quick mode: client {} allowlisted (endpoint-id credential; no client keys)",
             q.client_id
         ),
-        None => log::info!("Loaded {} client authentication token(s)", valid_tokens.len()),
+        None => log::info!("Loaded {} authorized client key(s)", authorized_keys.len()),
     }
 
     let secret_key = secret::resolve_secret_key(r.secret.as_deref(), r.secret_file.as_deref())?;
@@ -810,7 +820,7 @@ async fn run_server(
             endpoint.id()
         ),
         None => log::info!(
-            "Clients connect with: flextunnel client start --server-node-id {} --auth-token <TOKEN>",
+            "Clients connect with: flextunnel client start --server-node-id {} --auth-key-file <KEY FILE>",
             endpoint.id()
         ),
     }
@@ -834,7 +844,7 @@ async fn run_server(
     let first_client = quick.as_ref().map(|_| Arc::new(Notify::new()));
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
-        valid_tokens,
+        authorized_keys,
         allowed_bridge_servers,
         host_aliases: r.host_aliases,
         routed_set,

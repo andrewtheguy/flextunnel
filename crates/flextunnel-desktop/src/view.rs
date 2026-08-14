@@ -457,6 +457,21 @@ fn profile_detail<'a>(app: &'a App, profile: &'a Profile) -> Element<'a, Message
         info_row("Server node id", truncate_middle(&node_id, 22), copy_node),
     ]
     .spacing(8);
+    // The auth public key is not a secret — always shown unmasked so it can
+    // be copied onto the server's authorized-keys file. (The secret never
+    // appears anywhere in the UI.)
+    if let Some(public_key) = flextunnel_core::auth::ClientKey::from_secret_str(
+        profile.auth_key.trim(),
+    )
+    .ok()
+    .map(|key| key.public_str())
+    {
+        info = info.push(info_row(
+            "Auth public key",
+            truncate_middle(&public_key, 22),
+            Some(public_key),
+        ));
+    }
     if let Some(socks) = socks {
         let copy = Some(format!("socks5://{socks}"));
         info = info.push(info_row("SOCKS5 proxy", socks, copy));
@@ -880,18 +895,42 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
 
     let validated = form.validate(&app.profiles);
 
+    // The secret key stays masked; the derived public key below is not a
+    // secret and is always shown unmasked (it's what goes on the server's
+    // authorized-keys file).
+    let auth_key = row![
+        input("flextunnelsecretv1:…", &form.auth_key, Message::AuthKeyChanged)
+            .secure(true)
+            .width(240),
+        button(text("Generate").size(12))
+            .padding([4, 10])
+            .style(style::outlined)
+            .on_press(Message::GenerateAuthKey),
+    ]
+    .spacing(8)
+    .align_y(Center);
+
     let mut card = column![
         form_row("Name", input("e.g. prod", &form.name, Message::ProfileNameChanged)),
         form_row(
             "Server node id",
             input("", &form.server_node_id, Message::ServerNodeIdChanged),
         ),
-        form_row(
-            "Auth token",
-            input("", &form.auth_token, Message::AuthTokenChanged)
-                .secure(true)
-                .width(240),
-        ),
+        form_row("Auth key", auth_key),
+    ]
+    .spacing(10);
+    if let Some(public_key) = form.public_key() {
+        card = card.push(form_row(
+            "Public key",
+            row![
+                text(truncate_middle(&public_key, 30)).size(12).font(Font::MONOSPACE),
+                copy_button(public_key),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ));
+    }
+    card = card.extend([
         form_row("SOCKS5 proxy", socks),
         form_row("HTTP proxy", http),
         form_row(
@@ -912,8 +951,7 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
             .secure(true)
             .width(240),
         ),
-    ]
-    .spacing(10);
+    ]);
 
     if let Err(message) = &validated {
         card = card.push(text(message.clone()).size(12).color(AMBER));
@@ -942,7 +980,8 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
             "NEW PROFILE"
         }),
         container(card).padding([12, 14]).width(Fill).style(style::card),
-        text("The auth token is stored in the system keychain; everything else in a local file.")
+        text("The secret key is stored in the system keychain; everything else in a local file. \
+              Give the public key to the server operator (authorized_keys_file).")
             .size(11)
             .style(style::faint_text),
     ]

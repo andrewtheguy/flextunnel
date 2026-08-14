@@ -94,7 +94,7 @@ SOCKS5 is not on by default — keep `--socks-port` too if you also want it:
 ```sh
 flextunnel client start \
     --server-node-id <ENDPOINT_ID> \
-    --auth-token     <AUTH_TOKEN> \
+    --auth-key-file  client.key \
     --socks-port     1080 \
     --http-port      8081
 ```

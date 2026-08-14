@@ -34,7 +34,22 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const TOKEN: &str = "test-token";
+/// The one authorized client keypair shared by the tests: servers authorize
+/// its public half, clients sign their handshakes with it.
+fn test_client_key() -> &'static crate::auth::ClientKey {
+    static KEY: std::sync::OnceLock<crate::auth::ClientKey> = std::sync::OnceLock::new();
+    KEY.get_or_init(crate::auth::ClientKey::generate)
+}
+
+/// A valid signed auth payload for `ep` (binding its own endpoint id), signed
+/// with [`test_client_key`].
+fn test_auth_payload(ep: &Endpoint) -> signaling::ClientAuthPayload {
+    signaling::ClientAuthPayload {
+        public_key: test_client_key().public_str(),
+        endpoint_id: ep.id().to_string(),
+        signature: test_client_key().sign_endpoint_id(&ep.id()),
+    }
+}
 
 /// Bind a hermetic loopback endpoint: relay off, no discovery, `127.0.0.1:0`.
 /// Servers get the ALPNs so they can accept (with the allowlisted paths —
@@ -105,14 +120,15 @@ async fn with_timeout<F: std::future::Future>(f: F) -> F::Output {
         .expect("operation timed out")
 }
 
-/// Spawn a `ProxyServer` on `endpoint` with a single client token, an empty
+/// Spawn a `ProxyServer` on `endpoint` with a single authorized client key, an empty
 /// routed set, and the given blocklist path. Returns the server's own id.
 fn spawn_server(endpoint: Endpoint, blocklist_path: std::path::PathBuf) -> iroh::EndpointId {
     spawn_server_full(endpoint, blocklist_path, HashMap::new(), Vec::new())
 }
 
-/// Spawn a `ProxyServer` with configurable host aliases. Client token is always
-/// [`TOKEN`]; `routed_domains` seeds the routed set (empty = deny all). Returns
+/// Spawn a `ProxyServer` with configurable host aliases. The authorized client
+/// key is always [`test_client_key`]; `routed_domains` seeds the routed set
+/// (empty = deny all). Returns
 /// the server's own id.
 fn spawn_server_full(
     endpoint: Endpoint,
@@ -133,13 +149,11 @@ fn spawn_server_dns(
     dns_forwards: HashMap<String, Vec<String>>,
 ) -> iroh::EndpointId {
     let own_id = endpoint.id();
-    let mut tokens = HashSet::new();
-    tokens.insert(TOKEN.to_string());
     let no_cidrs: Vec<String> = Vec::new();
     let dns_forwarder = DnsForwarder::new(&dns_forwards).unwrap();
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
-        valid_tokens: tokens,
+        authorized_keys: HashSet::from([test_client_key().public_key()]),
         allowed_bridge_servers: HashSet::new(),
         host_aliases,
         routed_set: RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
@@ -162,12 +176,12 @@ fn spawn_server_dns(
     own_id
 }
 
-/// Baseline [`ProxyServerParams`]: the [`TOKEN`] client pool and everything
-/// else empty/off. Bridge tests override the fields they exercise.
+/// Baseline [`ProxyServerParams`]: the [`test_client_key`] authorized and
+/// everything else empty/off. Bridge tests override the fields they exercise.
 fn base_params(own_id: iroh::EndpointId, blocklist_path: std::path::PathBuf) -> ProxyServerParams {
     ProxyServerParams {
         own_id,
-        valid_tokens: HashSet::from([TOKEN.to_string()]),
+        authorized_keys: HashSet::from([test_client_key().public_key()]),
         allowed_bridge_servers: HashSet::new(),
         host_aliases: HashMap::new(),
         routed_set: RoutedSet::default(),
@@ -259,8 +273,9 @@ async fn client_handshake(
     handshake_on_alpn(ep, server_addr, ALPN, nonce, duplicate_server_observed).await
 }
 
-/// [`client_handshake`] on an explicit ALPN. The `Hello` carries the [`TOKEN`]
-/// on the client ALPN and no token on the quick ALPN, matching production.
+/// [`client_handshake`] on an explicit ALPN. The `Hello` carries a
+/// [`test_client_key`]-signed credential on the client ALPN and no credential
+/// on the quick ALPN, matching production.
 async fn handshake_on_alpn(
     ep: &Endpoint,
     server_addr: EndpointAddr,
@@ -268,10 +283,10 @@ async fn handshake_on_alpn(
     nonce: u128,
     duplicate_server_observed: bool,
 ) -> (Connection, SendStream, RecvStream, HelloResponse) {
+    let auth = (alpn == ALPN).then(|| test_auth_payload(ep));
     let conn = with_timeout(ep.connect(server_addr, alpn)).await.unwrap();
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    let token = (alpn == ALPN).then(|| TOKEN.to_string());
-    let mut hello = Hello::new(token, nonce);
+    let mut hello = Hello::new(auth, nonce);
     hello.duplicate_server_observed = duplicate_server_observed;
     signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
         .await
@@ -936,9 +951,9 @@ async fn bridge_rejected_by_native_allowlist() {
 }
 
 /// Quick mode end to end: a client whose endpoint id is on the server's quick
-/// allowlist connects over the quick ALPN with **no token** (the server runs
-/// with an empty token set, like a quick server), is served exactly like a
-/// token client (routed set pushed, tunnel streams pipe), and its heartbeat
+/// allowlist connects over the quick ALPN with **no keypair** (the server runs
+/// with an empty authorized-keys set, like a quick server), is served exactly
+/// like a keypair client (routed set pushed, tunnel streams pipe), and its heartbeat
 /// refreshes liveness through the same accepted path.
 #[tokio::test]
 async fn quick_client_authenticates_by_endpoint_id() {
@@ -962,7 +977,7 @@ async fn quick_client_authenticates_by_endpoint_id() {
     .await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     let mut params = base_params(server_ep.id(), temp_blocklist("quickok"));
-    params.valid_tokens = HashSet::new(); // a quick server has no tokens at all
+    params.authorized_keys = HashSet::new(); // a quick server has no client keys at all
     params.routed_set = routed_set;
     params.routed_cidrs = cidrs;
     spawn_server_params(server_ep, params);
@@ -982,14 +997,16 @@ async fn quick_client_authenticates_by_endpoint_id() {
 /// Quick-mode gating, enforced natively by the endpoint's allowlist hook: a
 /// non-allowlisted client id is rejected at the TLS handshake, and an empty
 /// quick allowlist (every normal server) rejects the quick ALPN entirely. A
-/// token is no substitute: case 1's dialer presents a token the server's
-/// token set does accept (on the client ALPN), yet is still rejected — the
-/// hook closes the connection before the `Hello` is ever read.
+/// keypair credential is no substitute: case 1's dialer presents a validly
+/// signed credential the server's authorized-keys set does accept (on the
+/// client ALPN), yet is still rejected — the hook closes the connection
+/// before the `Hello` is ever read.
 #[tokio::test]
 async fn quick_client_rejected_by_native_allowlist() {
     // Case 1: quick allowlist names someone else. The server's ProxyServer
-    // holds [`TOKEN`] as valid (base_params), and the dialer's Hello carries
-    // it — proving a valid token cannot bypass the allowlist on the quick ALPN.
+    // authorizes [`test_client_key`] (base_params), and the dialer's Hello
+    // carries a valid signed credential — proving an authorized keypair cannot
+    // bypass the allowlist on the quick ALPN.
     let ep1 = loopback_endpoint_full(
         SecretKey::generate(),
         true,
@@ -1004,9 +1021,9 @@ async fn quick_client_rejected_by_native_allowlist() {
     let p1 = base_params(ep1.id(), temp_blocklist("quickrej1"));
     spawn_server_params(ep1, p1);
     let dialer = loopback_endpoint(SecretKey::generate(), false).await;
-    let hello_with_valid_token =
-        signaling::encode_hello(&Hello::new(Some(TOKEN.to_string()), 1)).unwrap();
-    assert_rejected_by_allowlist(&dialer, addr1, QUICK_ALPN, hello_with_valid_token, "allowlist")
+    let hello_with_valid_credential =
+        signaling::encode_hello(&Hello::new(Some(test_auth_payload(&dialer)), 1)).unwrap();
+    assert_rejected_by_allowlist(&dialer, addr1, QUICK_ALPN, hello_with_valid_credential, "allowlist")
         .await;
 
     // Case 2: quick mode not enabled (empty allowlist — every normal server).
@@ -1018,24 +1035,17 @@ async fn quick_client_rejected_by_native_allowlist() {
     assert_quick_client_rejected(&dialer2, addr2, "not enabled").await;
 }
 
-/// A tokenless `Hello` on the regular client ALPN is an auth failure: omitting
-/// the token must never bypass token auth (only the quick ALPN — gated by the
-/// native allowlist — is tokenless).
-#[tokio::test]
-async fn tokenless_hello_on_client_alpn_is_rejected() {
-    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
-    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
-    spawn_server(server_ep, temp_blocklist("tokenless"));
-
-    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+/// Send `hello` on the client ALPN and return the server's response.
+async fn send_hello_expect_response(
+    client_ep: &Endpoint,
+    server_addr: EndpointAddr,
+    hello: Hello,
+) -> HelloResponse {
     let conn = with_timeout(client_ep.connect(server_addr, ALPN)).await.unwrap();
     let (mut send, mut recv) = with_timeout(conn.open_bi()).await.unwrap();
-    signaling::write_message(
-        &mut send,
-        &signaling::encode_hello(&Hello::new(None, 5)).unwrap(),
-    )
-    .await
-    .unwrap();
+    signaling::write_message(&mut send, &signaling::encode_hello(&hello).unwrap())
+        .await
+        .unwrap();
     send.flush().await.unwrap();
     let data = with_timeout(signaling::read_message(
         &mut recv,
@@ -1043,16 +1053,64 @@ async fn tokenless_hello_on_client_alpn_is_rejected() {
     ))
     .await
     .unwrap();
-    let resp = signaling::decode_hello_response(&data).unwrap();
-    assert!(!resp.accepted, "a tokenless hello on the client ALPN must be rejected");
-    assert!(
-        resp.reject_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("token"),
-        "reject reason should mention the token: {:?}",
-        resp.reject_reason
-    );
+    signaling::decode_hello_response(&data).unwrap()
+}
+
+/// Every broken credential on the regular client ALPN is an auth failure: a
+/// missing payload, an unauthorized (though validly signing) key, a claimed
+/// endpoint id that differs from the connection's TLS-authenticated one
+/// (replaying a captured credential from another endpoint), and a corrupted
+/// signature. Only the intact [`test_client_key`] credential is accepted
+/// (covered by the other tests via [`client_handshake`]).
+#[tokio::test]
+async fn broken_credentials_on_client_alpn_are_rejected() {
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
+    spawn_server(server_ep, temp_blocklist("badcreds"));
+
+    let client_ep = loopback_endpoint(SecretKey::generate(), false).await;
+
+    // No credential at all.
+    let cases: Vec<(&str, Option<signaling::ClientAuthPayload>)> = vec![
+        ("missing credential", None),
+        ("unauthorized key", {
+            let stranger = crate::auth::ClientKey::generate();
+            Some(signaling::ClientAuthPayload {
+                public_key: stranger.public_str(),
+                endpoint_id: client_ep.id().to_string(),
+                signature: stranger.sign_endpoint_id(&client_ep.id()),
+            })
+        }),
+        ("mismatched claimed endpoint id", {
+            // Validly signed by the authorized key, but binding a *different*
+            // endpoint id — a replay from another endpoint.
+            let other_id = SecretKey::generate().public();
+            Some(signaling::ClientAuthPayload {
+                public_key: test_client_key().public_str(),
+                endpoint_id: other_id.to_string(),
+                signature: test_client_key().sign_endpoint_id(&other_id),
+            })
+        }),
+        ("bad signature", {
+            let mut auth = test_auth_payload(&client_ep);
+            auth.signature = crate::auth::ClientKey::generate()
+                .sign_endpoint_id(&client_ep.id());
+            Some(auth)
+        }),
+    ];
+    for (what, auth) in cases {
+        let resp =
+            send_hello_expect_response(&client_ep, server_addr.clone(), Hello::new(auth, 5)).await;
+        assert!(!resp.accepted, "{what} must be rejected");
+        assert!(
+            resp.reject_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("authentication"),
+            "{what}: reject reason should mention authentication: {:?}",
+            resp.reject_reason
+        );
+    }
 }
 
 /// Single hop: two servers bridging the same range at each other must not

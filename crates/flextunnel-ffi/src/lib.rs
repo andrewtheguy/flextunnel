@@ -30,15 +30,16 @@
 //!
 //! ## Config JSON (input to `flextunnel_start`)
 //!
-//! `auth_token` and `server_node_id` are required; the rest are optional. The
-//! routed set (the *tunnel set* that decides split-tunneling) is configured on
-//! the server and pushed to the client during the handshake, so the app sends
-//! no routed set of its own.
+//! `auth_key` (the client's `flextunnelsecretv1:...` secret key, whose public
+//! half must be on the server's authorized-keys file) and `server_node_id` are
+//! required; the rest are optional. The routed set (the *tunnel set* that
+//! decides split-tunneling) is configured on the server and pushed to the
+//! client during the handshake, so the app sends no routed set of its own.
 //!
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
-//!   "auth_token": "<flextunnel auth token>",
+//!   "auth_key": "flextunnelsecretv1:...",
 //!   "socks_port": null,
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_auth_token": null
@@ -97,7 +98,9 @@ pub struct FlextunnelHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     server_node_id: String,
-    auth_token: String,
+    /// The client's secret key (`flextunnelsecretv1:...`); the app stores it
+    /// in the iOS keychain and passes it here at start.
+    auth_key: String,
     /// Loopback SOCKS5 port to bind. `None` disables the SOCKS5 front-end;
     /// `Some(0)` binds an OS-assigned ephemeral port.
     #[serde(default)]
@@ -131,6 +134,67 @@ pub extern "C" fn flextunnel_init_logging() {
     flextunnel_core::app::init_logger(
         "warn,flextunnel_core=info,flextunnel_ffi=info,flextunnel_cli=info",
     );
+}
+
+/// Generate a fresh client authentication keypair. Writes
+/// `{"created":"<UTC>","public_key":"flextunnelpubv1:...","secret_key":"flextunnelsecretv1:..."}`
+/// to `out_buf`. The app stores the secret key in the keychain and shows the
+/// public key (never a secret) for the user to put on the server's
+/// authorized-keys file. Returns 1 on success, 0 if `out_buf` is too small.
+///
+/// # Safety
+/// `out_buf` must point to at least `out_len` writable bytes (may be null only
+/// if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_generate_client_key(
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    let key = flextunnel_core::auth::ClientKey::generate();
+    let json = serde_json::json!({
+        "created": flextunnel_core::auth::utc_timestamp(),
+        "public_key": key.public_str(),
+        "secret_key": key.secret_str(),
+    })
+    .to_string();
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+}
+
+/// Derive the public key (`flextunnelpubv1:...`) of a stored secret key, so
+/// the app can display it unmasked without persisting it separately. Writes
+/// the public key string to `out_buf` on success (returns 1), or an error
+/// message (returns 0) for an invalid secret or a too-small buffer.
+///
+/// # Safety
+/// - `secret_key` must be a valid, NUL-terminated UTF-8 C string.
+/// - `out_buf` must point to at least `out_len` writable bytes (may be null
+///   only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_client_public_key(
+    secret_key: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if secret_key.is_null() {
+        write_cstr(out_buf, out_len, "secret_key is null");
+        return 0;
+    }
+    let secret = match unsafe { CStr::from_ptr(secret_key) }.to_str() {
+        Ok(secret) => secret,
+        Err(_) => {
+            write_cstr(out_buf, out_len, "secret_key is not valid UTF-8");
+            return 0;
+        }
+    };
+    match flextunnel_core::auth::ClientKey::from_secret_str(secret.trim()) {
+        Ok(key) => {
+            if write_cstr(out_buf, out_len, &key.public_str()) { 1 } else { 0 }
+        }
+        Err(e) => {
+            write_cstr(out_buf, out_len, &format!("invalid secret key: {e:#}"));
+            0
+        }
+    }
 }
 
 /// Start the in-process tunnel, optionally with a SOCKS5 front-end.
@@ -234,13 +298,15 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
 
     let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token.clone())
         .map_err(|e| format!("invalid relay configuration: {e}"))?;
+    let client_key = flextunnel_core::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
+        .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let endpoint = runtime
         .block_on(create_client_endpoint(&relay_config))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
 
     let client = Arc::new(ProxyClient::new(ClientConfig {
         server_node_id: cfg.server_node_id,
-        auth: ClientAuth::Token(cfg.auth_token),
+        auth: ClientAuth::Key(Box::new(client_key)),
         // Unused: any listener is already bound above and passed in directly.
         socks_listen: port.map(|p| SocketAddr::from((Ipv4Addr::LOCALHOST, p))),
         // iOS exposes no HTTP front-end.

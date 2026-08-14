@@ -60,7 +60,9 @@ pub enum Message {
     // Profile form
     ProfileNameChanged(String),
     ServerNodeIdChanged(String),
-    AuthTokenChanged(String),
+    AuthKeyChanged(String),
+    /// Fill the form's auth-key field with a freshly generated keypair.
+    GenerateAuthKey,
     SocksEnabledToggled(bool),
     SocksPortChanged(String),
     HttpEnabledToggled(bool),
@@ -152,7 +154,7 @@ fn unique_name(profiles: &[Profile], desired: String, own_id: Option<&str>) -> S
 
 /// Merge an imported (already structurally validated) profile list into the
 /// current one. A matching server node id replaces that profile's settings
-/// and forwards but keeps its id and both secrets (auth token and relay auth
+/// and forwards but keeps its id and both secrets (auth key and relay auth
 /// token); anything else is added as a new profile with a fresh id and no
 /// secrets — imports never carry them. Colliding names get a " - N" suffix,
 /// and imported forwards get fresh ids so they stay globally unique. Returns
@@ -173,7 +175,7 @@ fn merge_imported(
         {
             Some(pos) => {
                 incoming.id = profiles[pos].id.clone();
-                incoming.auth_token = profiles[pos].auth_token.clone();
+                incoming.auth_key = profiles[pos].auth_key.clone();
                 incoming.relay_auth_token = profiles[pos].relay_auth_token.clone();
                 incoming.name = unique_name(profiles, incoming.name, Some(&incoming.id));
                 profiles[pos] = incoming;
@@ -181,7 +183,7 @@ fn merge_imported(
             }
             None => {
                 incoming.id = Profile::new_id();
-                incoming.auth_token = String::new();
+                incoming.auth_key = String::new();
                 incoming.relay_auth_token = None;
                 incoming.name = unique_name(profiles, incoming.name, None);
                 profiles.push(incoming);
@@ -209,7 +211,7 @@ pub struct ProfileForm {
     editing_id: Option<ProfileId>,
     pub name: String,
     pub server_node_id: String,
-    pub auth_token: String,
+    pub auth_key: String,
     pub socks_enabled: bool,
     pub socks_port: String,
     pub http_enabled: bool,
@@ -221,6 +223,15 @@ pub struct ProfileForm {
 impl ProfileForm {
     pub fn is_edit(&self) -> bool {
         self.editing_id.is_some()
+    }
+
+    /// The public key derived from the form's auth key, when it parses. The
+    /// public half is never a secret — the UI shows it unmasked so it can be
+    /// copied onto the server's authorized-keys file.
+    pub fn public_key(&self) -> Option<String> {
+        flextunnel_core::auth::ClientKey::from_secret_str(self.auth_key.trim())
+            .ok()
+            .map(|key| key.public_str())
     }
 
     fn add(profiles: &[Profile]) -> Self {
@@ -237,7 +248,7 @@ impl ProfileForm {
             editing_id: Some(profile.id.clone()),
             name: profile.name.clone(),
             server_node_id: profile.server_node_id.clone(),
-            auth_token: profile.auth_token.clone(),
+            auth_key: profile.auth_key.clone(),
             socks_enabled: profile.socks_port.is_some(),
             socks_port: profile
                 .socks_port
@@ -286,12 +297,12 @@ impl ProfileForm {
                 other.name
             ));
         }
-        let auth_token = self.auth_token.trim();
-        if auth_token.is_empty() {
-            return Err("Auth token is required".into());
+        let auth_key = self.auth_key.trim();
+        if auth_key.is_empty() {
+            return Err("Auth key is required (generate one, or paste a flextunnelsecretv1: key)".into());
         }
-        flextunnel_core::auth::validate_client_token(auth_token)
-            .map_err(|e| format!("Invalid auth token: {e}"))?;
+        flextunnel_core::auth::ClientKey::from_secret_str(auth_key)
+            .map_err(|e| format!("Invalid auth key: {e}"))?;
         let editing = self.editing_id.as_deref();
         let socks_port = if self.socks_enabled {
             let port = parse_port(&self.socks_port, "SOCKS5 port")?;
@@ -339,7 +350,7 @@ impl ProfileForm {
             id: self.editing_id.clone().unwrap_or_else(Profile::new_id),
             name,
             server_node_id: server_node_id.into(),
-            auth_token: auth_token.into(),
+            auth_key: auth_key.into(),
             socks_port,
             http_port,
             relay_urls,
@@ -735,9 +746,15 @@ impl App {
                 }
                 Task::none()
             }
-            Message::AuthTokenChanged(value) => {
+            Message::AuthKeyChanged(value) => {
                 if let Some(form) = &mut self.profile_form {
-                    form.auth_token = value;
+                    form.auth_key = value;
+                }
+                Task::none()
+            }
+            Message::GenerateAuthKey => {
+                if let Some(form) = &mut self.profile_form {
+                    form.auth_key = flextunnel_core::auth::ClientKey::generate().secret_str();
                 }
                 Task::none()
             }
@@ -923,7 +940,7 @@ impl App {
             // The token's keychain entry was lost — re-enter it.
             self.selection = Selection::Profile(profile.id.clone());
             self.profile_form = Some(ProfileForm::edit(&profile));
-            self.notice = Some("Enter the auth token to connect.".into());
+            self.notice = Some("Enter the auth key to connect.".into());
             self.show_window()
         }
     }
@@ -1036,7 +1053,7 @@ impl App {
         let Ok(profile) = form.validate(&self.profiles) else {
             return;
         };
-        if let Err(e) = config::save_profile_secret(&profile.id, &profile.auth_token) {
+        if let Err(e) = config::save_profile_secret(&profile.id, &profile.auth_key) {
             log::error!("{e:#}");
             self.notice = Some(format!("{e:#}"));
             return;
@@ -1215,7 +1232,7 @@ mod tests {
             editing_id: None,
             name: " prod ".into(),
             server_node_id: " node-id ".into(),
-            auth_token: flextunnel_core::auth::generate_client_token(),
+            auth_key: flextunnel_core::auth::ClientKey::generate().secret_str(),
             socks_enabled: true,
             socks_port: "1080".into(),
             http_enabled: false,
@@ -1252,7 +1269,7 @@ mod tests {
             id: id.into(),
             name: format!("profile-{id}"),
             server_node_id: "node".into(),
-            auth_token: "token".into(),
+            auth_key: "token".into(),
             socks_port: Some(socks_port),
             http_port: None,
             relay_urls: Vec::new(),
@@ -1324,7 +1341,7 @@ mod tests {
             existing_profile("p2", 1081, vec![]),
         ];
         current[1].server_node_id = "node-2".into();
-        current[0].auth_token = "secret".into();
+        current[0].auth_key = "secret".into();
         current[0].relay_auth_token = Some("relay-psk".into());
 
         // Same server as p1: replaces settings/forwards, keeps id + secrets.
@@ -1345,7 +1362,7 @@ mod tests {
 
         let p1 = &current[0];
         assert_eq!(p1.id, "p1", "id kept");
-        assert_eq!(p1.auth_token, "secret", "token kept");
+        assert_eq!(p1.auth_key, "secret", "token kept");
         assert_eq!(
             p1.relay_auth_token.as_deref(),
             Some("relay-psk"),
@@ -1358,7 +1375,7 @@ mod tests {
 
         let new = &current[2];
         assert_eq!(new.name, "profile-p2 - 2");
-        assert!(new.auth_token.is_empty(), "no secret in imports");
+        assert!(new.auth_key.is_empty(), "no secret in imports");
         assert_eq!(new.relay_auth_token, None, "no relay secret in imports");
         assert_ne!(new.id, "y", "imported profile ids are fresh");
 
@@ -1422,7 +1439,7 @@ mod tests {
         assert!(form.validate(&[]).is_err());
 
         let mut form = valid_form();
-        form.auth_token = "not-a-token".into();
+        form.auth_key = "not-a-token".into();
         assert!(form.validate(&[]).is_err());
 
         let mut form = valid_form();

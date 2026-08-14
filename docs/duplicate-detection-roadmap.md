@@ -24,9 +24,9 @@ observability), this simplicity breaks and the design must change:
   an operator clears the blocklist. Auto-blocking on detection becomes an
   availability footgun, exactly as it is for the server today.
 - **Duplicates become plausible, not rare** — copying a client config (secret +
-  token) to a second device is an easy misconfiguration, so detection would fire
-  in normal-ish operations rather than only on a genuine bug.
-- It would need **identity vs credential separation** (node id, auth token, and a
+  auth key) to a second device is an easy misconfiguration, so detection would
+  fire in normal-ish operations rather than only on a genuine bug.
+- It would need **identity vs credential separation** (node id, auth key, and a
   human-facing client name are three different things), an **operator-clearable,
   per-client** blocklist with clear provenance, and likely a softer first
   response (warn / disconnect-newcomer) before any sticky block.

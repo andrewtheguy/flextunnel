@@ -4,7 +4,7 @@
 //! clients may run local SOCKS5/HTTP proxy listeners or server-direct loopback
 //! forwards; routed targets are reliable QUIC bi-streams to the server, which
 //! resolves DNS and connects from its own network. Uses a fixed ALPN for
-//! protocol selection, auth tokens for access control, and TLS 1.3/QUIC for
+//! protocol selection, client keypairs (ed25519) for access control, and TLS 1.3/QUIC for
 //! encryption. Neither side needs admin/root (no TUN device).
 //!
 //! This is the reusable core library, consumed by the `flextunnel` CLI binary
