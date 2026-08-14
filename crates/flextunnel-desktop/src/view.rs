@@ -1085,6 +1085,12 @@ fn keys_pane(app: &App) -> Element<'_, Message> {
         );
     }
     for key in &app.keys {
+        // The edited key is represented by the open form above, not its card.
+        if let Some(form) = &app.key_form
+            && form.editing_id() == Some(key.id.as_str())
+        {
+            continue;
+        }
         col = col.push(key_card(app, key));
     }
     col = col.push(

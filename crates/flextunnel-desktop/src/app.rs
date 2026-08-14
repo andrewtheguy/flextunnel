@@ -406,6 +406,12 @@ impl KeyForm {
         self.editing_id.is_some()
     }
 
+    /// The id of the key being edited (`None` when adding), so the Keys pane
+    /// can hide that key's card while its form is open.
+    pub fn editing_id(&self) -> Option<&str> {
+        self.editing_id.as_deref()
+    }
+
     fn edit(key: &AuthKey) -> Self {
         Self {
             editing_id: Some(key.id.clone()),
