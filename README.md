@@ -220,7 +220,7 @@ authorized-keys file, one per line with an optional trailing comment, ssh
 `authorized_keys` style:
 
 ```text
-# /etc/flextunnel/authorized_keys
+# ./authorized_keys
 flextunnelpubv1:XXXXXXXX alice laptop
 flextunnelpubv1:YYYYYYYY build server
 ```
@@ -237,7 +237,7 @@ tunneling.
 secret_file = "./server.key"
 
 # Authorized client public keys — always a file (ssh authorized_keys style).
-authorized_keys_file = "/etc/flextunnel/authorized_keys"
+authorized_keys_file = "./authorized_keys"
 
 routed_domains = ["*"]
 routed_cidrs = ["0.0.0.0/0", "::/0"]

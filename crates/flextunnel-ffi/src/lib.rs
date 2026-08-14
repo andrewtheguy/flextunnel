@@ -163,7 +163,8 @@ pub unsafe extern "C" fn flextunnel_generate_client_key(
 /// Derive the public key (`flextunnelpubv1:...`) of a stored secret key, so
 /// the app can display it unmasked without persisting it separately. Writes
 /// the public key string to `out_buf` on success (returns 1), or an error
-/// message (returns 0) for an invalid secret or a too-small buffer.
+/// message (returns 0) for an invalid secret. A too-small `out_buf` also
+/// returns 0, but then holds the truncated output rather than a diagnostic.
 ///
 /// # Safety
 /// - `secret_key` must be a valid, NUL-terminated UTF-8 C string.

@@ -14,7 +14,7 @@ secret_file = "./server.key"
 # ignored. Clients generate a keypair with `flextunnel generate-auth-private-key`
 # and you paste the printed PUBLIC key here (the secret never leaves the
 # client).
-authorized_keys_file = "/etc/flextunnel/authorized_keys"
+authorized_keys_file = "./authorized_keys"
 
 # Optional iroh tuning.
 # Custom relay(s) for failover. Configuring custom relays disables n0 internet

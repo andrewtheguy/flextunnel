@@ -234,7 +234,10 @@ pub fn load_secret(path: &Path) -> Result<SecretKey> {
     // Key files carry `# created:` / `# public key:` comments above the secret;
     // the first meaningful line is the base64 secret itself.
     let Some((_, line)) = crate::auth::meaningful_lines(&content).next() else {
-        anyhow::bail!("Secret key file is empty: {}", path.display());
+        anyhow::bail!(
+            "No secret key found in {} (only blank lines or `#` comments)",
+            path.display()
+        );
     };
     load_secret_from_string(line)
 }
@@ -521,7 +524,7 @@ mod tests {
         let mut empty = tempfile::NamedTempFile::new().unwrap();
         writeln!(empty, "# created: 2026-08-13T01:02:03Z").unwrap();
         let err = load_secret(empty.path()).unwrap_err();
-        assert!(err.to_string().contains("empty"), "{err}");
+        assert!(err.to_string().contains("No secret key found"), "{err}");
     }
 
     #[test]

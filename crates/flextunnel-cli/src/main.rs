@@ -187,7 +187,7 @@ enum ClientAction {
         server_node_id: Option<String>,
         /// Inline client secret key (`flextunnelsecretv1:...`) used to
         /// authenticate to the server.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "auth_key_file")]
         auth_key: Option<String>,
         /// File containing the client secret key (from `flextunnel
         /// generate-auth-private-key`).

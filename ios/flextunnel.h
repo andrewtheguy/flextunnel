@@ -57,8 +57,10 @@ int flextunnel_generate_client_key(char *out_buf, size_t out_len);
 /*
  * Derive the public key ("flextunnelpubv1:...") of a stored secret key, so the
  * app can display it unmasked without persisting it separately. On success
- * writes the public key to out_buf and returns 1; on failure (invalid secret,
- * small buffer) writes an error message and returns 0.
+ * writes the public key to out_buf and returns 1. For an invalid secret it
+ * writes an error message and returns 0. If out_buf is too small it also
+ * returns 0, but out_buf then holds the truncated (NUL-terminated) output —
+ * no diagnostic text — so retry with a larger buffer.
  */
 int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t out_len);
 
