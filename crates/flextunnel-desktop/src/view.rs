@@ -905,46 +905,19 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
 
     let validated = form.validate(&app.profiles, &app.keys);
 
-    // Keys are shared across profiles: pick one from the list (managed in the
-    // Keys pane), or mint a fresh one right here with "New key".
-    let choices: Vec<KeyChoice> = app
-        .keys
-        .iter()
-        .map(|k| KeyChoice {
-            id: k.id.clone(),
-            name: k.name.clone(),
-        })
-        .collect();
-    let selected = choices.iter().find(|c| c.id == form.auth_key_id).cloned();
-    let auth_key = row![
-        pick_list(choices, selected, Message::AuthKeyPicked)
-            .placeholder(if app.keys.is_empty() {
-                "no keys yet"
-            } else {
-                "pick a key"
-            })
-            .text_size(13)
-            .width(240),
-        button(text("New key…").size(12))
-            .padding([4, 10])
-            .style(style::outlined)
-            .on_press(Message::NewKeyPrompt),
-    ]
-    .spacing(8)
-    .align_y(Center);
-
     let mut card = column![
         form_row("Name", input("e.g. prod", &form.name, Message::ProfileNameChanged)),
         form_row(
             "Server node id",
             input("", &form.server_node_id, Message::ServerNodeIdChanged),
         ),
-        form_row("Auth key", auth_key),
     ]
     .spacing(10);
-    // The "New key" prompt: name the key, then Create generates the keypair,
-    // adds it to the shared list, and selects it above.
     if let Some(new_name) = &form.new_key_name {
+        // The "New key" prompt replaces the picker and public-key rows while
+        // open, so the form shows exactly one key flow at a time: name the
+        // key, then Create generates the keypair, adds it to the shared list,
+        // and selects it; Cancel returns to the picker.
         let name_check = crate::app::validate_key_name(new_name, &app.keys, None);
         card = card.push(form_row(
             "New key name",
@@ -968,17 +941,48 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         {
             card = card.push(text(message.clone()).size(12).color(AMBER));
         }
-    }
-    if let Some(key) = config::find_key(&app.keys, &form.auth_key_id) {
+    } else {
+        // Keys are shared across profiles: pick one from the list (managed in
+        // the Keys pane), or mint a fresh one right here with "New key…".
+        let choices: Vec<KeyChoice> = app
+            .keys
+            .iter()
+            .map(|k| KeyChoice {
+                id: k.id.clone(),
+                name: k.name.clone(),
+            })
+            .collect();
+        let selected = choices.iter().find(|c| c.id == form.auth_key_id).cloned();
         card = card.push(form_row(
-            "Public key",
+            "Auth key",
             row![
-                text(truncate_middle(&key.public_key, 30)).size(12).font(Font::MONOSPACE),
-                copy_button(key.public_key.clone()),
+                pick_list(choices, selected, Message::AuthKeyPicked)
+                    .placeholder(if app.keys.is_empty() {
+                        "no keys yet"
+                    } else {
+                        "pick a key"
+                    })
+                    .text_size(13)
+                    .width(240),
+                button(text("New key…").size(12))
+                    .padding([4, 10])
+                    .style(style::outlined)
+                    .on_press(Message::NewKeyPrompt),
             ]
             .spacing(8)
             .align_y(Center),
         ));
+        if let Some(key) = config::find_key(&app.keys, &form.auth_key_id) {
+            card = card.push(form_row(
+                "Public key",
+                row![
+                    text(truncate_middle(&key.public_key, 30)).size(12).font(Font::MONOSPACE),
+                    copy_button(key.public_key.clone()),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            ));
+        }
     }
     card = card.extend([
         form_row("SOCKS5 proxy", socks),
