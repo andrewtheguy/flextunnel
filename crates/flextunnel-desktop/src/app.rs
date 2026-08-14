@@ -78,9 +78,14 @@ pub enum Message {
     ServerNodeIdChanged(String),
     /// Pick a shared auth key for the profile being edited.
     AuthKeyPicked(KeyChoice),
-    /// Add a freshly generated key to the shared list (auto-named) and select
-    /// it in the profile form — the "New key" shortcut next to the picker.
-    GenerateAuthKey,
+    /// Open the profile form's "New key" prompt (a name field next to the
+    /// picker).
+    NewKeyPrompt,
+    NewKeyNameChanged(String),
+    /// Generate a keypair under the prompted name, add it to the shared list,
+    /// and select it in the profile form.
+    NewKeyCreate,
+    NewKeyCancel,
     // Auth keys (the Keys pane)
     AddKey,
     EditKey(String),
@@ -245,6 +250,8 @@ pub struct ProfileForm {
     pub server_node_id: String,
     /// The picked shared key ([`AuthKey::id`]); empty while none is picked.
     pub auth_key_id: String,
+    /// The "New key" prompt's name buffer; `None` while the prompt is closed.
+    pub new_key_name: Option<String>,
     pub socks_enabled: bool,
     pub socks_port: String,
     pub http_enabled: bool,
@@ -273,6 +280,7 @@ impl ProfileForm {
             name: profile.name.clone(),
             server_node_id: profile.server_node_id.clone(),
             auth_key_id: profile.auth_key_id.clone(),
+            new_key_name: None,
             socks_enabled: profile.socks_port.is_some(),
             socks_port: profile
                 .socks_port
@@ -413,21 +421,7 @@ impl KeyForm {
     }
 
     pub fn validate(&self, keys: &[AuthKey]) -> Result<AuthKey, String> {
-        // Same normalized name shape as profiles (see `config::is_valid_name`).
-        let name = self.name.split_whitespace().collect::<Vec<_>>().join(" ");
-        if name.is_empty() {
-            return Err("Key name is required".into());
-        }
-        if name.len() > 64 {
-            return Err("Key name must be 64 characters or fewer".into());
-        }
-        // Unique names keep the profile form's picker unambiguous.
-        if keys
-            .iter()
-            .any(|k| k.name == name && Some(k.id.as_str()) != self.editing_id.as_deref())
-        {
-            return Err(format!("Another key is already named \"{name}\""));
-        }
+        let name = validate_key_name(&self.name, keys, self.editing_id.as_deref())?;
         let secret = self.secret.trim();
         if secret.is_empty() {
             return Err(
@@ -452,6 +446,31 @@ impl KeyForm {
             secret: secret.into(),
         })
     }
+}
+
+/// Normalize and validate a key name (same shape as profile names — see
+/// `config::is_valid_name`), rejecting duplicates of any key other than
+/// `own_id`. Shared by the Keys form and the profile form's New key prompt;
+/// unique names keep the profile form's picker unambiguous.
+pub fn validate_key_name(
+    name: &str,
+    keys: &[AuthKey],
+    own_id: Option<&str>,
+) -> Result<String, String> {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return Err("Key name is required".into());
+    }
+    if name.len() > 64 {
+        return Err("Key name must be 64 characters or fewer".into());
+    }
+    if keys
+        .iter()
+        .any(|k| k.name == name && Some(k.id.as_str()) != own_id)
+    {
+        return Err(format!("Another key is already named \"{name}\""));
+    }
+    Ok(name)
 }
 
 /// Editable add/edit buffers for one port forward, mirroring the iOS sheet.
@@ -860,8 +879,30 @@ impl App {
                 }
                 Task::none()
             }
-            Message::GenerateAuthKey => {
-                self.generate_key_for_profile_form();
+            Message::NewKeyPrompt => {
+                if let Some(form) = &mut self.profile_form
+                    && form.new_key_name.is_none()
+                {
+                    form.new_key_name = Some(String::new());
+                }
+                Task::none()
+            }
+            Message::NewKeyNameChanged(value) => {
+                if let Some(form) = &mut self.profile_form
+                    && let Some(buffer) = &mut form.new_key_name
+                {
+                    *buffer = value;
+                }
+                Task::none()
+            }
+            Message::NewKeyCreate => {
+                self.create_key_for_profile_form();
+                Task::none()
+            }
+            Message::NewKeyCancel => {
+                if let Some(form) = &mut self.profile_form {
+                    form.new_key_name = None;
+                }
                 Task::none()
             }
             Message::AddKey => {
@@ -1250,20 +1291,22 @@ impl App {
         self.profile_form = None;
     }
 
-    /// The profile form's "New key" shortcut: generate a keypair, add it to
-    /// the shared list under an auto-picked name, and select it in the form.
+    /// The profile form's "New key" prompt: generate a keypair under the
+    /// entered name, add it to the shared list, and select it in the form.
     /// (Cancelling the profile form afterwards keeps the key — it's in the
     /// list, deletable from the Keys pane.)
-    fn generate_key_for_profile_form(&mut self) {
-        if self.profile_form.is_none() {
+    fn create_key_for_profile_form(&mut self) {
+        let Some(name) = self.profile_form.as_ref().and_then(|f| f.new_key_name.clone()) else {
             return;
-        }
+        };
+        // The view disables Create on an invalid name; this is the backstop.
+        let Ok(name) = validate_key_name(&name, &self.keys, None) else {
+            return;
+        };
         let client_key = flextunnel_core::auth::ClientKey::generate();
         let key = AuthKey {
             id: AuthKey::new_id(),
-            name: unique_name("key".into(), |name| {
-                self.keys.iter().any(|k| k.name == name)
-            }),
+            name,
             public_key: client_key.public_str(),
             secret: client_key.secret_str(),
         };
@@ -1277,6 +1320,7 @@ impl App {
         self.persist_store();
         if let Some(form) = &mut self.profile_form {
             form.auth_key_id = id;
+            form.new_key_name = None;
         }
     }
 
@@ -1479,6 +1523,7 @@ mod tests {
             name: " prod ".into(),
             server_node_id: " node-id ".into(),
             auth_key_id: "k1".into(),
+            new_key_name: None,
             socks_enabled: true,
             socks_port: "1080".into(),
             http_enabled: false,

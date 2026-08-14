@@ -925,10 +925,10 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
             })
             .text_size(13)
             .width(240),
-        button(text("New key").size(12))
+        button(text("New key…").size(12))
             .padding([4, 10])
             .style(style::outlined)
-            .on_press(Message::GenerateAuthKey),
+            .on_press(Message::NewKeyPrompt),
     ]
     .spacing(8)
     .align_y(Center);
@@ -942,6 +942,33 @@ fn profile_form_view<'a>(app: &'a App, form: &'a ProfileForm) -> Element<'a, Mes
         form_row("Auth key", auth_key),
     ]
     .spacing(10);
+    // The "New key" prompt: name the key, then Create generates the keypair,
+    // adds it to the shared list, and selects it above.
+    if let Some(new_name) = &form.new_key_name {
+        let name_check = crate::app::validate_key_name(new_name, &app.keys, None);
+        card = card.push(form_row(
+            "New key name",
+            row![
+                input("e.g. work laptop", new_name, Message::NewKeyNameChanged).width(240),
+                button(text("Create").size(12).font(semibold()))
+                    .padding([4, 10])
+                    .style(style::primary)
+                    .on_press_maybe(name_check.is_ok().then_some(Message::NewKeyCreate)),
+                button(text("Cancel").size(12))
+                    .padding([4, 10])
+                    .style(style::outlined)
+                    .on_press(Message::NewKeyCancel),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ));
+        // Only nag once something was typed — an empty prompt just opened.
+        if let Err(message) = &name_check
+            && !new_name.is_empty()
+        {
+            card = card.push(text(message.clone()).size(12).color(AMBER));
+        }
+    }
     if let Some(key) = config::find_key(&app.keys, &form.auth_key_id) {
         card = card.push(form_row(
             "Public key",
