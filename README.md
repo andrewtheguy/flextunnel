@@ -621,10 +621,10 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
   (running your own iroh relay).
 - [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) — the
-  app-independent Ed25519 key format and tooling adopted by tunnel-rs. A
-  [phase-2 migration](https://github.com/flexaccessdev/flexaccess-keys/blob/main/docs/flextunnel-phase-2.md)
-  will replace flextunnel's current `flxtsecretv1:` / `flxtpubv1:` key-material
-  layer while retaining its product-specific authentication transcript.
+  app-independent Ed25519 key format and tooling adopted by tunnel-rs. A planned
+  migration will replace flextunnel's current `flxtsecretv1:` / `flxtpubv1:`
+  key-material layer while retaining its product-specific authentication
+  transcript.
 - [`docs/architecture.md`](docs/architecture.md) — how it works: connection
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
