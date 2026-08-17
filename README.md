@@ -613,13 +613,18 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 ## Documentation
 
 - [iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture) —
-  the iroh transport layer shared with [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs)
+  the iroh transport layer shared with [tunnel-rs](https://github.com/flexaccessdev/tunnel-rs)
   and [ezvpn](https://github.com/flexaccessdev/ezvpn):
   [relays and address lookup](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md)
   (default vs custom relays, relay hints, the per-relay startup probe, relay auth
   tokens) and
   [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
   (running your own iroh relay).
+- [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) — the
+  app-independent Ed25519 key format and tooling adopted by tunnel-rs. A
+  [phase-2 migration](https://github.com/flexaccessdev/flexaccess-keys/blob/main/docs/flextunnel-phase-2.md)
+  will replace flextunnel's current `flxtsecretv1:` / `flxtpubv1:` key-material
+  layer while retaining its product-specific authentication transcript.
 - [`docs/architecture.md`](docs/architecture.md) — how it works: connection
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference
