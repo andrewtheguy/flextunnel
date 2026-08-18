@@ -56,11 +56,15 @@ XCFRAMEWORK="$DIST/libflextunnel.xcframework"
 mkdir -p "$DIST"
 cp "ios/flextunnel.h" "$DIST/flextunnel.h"
 
+# Where cargo actually put the .a files: honor CARGO_TARGET_DIR (ci/unix/
+# remote.sh redirects the build cache outside the workspace), else ./target.
+TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
+
 echo "Creating libflextunnel.xcframework ..."
 rm -rf "$XCFRAMEWORK"
 xcodebuild -create-xcframework \
-  -library "target/${DEVICE_TARGET}/${OUT_SUBDIR}/libflextunnel.a" -headers "ios" \
-  -library "target/${SIM_TARGET}/${OUT_SUBDIR}/libflextunnel.a"    -headers "ios" \
+  -library "$TARGET_DIR/${DEVICE_TARGET}/${OUT_SUBDIR}/libflextunnel.a" -headers "ios" \
+  -library "$TARGET_DIR/${SIM_TARGET}/${OUT_SUBDIR}/libflextunnel.a"    -headers "ios" \
   -output "$XCFRAMEWORK"
 
 echo "Staged: $XCFRAMEWORK"

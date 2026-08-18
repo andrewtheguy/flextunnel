@@ -8,9 +8,9 @@
 #   ci/unix/remote.sh -H other-box ci     # against a different ssh alias
 #
 # The host is an ssh alias: 'workstation-wsl' (Debian amd64 under WSL2) is the
-# box this was set up against, and any Unix machine with rustup and a C
-# toolchain works the same way. macOS is not run this way — the dev box is a
-# Mac, so `ci/unix/ci.sh` covers that platform natively; see docs/local-ci.md.
+# default, and any Unix machine with rustup and a C toolchain works the same
+# way — including a Mac (e.g. `-H macwork`), which is how the macOS leg runs
+# when the driving machine is not itself a Mac; see docs/local-ci.md.
 # ci/unix/ci.sh is the half that runs over there; it picks the platform's steps
 # itself.
 #
@@ -90,7 +90,8 @@ case $command in
         ;;
 esac
 
-archive=$(mktemp -t flextunnel-unixci).tgz
+# A full template rather than -t: BSD and GNU mktemp disagree on what -t means.
+archive=$(mktemp "${TMPDIR:-/tmp}/flextunnel-unixci.XXXXXX").tgz
 # Per-run, so two invocations cannot land on each other's upload in the shared
 # login home directory.
 remote_archive="flextunnel-unixci-src-$$.tgz"
@@ -113,9 +114,11 @@ cleanup() {
 trap cleanup EXIT
 
 info "packing $(basename "$project_root")"
-# -L for parity with the Windows driver: what lands on the far end is the same
-# tree either way, symlinks (AGENTS.md -> CLAUDE.md) resolved.
-tar -C "$project_root" -L \
+# --dereference for parity with the Windows driver: what lands on the far end
+# is the same tree either way, symlinks (AGENTS.md -> CLAUDE.md) resolved. The
+# long spelling because BSD tar's -L is GNU tar's -h, and the driver may be
+# either.
+tar -C "$project_root" --dereference \
     --exclude=./target --exclude=./dist --exclude=./tmp --exclude=./.git \
     -czf "$archive" .
 

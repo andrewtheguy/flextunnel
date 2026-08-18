@@ -91,7 +91,8 @@ case $command in
         ;;
 esac
 
-archive=$(mktemp -t flextunnel-winci).tgz
+# A full template rather than -t: BSD and GNU mktemp disagree on what -t means.
+archive=$(mktemp "${TMPDIR:-/tmp}/flextunnel-winci.XXXXXX").tgz
 # Per-run, so two invocations cannot land on each other's upload in the shared
 # login home directory.
 remote_archive="flextunnel-winci-src-$$.tgz"
@@ -115,10 +116,11 @@ cleanup() {
 trap cleanup EXIT
 
 info "packing $(basename "$project_root")"
-# -L: ship symlinks (AGENTS.md -> CLAUDE.md) as regular files — cmd.exe's tar on
-# the VM cannot recreate them, and a Windows checkout would have materialized
-# them as files anyway.
-tar -C "$project_root" -L \
+# --dereference: ship symlinks (AGENTS.md -> CLAUDE.md) as regular files —
+# cmd.exe's tar on the VM cannot recreate them, and a Windows checkout would
+# have materialized them as files anyway. The long spelling because BSD tar's
+# -L is GNU tar's -h, and the driver may be either.
+tar -C "$project_root" --dereference \
     --exclude=./target --exclude=./dist --exclude=./tmp --exclude=./.git \
     -czf "$archive" .
 

@@ -11,16 +11,23 @@ entirely on Linux. So a change that compiles here can still fail there.
 changes included — so a platform-specific failure can be found without pushing a
 branch and waiting.
 
-| Platform | Machine | Entry point |
-| --- | --- | --- |
-| macOS | this one, natively | `ci/unix/ci.sh` |
-| Linux | `workstation-wsl` (Debian amd64 under WSL2) | `ci/unix/remote.sh` |
-| Windows | `winsandbox` (Windows Server 2025 VM) | `ci/windows/remote.sh` |
+Any of the machines can be the driver. The platform you are on runs natively
+(`ci/unix/ci.sh` picks its own platform's steps); the other two are reached
+over ssh by alias, each with an override for pointing at a different machine:
+
+| Platform | Default ssh alias | Override | Entry point |
+| --- | --- | --- | --- |
+| macOS | `macwork` | `FLEXTUNNEL_MACCI_HOST`, or `ci/unix/remote.sh -H <host>` | `ci/unix/ci.sh` natively on a Mac, `ci/unix/remote.sh` otherwise |
+| Linux | `workstation-wsl` | `FLEXTUNNEL_UNIXCI_HOST`, or `-H` | `ci/unix/ci.sh` natively on Linux, `ci/unix/remote.sh` otherwise |
+| Windows | `winsandbox` | `FLEXTUNNEL_WINCI_HOST` | `ci/windows/remote.sh` |
 
 ```sh
 ci/all.sh                  # all three, concurrently
 ci/all.sh linux windows    # only these
 ```
+
+`ci/all.sh` decides native-vs-remote itself from `uname`, so the same command
+works from a Mac or a Linux box.
 
 `ci/all.sh` captures each platform's output and replays it in full once
 everything has finished — three machines writing to one terminal at once would
@@ -34,7 +41,8 @@ Each remote platform is two scripts, and the split is the point:
 - `ci/unix/ci.sh` and `ci/windows/ci.ps1` run **natively on the far end**. They
   are the workflow's steps, in the same order, with the same flags. They install
   nothing and change no machine state, so either can also be run directly on a
-  dev box — `ci/unix/ci.sh` *is* the macOS row of the table above.
+  dev box — running `ci/unix/ci.sh` on the machine you are sitting at *is* that
+  machine's row of the table above.
 - `ci/unix/remote.sh` and `ci/windows/remote.sh` run **here**. They pack the
   working tree, ship it over ssh, and invoke the script above.
 
@@ -51,7 +59,9 @@ ci/unix/remote.sh clean      # drop the machine's cargo target cache
 ```
 
 `ci/unix/remote.sh -H some-other-host` points the Unix driver at a different ssh
-alias; any Unix machine with rustup and a C toolchain works.
+alias; any Unix machine with rustup and a C toolchain works — including a Mac,
+which is how the macOS leg runs when the driver is not itself a Mac (the iOS
+step additionally needs Xcode on that machine).
 
 ## What runs where
 
@@ -85,7 +95,7 @@ there and still being compiled), while `CARGO_TARGET_DIR` points *outside* the
 workspace so the build cache survives the swap. That is what makes a warm run
 fast and a cold one slow.
 
-| | Linux (`workstation-wsl`) | Windows (`winsandbox`) |
+| | Unix remotes (`workstation-wsl`, `macwork`, …) | Windows (`winsandbox`) |
 | --- | --- | --- |
 | workspace | `~/codes/staging-area/flextunnel` | `C:\ci-workspaces\flextunnel` |
 | build cache | `~/codes/staging-area/flextunnel-cargo-target` | `C:\ci-cache\flextunnel-target` |
@@ -105,7 +115,12 @@ lock — the cache it drops is the one a concurrent run would be compiling into.
 If a run is killed hard enough to skip the release, the next one says so and
 prints the command to clear the lock.
 
-## The two machines
+## The machines
+
+These are the machines the default aliases point at; any equivalently equipped
+machine works through the overrides above. The macOS leg has no dedicated CI
+box — it is a Mac dev machine, run natively when it is the driver and over
+`ci/unix/remote.sh` (default alias `macwork`) when it is not.
 
 **`workstation-wsl`** is a Debian install under WSL2, reached by the ssh alias of
 that name. It needs rustup (with clippy) and a C toolchain and nothing else —
@@ -123,8 +138,8 @@ sshd captures its environment when the service starts, so a machine-scoped
 and the guest needs a page file, or parallel `rustc` processes exhaust the commit
 limit and fail with what looks like a corrupted toolchain.
 
-The Windows driver is bash rather than PowerShell because the machine driving it
-is the Mac. The far end is still `cmd.exe`, so remote paths are kept free of
+The Windows driver is bash rather than PowerShell because the driving machine is
+always a Unix box. The far end is still `cmd.exe`, so remote paths are kept free of
 spaces and quotes and are validated against that shape before use — they get
 interpolated into command lines that include `rmdir /s /q`.
 
@@ -141,5 +156,5 @@ Worth knowing before trusting a green run:
   also runs as Administrator, which CI does not.
 - **Linux is WSL2, not a GitHub Ubuntu runner** — a different kernel, and a
   Debian userland rather than Ubuntu.
-- **macOS is this dev box**, with your Xcode, your keychain and your logged-in
+- **macOS is a dev box**, with its Xcode, its keychain and its logged-in
   GUI session — the closest of the three to its runner and still not it.
