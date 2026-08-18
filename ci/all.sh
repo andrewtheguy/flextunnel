@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Run the whole of .github/workflows/ci.yml locally, across the three machines
-# that stand in for its three runners:
+# that stand in for its three runners. The platform this script runs on is done
+# natively (ci/unix/ci.sh picks its own platform's steps); the other two go
+# over ssh:
 #
-#   mac      this machine, natively            ci/unix/ci.sh
-#   linux    the 'workstation-wsl' ssh alias   ci/unix/remote.sh
-#   windows  the 'winsandbox' ssh alias        ci/windows/remote.sh
+#   mac      natively on a Mac, else the FLEXTUNNEL_MACCI_HOST alias
+#            (default 'macwork')                ci/unix/{ci,remote}.sh
+#   linux    natively on Linux, else the FLEXTUNNEL_UNIXCI_HOST alias
+#            (default 'workstation-wsl')        ci/unix/{ci,remote}.sh
+#   windows  the FLEXTUNNEL_WINCI_HOST alias
+#            (default 'winsandbox')             ci/windows/remote.sh
 #
 #   ci/all.sh                  # all three
 #   ci/all.sh linux windows    # only these
@@ -26,15 +31,22 @@ for job in "${jobs[@]}"; do
     case $job in mac|linux|windows) ;; *) usage ;; esac
 done
 
+native=$(uname -s)
+
 run_job() {
     case $1 in
-        mac)     ./ci/unix/ci.sh ;;
-        linux)   ./ci/unix/remote.sh ci ;;
+        mac)
+            if [ "$native" = Darwin ]; then ./ci/unix/ci.sh
+            else ./ci/unix/remote.sh -H "${FLEXTUNNEL_MACCI_HOST:-macwork}" ci; fi ;;
+        linux)
+            if [ "$native" = Linux ]; then ./ci/unix/ci.sh
+            else ./ci/unix/remote.sh ci; fi ;;
         windows) ./ci/windows/remote.sh ci ;;
     esac
 }
 
-logdir=$(mktemp -d -t flextunnel-ci)
+# A full template rather than -t: BSD and GNU mktemp disagree on what -t means.
+logdir=$(mktemp -d "${TMPDIR:-/tmp}/flextunnel-ci.XXXXXX")
 trap 'rm -rf "$logdir"' EXIT
 
 echo "[ci] starting: ${jobs[*]}"

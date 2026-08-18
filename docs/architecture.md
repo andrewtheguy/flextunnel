@@ -39,9 +39,9 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | client keypair auth (ed25519): age-style key generation/parsing (`flxtpubv1:`/`flxtsecretv1:`), ssh-style authorized-keys file loading, endpoint-id-bound sign/verify |
+| `auth.rs` | client keypair auth (ed25519): endpoint-id-bound sign/verify over flextunnel's domain-separated transcript; key format, key files, and authorized-keys parsing (`ed25519-pub:`/`ed25519-sec:`) are delegated to the shared [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) crate |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
-| `secret.rs` | key-management commands: iroh identity keys (`generate-iroh-key`/`show-iroh-id`) and client auth keypairs (`generate-auth-private-key`/`show-auth-public-key`) |
+| `secret.rs` | iroh identity key commands (`generate-iroh-key`/`show-iroh-id`); client auth keypairs are generated with the standalone `flexaccess-keys` CLI |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
 | `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients) |
@@ -87,7 +87,7 @@ handshake authenticates it. An empty set disables its ALPN entirely (a normal
 server rejects every quick dial; a no-bridging server rejects every bridge).
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 12`. On the first bi-stream a
+The protocol version is `PROTOCOL_VERSION = 13`. On the first bi-stream a
 client sends
 `Hello { version, auth?, client_instance_nonce, duplicate_server_observed }`
 where `auth` is `ClientAuthPayload { public_key, endpoint_id, signature }`
@@ -255,10 +255,15 @@ servers started with the same identity, blocking the conflicted id and refusing 
 self-blocked server's restart. These are guard rails for operators, not adversary
 defenses.
 
-- **Credentials:** client keypairs are ed25519 — the public key travels as
-  `flxtpubv1:` + base64url, the secret as `flxtsecretv1:` +
-  base64url — verified in the handshake via a signature bound to the
-  connection's endpoint id. Bridges and quick-mode clients
+- **Credentials:** client keypairs are ed25519 in the shared
+  [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format —
+  the public key travels as `ed25519-pub:` + base64url, the secret as
+  `ed25519-sec:` + base64url — verified in the handshake via a signature bound
+  to the connection's endpoint id under a flextunnel-specific
+  domain-separation context. That context is what rejects a signature produced
+  for another FlexAccess app — cross-app isolation holds because each app signs
+  under its own distinct context, not because the shared library enforces
+  anything about how applications use the keys. Bridges and quick-mode clients
   carry no keypair: their credential is their TLS-authenticated endpoint id,
   checked natively against the matching allowlist — `allowed_bridge_servers`,
   or the single client id entered on a quick server (the `authorized_keys`
@@ -295,7 +300,7 @@ defenses.
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
-| `PROTOCOL_VERSION` | 11 | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 13 | `proxy/signaling.rs` |
 | client key encoding | ed25519, base64url (32-byte keys, 64-byte sigs) | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 | `BRIDGE_ALPN` | `flextunnel-bridge/1` | `transport/mod.rs` |

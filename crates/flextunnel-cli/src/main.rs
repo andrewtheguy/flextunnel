@@ -87,34 +87,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Generate a client auth keypair (age-style key file). Share the printed
-    /// PUBLIC key with the server operator (it goes on the server's
-    /// authorized_keys_file); the secret stays on the client.
-    GenerateAuthPrivateKey {
-        /// Path where to save the key file. Defaults to stdout ("-").
-        #[arg(short, long, default_value = "-")]
-        output: PathBuf,
-        /// Overwrite existing file if it exists.
-        #[arg(long)]
-        force: bool,
-        /// Print machine-readable JSON to stdout (for automation).
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show the auth public key derived from an auth private key.
-    #[command(arg_required_else_help = true)]
-    ShowAuthPublicKey {
-        /// Inline client secret key (`flxtsecretv1:...`).
-        #[arg(long, conflicts_with = "auth_key_file")]
-        auth_key: Option<String>,
-        /// File containing the client secret key (from `flextunnel
-        /// generate-auth-private-key`).
-        #[arg(long)]
-        auth_key_file: Option<PathBuf>,
-        /// Print machine-readable JSON to stdout (for automation).
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -135,7 +107,7 @@ enum ServerAction {
         #[arg(long)]
         secret_file: Option<PathBuf>,
         /// File of authorized client public keys (ssh authorized_keys style:
-        /// one `flxtpubv1:...` per line, optional trailing comment).
+        /// one `ed25519-pub:...` per line, optional trailing comment).
         #[arg(long)]
         authorized_keys_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
@@ -185,12 +157,12 @@ enum ClientAction {
         /// EndpointId of the server to connect to.
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
-        /// Inline client secret key (`flxtsecretv1:...`) used to
+        /// Inline client secret key (`ed25519-sec:...`) used to
         /// authenticate to the server.
         #[arg(long, conflicts_with = "auth_key_file")]
         auth_key: Option<String>,
-        /// File containing the client secret key (from `flextunnel
-        /// generate-auth-private-key`).
+        /// File containing the client secret key (from `flexaccess-keys
+        /// generate-auth-key`).
         #[arg(long)]
         auth_key_file: Option<PathBuf>,
         /// Custom relay server URL(s) for failover (repeatable).
@@ -255,7 +227,7 @@ mod cli_tests {
             "--server-node-id",
             "server-id",
             "--auth-key",
-            "flxtsecretv1:XXXX",
+            "ed25519-sec:XXXX",
         ])
         .unwrap_or_else(|error| panic!("client start should parse: {error}"));
 
@@ -355,7 +327,7 @@ mod cli_tests {
             vec!["flextunnel", "client", "start", "--quick", "-c", "client.toml"],
             // Quick mode has no keypair auth at all (the credential is the
             // client's endpoint id), so key flags are rejected too.
-            vec!["flextunnel", "client", "start", "--quick", "--auth-key", "flxtsecretv1:X"],
+            vec!["flextunnel", "client", "start", "--quick", "--auth-key", "ed25519-sec:X"],
             vec!["flextunnel", "client", "start", "--quick", "--auth-key-file", "c.key"],
         ];
         for case in cases {
@@ -454,14 +426,6 @@ fn main() -> Result<()> {
             let r = config::resolve_server(cli, file)?;
             secret::show_iroh_id(r.secret_file.as_deref(), json)
         }
-        Command::GenerateAuthPrivateKey { output, force, json } => {
-            secret::generate_auth_private_key(output, force, json)
-        }
-        Command::ShowAuthPublicKey {
-            auth_key,
-            auth_key_file,
-            json,
-        } => secret::show_auth_public_key(auth_key.as_deref(), auth_key_file.as_deref(), json),
         command => app::build_runtime()?.block_on(run_async(command)),
     }
 }
@@ -697,13 +661,14 @@ async fn run_server(
     let authorized_keys = match &r.authorized_keys_file {
         Some(path) => auth::load_authorized_keys(path)
             .context("Failed to load the authorized client keys")?,
-        None => std::collections::HashSet::new(),
+        None => Default::default(),
     };
     if authorized_keys.is_empty() && quick.is_none() {
         anyhow::bail!(
             "The server requires at least one authorized client public key.\n\
-             Each client generates a keypair with: flextunnel generate-auth-private-key -o <FILE>\n\
-             Put the printed public keys (one `flxtpubv1:...` per line) in a file and \
+             Each client generates a keypair with: flexaccess-keys generate-auth-key -o <FILE>\n\
+             Put each key's authorized-key entry (one `ed25519-pub:...` per line, from \
+             `flexaccess-keys show-auth-key --private-key-file <FILE>`) in a file and \
              pass --authorized-keys-file <FILE> or set authorized_keys_file in the config."
         );
     }

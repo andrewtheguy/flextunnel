@@ -233,7 +233,11 @@ pub fn load_secret(path: &Path) -> Result<SecretKey> {
     let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
     // Key files carry `# created:` / `# public key:` comments above the secret;
     // the first meaningful line is the base64 secret itself.
-    let Some((_, line)) = crate::auth::meaningful_lines(&content).next() else {
+    let Some(line) = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+    else {
         anyhow::bail!(
             "No secret key found in {} (only blank lines or `#` comments)",
             path.display()

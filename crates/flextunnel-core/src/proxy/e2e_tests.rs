@@ -41,6 +41,15 @@ fn test_client_key() -> &'static crate::auth::ClientKey {
     KEY.get_or_init(crate::auth::ClientKey::generate)
 }
 
+/// An authorized-keys set holding only [`test_client_key`]'s public half.
+fn test_authorized_keys() -> crate::auth::AuthorizedKeys {
+    flexaccess_keys::parse_authorized_key_entries(
+        &[test_client_key().public_str()],
+        "e2e_tests",
+    )
+    .unwrap()
+}
+
 /// A valid signed auth payload for `ep` (binding its own endpoint id), signed
 /// with [`test_client_key`].
 fn test_auth_payload(ep: &Endpoint) -> signaling::ClientAuthPayload {
@@ -153,7 +162,7 @@ fn spawn_server_dns(
     let dns_forwarder = DnsForwarder::new(&dns_forwards).unwrap();
     let server = ProxyServer::new(ProxyServerParams {
         own_id,
-        authorized_keys: HashSet::from([test_client_key().public_key()]),
+        authorized_keys: test_authorized_keys(),
         allowed_bridge_servers: HashSet::new(),
         host_aliases,
         routed_set: RoutedSet::new(&routed_domains, &no_cidrs).unwrap(),
@@ -181,7 +190,7 @@ fn spawn_server_dns(
 fn base_params(own_id: iroh::EndpointId, blocklist_path: std::path::PathBuf) -> ProxyServerParams {
     ProxyServerParams {
         own_id,
-        authorized_keys: HashSet::from([test_client_key().public_key()]),
+        authorized_keys: test_authorized_keys(),
         allowed_bridge_servers: HashSet::new(),
         host_aliases: HashMap::new(),
         routed_set: RoutedSet::default(),
@@ -977,7 +986,7 @@ async fn quick_client_authenticates_by_endpoint_id() {
     .await;
     let server_addr = EndpointAddr::new(server_ep.id()).with_ip_addr(server_ep.bound_sockets()[0]);
     let mut params = base_params(server_ep.id(), temp_blocklist("quickok"));
-    params.authorized_keys = HashSet::new(); // a quick server has no client keys at all
+    params.authorized_keys = Default::default(); // a quick server has no client keys at all
     params.routed_set = routed_set;
     params.routed_cidrs = cidrs;
     spawn_server_params(server_ep, params);

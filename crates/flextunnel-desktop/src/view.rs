@@ -1176,7 +1176,7 @@ fn key_form_view<'a>(app: &'a App, form: &'a KeyForm) -> Element<'a, Message> {
     // and is always shown unmasked (it's what goes on the server's
     // authorized-keys file).
     let secret = row![
-        input("flxtsecretv1:…", &form.secret, Message::KeySecretChanged)
+        input("ed25519-sec:…", &form.secret, Message::KeySecretChanged)
             .secure(true)
             .width(240),
         button(text("Generate").size(12))

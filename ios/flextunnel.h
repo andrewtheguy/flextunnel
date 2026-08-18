@@ -46,8 +46,8 @@ void flextunnel_init_logging(void);
 
 /*
  * Generate a fresh client authentication keypair. Writes
- *   {"created":"<UTC>","public_key":"flxtpubv1:...",
- *    "secret_key":"flxtsecretv1:..."}
+ *   {"created":"<UTC>","public_key":"ed25519-pub:...",
+ *    "secret_key":"ed25519-sec:..."}
  * to out_buf. Store the secret key in the keychain; show the public key (never
  * a secret) for the user to put on the server's authorized-keys file.
  * Returns 1 on success, 0 if out_buf is too small.
@@ -55,7 +55,7 @@ void flextunnel_init_logging(void);
 int flextunnel_generate_client_key(char *out_buf, size_t out_len);
 
 /*
- * Derive the public key ("flxtpubv1:...") of a stored secret key, so the
+ * Derive the public key ("ed25519-pub:...") of a stored secret key, so the
  * app can display it unmasked without persisting it separately. On success
  * writes the public key to out_buf and returns 1. For an invalid secret it
  * writes an error message and returns 0. If out_buf is too small it also
@@ -69,10 +69,10 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  * loopback SOCKS5 listener, and spawn the connect/auth/serve loop.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
- *   {"server_node_id":"<id>","auth_key":"flxtsecretv1:...",
+ *   {"server_node_id":"<id>","auth_key":"ed25519-sec:...",
  *    "socks_port":0,"relay_urls":[],"relay_auth_token":null}
  *   auth_key is this client's secret key (from flextunnel_generate_client_key
- *   or `flextunnel generate-auth-private-key`); its public half must be on the
+ *   or `flexaccess-keys generate-auth-key`); its public half must be on the
  *   server's authorized_keys_file.
  *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
  *   OS-assigned port (read it from the result JSON). relay_auth_token is

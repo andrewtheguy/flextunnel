@@ -16,6 +16,10 @@
 // a version skew against the one the core is built with.
 pub use iroh;
 
+// Same for the shared FlexAccess key crate (`ed25519-sec:` / `ed25519-pub:`
+// tokens, key files, authorized-keys parsing) that `auth` builds on.
+pub use flexaccess_keys;
+
 pub mod app;
 pub mod auth;
 pub mod blocklist;

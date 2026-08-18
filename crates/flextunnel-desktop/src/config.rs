@@ -618,7 +618,7 @@ mod tests {
         AuthKey {
             id: "key1".into(),
             name: "work laptop".into(),
-            public_key: "flxtpubv1:abc".into(),
+            public_key: "ed25519-pub:abc".into(),
             // Distinctive sentinel so the leak-check assertions match the
             // secret *value* and don't collide with field names.
             secret: "ftc-secret-authtok".into(),
@@ -670,7 +670,7 @@ mod tests {
         assert!(!json.contains("ftc-secret-authtok"), "secret leaked: {json}");
         // The non-secret halves of the key persist, as does the profile's
         // reference to it.
-        assert!(json.contains("flxtpubv1:abc"), "public key dropped: {json}");
+        assert!(json.contains("ed25519-pub:abc"), "public key dropped: {json}");
         assert!(json.contains("\"auth_key_id\":\"key1\""), "reference dropped: {json}");
         // `enabled` is runtime-only on forwards and must not leak either.
         assert!(!json.contains("enabled"), "enabled leaked: {json}");
@@ -741,25 +741,25 @@ mod tests {
         let a = key();
         let mut same_id = key();
         same_id.name = "other".into();
-        same_id.public_key = "flxtpubv1:other".into();
+        same_id.public_key = "ed25519-pub:other".into();
         let mut same_name = key();
         same_name.id = "key2".into();
-        same_name.public_key = "flxtpubv1:def".into();
+        same_name.public_key = "ed25519-pub:def".into();
         let mut same_public = key();
         same_public.id = "key3".into();
         same_public.name = "same pubkey".into();
         let mut bad_name = key();
         bad_name.id = "key4".into();
         bad_name.name = " padded ".into();
-        bad_name.public_key = "flxtpubv1:ghi".into();
+        bad_name.public_key = "ed25519-pub:ghi".into();
         let mut empty_id = key();
         empty_id.id = String::new();
         empty_id.name = "no id".into();
-        empty_id.public_key = "flxtpubv1:mno".into();
+        empty_id.public_key = "ed25519-pub:mno".into();
         let mut unique = key();
         unique.id = "key5".into();
         unique.name = "home".into();
-        unique.public_key = "flxtpubv1:jkl".into();
+        unique.public_key = "ed25519-pub:jkl".into();
 
         let kept = drop_invalid_keys(vec![
             a.clone(),
