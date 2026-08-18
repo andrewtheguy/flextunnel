@@ -34,7 +34,8 @@ server_node_id = "<server endpoint id>"
 
 # This client's authentication keypair — always a key file (generate with
 # `flexaccess-keys generate-auth-key -o ~/.config/flextunnel/client.key`;
-# put its public entry, from `flexaccess-keys show-auth-key`, on the server's
+# put its public entry, from `flexaccess-keys show-auth-key
+# --private-key-file ~/.config/flextunnel/client.key`, on the server's
 # authorized_keys_file). There is no inline variant in the config;
 # `--auth-key` exists only as a CLI flag.
 auth_key_file = "~/.config/flextunnel/client.key"

@@ -668,7 +668,7 @@ async fn run_server(
             "The server requires at least one authorized client public key.\n\
              Each client generates a keypair with: flexaccess-keys generate-auth-key -o <FILE>\n\
              Put each key's authorized-key entry (one `ed25519-pub:...` per line, from \
-             `flexaccess-keys show-auth-key`) in a file and \
+             `flexaccess-keys show-auth-key --private-key-file <FILE>`) in a file and \
              pass --authorized-keys-file <FILE> or set authorized_keys_file in the config."
         );
     }

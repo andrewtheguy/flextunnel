@@ -92,7 +92,9 @@ case $command in
 esac
 
 # A full template rather than -t: BSD and GNU mktemp disagree on what -t means.
-archive=$(mktemp "${TMPDIR:-/tmp}/flextunnel-winci.XXXXXX").tgz
+# No .tgz suffix appended — tar overwrites the file mktemp made, so cleanup
+# removes exactly what was created (an appended suffix would leak the original).
+archive=$(mktemp "${TMPDIR:-/tmp}/flextunnel-winci.XXXXXX")
 # Per-run, so two invocations cannot land on each other's upload in the shared
 # login home directory.
 remote_archive="flextunnel-winci-src-$$.tgz"

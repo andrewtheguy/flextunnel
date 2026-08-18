@@ -102,7 +102,8 @@ fn resolve_client_key(r: &config::ResolvedClient) -> Result<auth::ClientKey> {
              Generate one with: flexaccess-keys generate-auth-key -o <FILE>\n\
              Then pass --auth-key-file <FILE> (or --auth-key <SECRET>), or set \
              auth_key_file/auth_key in the config, and put the key's public half \
-             (`flexaccess-keys show-auth-key`) on the server's authorized_keys_file."
+             (`flexaccess-keys show-auth-key --private-key-file <FILE>`) on the \
+             server's authorized_keys_file."
         )
     }
 }

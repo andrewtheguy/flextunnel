@@ -87,7 +87,7 @@ handshake authenticates it. An empty set disables its ALPN entirely (a normal
 server rejects every quick dial; a no-bridging server rejects every bridge).
 
 ### 2. Auth handshake (control stream)
-The protocol version is `PROTOCOL_VERSION = 12`. On the first bi-stream a
+The protocol version is `PROTOCOL_VERSION = 13`. On the first bi-stream a
 client sends
 `Hello { version, auth?, client_instance_nonce, duplicate_server_observed }`
 where `auth` is `ClientAuthPayload { public_key, endpoint_id, signature }`
@@ -260,8 +260,10 @@ defenses.
   the public key travels as `ed25519-pub:` + base64url, the secret as
   `ed25519-sec:` + base64url — verified in the handshake via a signature bound
   to the connection's endpoint id under a flextunnel-specific
-  domain-separation context (a key shared with another FlexAccess app can
-  never have its signatures accepted across apps). Bridges and quick-mode clients
+  domain-separation context. That context is what rejects a signature produced
+  for another FlexAccess app — cross-app isolation holds because each app signs
+  under its own distinct context, not because the shared library enforces
+  anything about how applications use the keys. Bridges and quick-mode clients
   carry no keypair: their credential is their TLS-authenticated endpoint id,
   checked natively against the matching allowlist — `allowed_bridge_servers`,
   or the single client id entered on a quick server (the `authorized_keys`
@@ -298,7 +300,7 @@ defenses.
 | `MAX_HANDSHAKE_SIZE` | 64 KiB | `proxy/signaling.rs` |
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
-| `PROTOCOL_VERSION` | 11 | `proxy/signaling.rs` |
+| `PROTOCOL_VERSION` | 13 | `proxy/signaling.rs` |
 | client key encoding | ed25519, base64url (32-byte keys, 64-byte sigs) | `auth.rs` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 | `BRIDGE_ALPN` | `flextunnel-bridge/1` | `transport/mod.rs` |

@@ -14,8 +14,11 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// flextunnel protocol version.
-pub const PROTOCOL_VERSION: u16 = 12;
+/// flextunnel protocol version. v13: `Hello.auth.public_key` switched from the
+/// `flxtpubv1:` format to the shared flexaccess-keys `ed25519-pub:` tokens, so
+/// a pre-migration peer is turned away at the version check, before
+/// authentication, instead of failing key parsing.
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Maximum auth-handshake message size (64 KiB). The server's routed set rides
 /// the `HelloResponse`, so this is generous enough for a large operator list.
@@ -579,6 +582,28 @@ mod tests {
         assert!(decoded.host_aliases.is_empty());
         assert!(decoded.dns_forwards.is_empty());
         assert!(decoded.bridges.is_empty());
+    }
+
+    #[test]
+    fn version_mismatch_is_rejected_before_auth() {
+        // A pre-migration (v12, `flxtpubv1:` keys) peer must be rejected at the
+        // version check — decode fails before any credential is even looked at,
+        // on both directions of the handshake.
+        let mut old = Hello::new(
+            Some(ClientAuthPayload {
+                public_key: "flxtpubv1:abc".to_string(),
+                endpoint_id: "endpointid".to_string(),
+                signature: "sig".to_string(),
+            }),
+            7,
+        );
+        old.version = 12;
+        let err = decode_hello(&serde_json::to_vec(&old).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Unsupported protocol version: 12"));
+
+        let mut resp = HelloResponse::rejected(7, "nope");
+        resp.version = 12;
+        assert!(decode_hello_response(&serde_json::to_vec(&resp).unwrap()).is_err());
     }
 
     #[test]
