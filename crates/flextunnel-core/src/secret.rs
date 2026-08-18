@@ -1,6 +1,7 @@
-//! Key-management commands: iroh identity keys (`generate-iroh-key` /
-//! `show-iroh-id`) and client auth keypairs (`generate-auth-private-key` /
-//! `show-auth-public-key`).
+//! Iroh identity key commands (`generate-iroh-key` / `show-iroh-id`).
+//!
+//! Client auth keypairs are not managed here: generate them with the
+//! standalone `flexaccess-keys` CLI (see [`crate::auth`]).
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -101,7 +102,7 @@ pub fn generate_iroh_key(output: PathBuf, force: bool, json: bool) -> Result<()>
     let secret = SecretKey::generate();
     let secret_base64 = BASE64.encode(secret.to_bytes());
     let endpoint_id = secret_to_endpoint_id(&secret);
-    let created = crate::auth::utc_timestamp();
+    let created = flexaccess_keys::rfc3339_utc(std::time::SystemTime::now());
     let contents = format!("# created: {created}\n# public key: {endpoint_id}\n{secret_base64}\n");
     if output.as_os_str() == std::ffi::OsStr::new("-") {
         // Print the whole key file (comments + secret) to stdout, or one JSON
@@ -132,78 +133,6 @@ pub fn generate_iroh_key(output: PathBuf, force: bool, json: bool) -> Result<()>
         format!("EndpointId: {}", endpoint_id)
     };
     write_secret_to_output(&output, &contents, &public_info, force, "Iroh key")
-}
-
-/// Generate a new client authentication keypair (see [`crate::auth`]) as an
-/// age-style key file, printing the public key to share with the server
-/// operator. With `json`, everything printed to stdout is a single JSON object
-/// (for QA automation): created timestamp and public key, plus either the
-/// written file path or, for `-`, the secret key itself.
-pub fn generate_auth_private_key(output: PathBuf, force: bool, json: bool) -> Result<()> {
-    let key = crate::auth::ClientKey::generate();
-    let created = crate::auth::utc_timestamp();
-    let contents = key.to_key_file(&created);
-    if output.as_os_str() == std::ffi::OsStr::new("-") {
-        // Print the whole key file (comments + secret) to stdout, or one JSON
-        // object carrying the same fields. No separate public-key line — the
-        // `# public key:` comment already shows it.
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "created": created,
-                    "public_key": key.public_str(),
-                    "secret_key": key.secret_str(),
-                })
-            );
-        } else {
-            print!("{contents}");
-        }
-        return Ok(());
-    }
-    let public_info = if json {
-        serde_json::json!({
-            "created": created,
-            "public_key": key.public_str(),
-            "secret_file": output.display().to_string(),
-        })
-        .to_string()
-    } else {
-        format!("Public key: {}", key.public_str())
-    };
-    write_secret_to_output(&output, &contents, &public_info, force, "Auth private key")
-}
-
-/// Show the auth public key (`flxtpubv1:...`) for a client auth secret
-/// resolved from an inline `auth_key` or an `auth_key_file`, exactly one of
-/// which must be provided. With `json`, prints a single JSON object instead
-/// (for QA automation).
-pub fn show_auth_public_key(
-    auth_key: Option<&str>,
-    auth_key_file: Option<&Path>,
-    json: bool,
-) -> Result<()> {
-    let key = match (auth_key, auth_key_file) {
-        (Some(_), Some(_)) => {
-            anyhow::bail!("Provide only one of auth_key or auth_key_file, not both")
-        }
-        (Some(s), None) => {
-            crate::auth::ClientKey::from_secret_str(s.trim()).context("Invalid client secret key")?
-        }
-        (None, Some(path)) => crate::auth::load_client_key_from_file(path)
-            .context("Failed to load the client key file")?,
-        (None, None) => anyhow::bail!(
-            "No auth private key given.\n\
-             Pass --auth-key-file <KEY FILE> or --auth-key <SECRET>.\n\
-             Generate one with: flextunnel generate-auth-private-key"
-        ),
-    };
-    if json {
-        println!("{}", serde_json::json!({ "public_key": key.public_str() }));
-    } else {
-        println!("{}", key.public_str());
-    }
-    Ok(())
 }
 
 /// Resolve a server secret key from its key file — the only source for a

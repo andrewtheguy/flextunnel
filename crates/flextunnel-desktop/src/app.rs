@@ -434,7 +434,7 @@ impl KeyForm {
         let secret = self.secret.trim();
         if secret.is_empty() {
             return Err(
-                "Secret key is required (generate one, or paste a flxtsecretv1: key)".into(),
+                "Secret key is required (generate one, or paste an ed25519-sec: key)".into(),
             );
         }
         let client_key = flextunnel_core::auth::ClientKey::from_secret_str(secret)
@@ -1564,8 +1564,8 @@ mod tests {
         vec![AuthKey {
             id: "k1".into(),
             name: "work laptop".into(),
-            public_key: "flxtpubv1:abc".into(),
-            secret: "flxtsecretv1:xyz".into(),
+            public_key: "ed25519-pub:abc".into(),
+            secret: "ed25519-sec:xyz".into(),
         }]
     }
 

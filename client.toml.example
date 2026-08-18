@@ -33,9 +33,10 @@ server_node_id = "<server endpoint id>"
 # http_port = 8081
 
 # This client's authentication keypair — always a key file (generate with
-# `flextunnel generate-auth-private-key -o ~/.config/flextunnel/client.key`;
-# put the printed PUBLIC key on the server's authorized_keys_file). There is
-# no inline variant in the config; `--auth-key` exists only as a CLI flag.
+# `flexaccess-keys generate-auth-key -o ~/.config/flextunnel/client.key`;
+# put its public entry, from `flexaccess-keys show-auth-key`, on the server's
+# authorized_keys_file). There is no inline variant in the config;
+# `--auth-key` exists only as a CLI flag.
 auth_key_file = "~/.config/flextunnel/client.key"
 
 # Optional iroh tuning and reconnect behavior.

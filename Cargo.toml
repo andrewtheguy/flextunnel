@@ -21,6 +21,10 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 env_logger = "0.11"
+# Shared FlexAccess auth key format (`ed25519-sec:` / `ed25519-pub:` tokens,
+# key files, authorized-keys parsing). Key generation is the standalone
+# `flexaccess-keys` CLI; this library only parses, signs, and verifies.
+flexaccess-keys = { git = "https://github.com/flexaccessdev/flexaccess-keys", tag = "v0.0.2", default-features = false }
 futures = "0.3"
 ipnetwork = "0.21"
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }

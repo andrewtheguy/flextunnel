@@ -127,9 +127,9 @@ pub struct ProxyServer {
     /// server instances that share this identity — how a duplicate server is
     /// detected client-side.
     server_instance_nonce: u128,
-    /// Authorized **client** public keys (`flxtpubv1:`), loaded from the
+    /// Authorized **client** public keys (`ed25519-pub:`), loaded from the
     /// server's authorized-keys file at startup.
-    authorized_keys: HashSet<iroh::PublicKey>,
+    authorized_keys: crate::auth::AuthorizedKeys,
     /// Endpoint ids of servers allowed to bridge into this server, mirrored
     /// here for the status page only. Enforcement is native: the endpoint's
     /// `AllowlistHook` rejects a non-allowlisted bridge at the TLS
@@ -174,7 +174,7 @@ pub struct ProxyServer {
 /// same-typed collections can't be swapped positionally.
 pub struct ProxyServerParams {
     pub own_id: EndpointId,
-    pub authorized_keys: HashSet<iroh::PublicKey>,
+    pub authorized_keys: crate::auth::AuthorizedKeys,
     /// For the status page's inbound-bridge list only; enforcement lives in
     /// the endpoint's `AllowlistHook` (see `create_server_endpoint`).
     pub allowed_bridge_servers: HashSet<EndpointId>,
@@ -469,7 +469,7 @@ impl ProxyServer {
             );
             return false;
         }
-        let public = match crate::auth::parse_public_key(&auth.public_key) {
+        let public = match auth.public_key.parse::<flexaccess_keys::PublicKey>() {
             Ok(public) => public,
             Err(e) => {
                 log::warn!("Client {remote_id} sent an invalid public key: {e}");

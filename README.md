@@ -57,8 +57,9 @@ defense).
 
 A per-client ed25519 keypair gates every connection:
 
-- **Client keypair** — each client generates an age-style keypair
-  (`flextunnel generate-auth-private-key`); the server keeps the public keys in an
+- **Client keypair** — each client generates a keypair in the shared
+  [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format
+  (`flexaccess-keys generate-auth-key`); the server keeps the public keys in an
   ssh-style authorized-keys file. In the handshake the client sends its public
   key, its (ephemeral) iroh endpoint id, and a signature over that id; the
   server accepts only if the claimed id matches the connection's
@@ -205,24 +206,33 @@ Docker, use `./build-linux.sh`.
 ```sh
 flextunnel generate-iroh-key -o server.key   # prints the server's EndpointId
 flextunnel show-iroh-id --secret-file server.key   # re-print the EndpointId
+```
 
-# On each client machine: generate that client's keypair (age-style file).
-flextunnel generate-auth-private-key -o client.key   # prints the PUBLIC key
-flextunnel show-auth-public-key --auth-key-file client.key   # re-print it
+Client authentication keys are managed by the standalone
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI;
+install it with its one-line installer
+(`curl -sSL https://flexaccessdev.github.io/flexaccess-keys/install.sh | bash`,
+Windows: `irm https://flexaccessdev.github.io/flexaccess-keys/install.ps1 | iex`):
+
+```sh
+# On each client machine: generate that client's keypair, then derive its
+# public authorized-key entry. Send only the public entry to the server admin.
+flexaccess-keys generate-auth-key "alice laptop" -o client.key
+flexaccess-keys show-auth-key --private-key-file client.key
 ```
 
 Without `-o`, the generate commands print the key file to stdout instead.
 Keep `server.key` and each `client.key` private (written `0600` on Unix; both
-key files carry `# created:` / `# public key:` comments). Share
+key files carry `# Created:` / `# Public key:` comments). Share
 the server's **EndpointId** with clients, and collect each client's printed
-**public key** (`flxtpubv1:…` — not a secret) into the server's
+**authorized-key entry** (`ed25519-pub:…` — not a secret) into the server's
 authorized-keys file, one per line with an optional trailing comment, ssh
 `authorized_keys` style:
 
 ```text
 # ./authorized_keys
-flxtpubv1:XXXXXXXX alice laptop
-flxtpubv1:YYYYYYYY build server
+ed25519-pub:XXXXXXXX alice laptop
+ed25519-pub:YYYYYYYY build server
 ```
 
 All commands above accept `--json` for machine-readable output (QA automation).
@@ -377,8 +387,10 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `client help` | Show the client subcommands and their help. |
 | `generate-iroh-key [-o <FILE>] [--force] [--json]` | Generate the server's iroh identity key (stdout without `-o`). |
 | `show-iroh-id --secret-file <FILE> [--json]` | Print the iroh id (EndpointId) for a key. |
-| `generate-auth-private-key [-o <FILE>] [--force] [--json]` | Generate a client auth keypair (age-style file, stdout without `-o`); prints the public key. |
-| `show-auth-public-key --auth-key-file <FILE> [--json]` | Print the auth public key for a private key (or `--auth-key <SECRET>`). |
+
+Client auth keypairs are generated with the standalone
+[`flexaccess-keys`](https://github.com/flexaccessdev/flexaccess-keys) CLI
+(`generate-auth-key` / `show-auth-key`), not by `flextunnel` itself.
 
 ### `server start`
 
@@ -387,7 +399,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `-c, --config <FILE>` | Load options from a TOML file (CLI flags override it). |
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
-| `--authorized-keys-file <FILE>` | File of authorized client public keys, one `flxtpubv1:…` per line (optional trailing comment, ssh `authorized_keys` style). |
+| `--authorized-keys-file <FILE>` | File of authorized client public keys, one `ed25519-pub:…` per line (optional trailing comment, ssh `authorized_keys` style). |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
@@ -400,7 +412,7 @@ analysis and what it doesn't cover (raw-TCP apps still need SOCKS5 or `socat`).
 | `-n, --server-node-id <ID>` | Server EndpointId. |
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
-| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `flxtsecretv1:…` secret, or the key file from `generate-auth-private-key`. |
+| `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
 | `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
@@ -620,6 +632,13 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
   tokens) and
   [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
   (running your own iroh relay).
+- [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) — the
+  app-independent Ed25519 key format and tooling shared with tunnel-rs: the
+  `ed25519-sec:` / `ed25519-pub:` tokens, key files, authorized-keys documents
+  ([key-format specification](https://github.com/flexaccessdev/flexaccess-keys/blob/main/docs/key-format.md)),
+  and the `generate-auth-key` / `show-auth-key` CLI. flextunnel links against
+  the same crate for parsing and verification and retains only its own
+  domain-separated authentication transcript.
 - [`docs/architecture.md`](docs/architecture.md) — how it works: connection
   lifecycle (fixed ALPN, auth handshake, per-stream protocol), module map,
   concurrency model, reconnect policy, security boundaries, and reference

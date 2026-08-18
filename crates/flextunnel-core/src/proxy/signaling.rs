@@ -53,7 +53,7 @@ pub const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 /// about the secret key — so `Debug` derives plainly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientAuthPayload {
-    /// The client's authentication public key (`flxtpubv1:...`), which
+    /// The client's authentication public key (`ed25519-pub:...`), which
     /// must be on the server's authorized-keys file.
     pub public_key: String,
     /// The iroh endpoint id this client claims to be connecting from (its
@@ -497,7 +497,7 @@ mod tests {
     fn hello_roundtrip() {
         let hello = Hello::new(
             Some(ClientAuthPayload {
-                public_key: "flxtpubv1:abc".to_string(),
+                public_key: "ed25519-pub:abc".to_string(),
                 endpoint_id: "endpointid".to_string(),
                 signature: "sig".to_string(),
             }),
@@ -506,7 +506,7 @@ mod tests {
         let encoded = encode_hello(&hello).unwrap();
         let decoded = decode_hello(&encoded).unwrap();
         let auth = decoded.auth.expect("auth payload present");
-        assert_eq!(auth.public_key, "flxtpubv1:abc");
+        assert_eq!(auth.public_key, "ed25519-pub:abc");
         assert_eq!(auth.endpoint_id, "endpointid");
         assert_eq!(auth.signature, "sig");
         assert_eq!(decoded.version, PROTOCOL_VERSION);

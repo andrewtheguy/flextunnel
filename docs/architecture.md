@@ -39,9 +39,9 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | client keypair auth (ed25519): age-style key generation/parsing (`flxtpubv1:`/`flxtsecretv1:`), ssh-style authorized-keys file loading, endpoint-id-bound sign/verify |
+| `auth.rs` | client keypair auth (ed25519): endpoint-id-bound sign/verify over flextunnel's domain-separated transcript; key format, key files, and authorized-keys parsing (`ed25519-pub:`/`ed25519-sec:`) are delegated to the shared [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) crate |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
-| `secret.rs` | key-management commands: iroh identity keys (`generate-iroh-key`/`show-iroh-id`) and client auth keypairs (`generate-auth-private-key`/`show-auth-public-key`) |
+| `secret.rs` | iroh identity key commands (`generate-iroh-key`/`show-iroh-id`); client auth keypairs are generated with the standalone `flexaccess-keys` CLI |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
 | `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients) |
@@ -255,10 +255,13 @@ servers started with the same identity, blocking the conflicted id and refusing 
 self-blocked server's restart. These are guard rails for operators, not adversary
 defenses.
 
-- **Credentials:** client keypairs are ed25519 — the public key travels as
-  `flxtpubv1:` + base64url, the secret as `flxtsecretv1:` +
-  base64url — verified in the handshake via a signature bound to the
-  connection's endpoint id. Bridges and quick-mode clients
+- **Credentials:** client keypairs are ed25519 in the shared
+  [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) format —
+  the public key travels as `ed25519-pub:` + base64url, the secret as
+  `ed25519-sec:` + base64url — verified in the handshake via a signature bound
+  to the connection's endpoint id under a flextunnel-specific
+  domain-separation context (a key shared with another FlexAccess app can
+  never have its signatures accepted across apps). Bridges and quick-mode clients
   carry no keypair: their credential is their TLS-authenticated endpoint id,
   checked natively against the matching allowlist — `allowed_bridge_servers`,
   or the single client id entered on a quick server (the `authorized_keys`
