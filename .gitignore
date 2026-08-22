@@ -3,3 +3,4 @@ tmp/
 # desktop and build-ios.sh staging output (libflextunnel.a + the copied flextunnel.h)
 dist/
 .idea/
+CLAUDE.local.md
