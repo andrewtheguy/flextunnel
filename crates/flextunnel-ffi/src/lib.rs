@@ -102,7 +102,10 @@ struct FfiConfig {
     /// in the iOS keychain and passes it here at start.
     auth_key: String,
     /// Loopback SOCKS5 port to bind. `None` disables the SOCKS5 front-end;
-    /// `Some(0)` binds an OS-assigned ephemeral port.
+    /// `Some(0)` binds an OS-assigned ephemeral port. A nonzero port is a
+    /// preference: if it is already in use the start falls back to an
+    /// OS-assigned port instead of failing (the result JSON reports the port
+    /// actually bound).
     #[serde(default)]
     socks_port: Option<u16>,
     #[serde(default)]
@@ -264,6 +267,22 @@ pub unsafe extern "C" fn flextunnel_start(
     }
 }
 
+/// Bind the browser's loopback SOCKS listener. A nonzero `requested` port is a
+/// *preference*, not a requirement: the app replays the previous session's
+/// OS-assigned port on relaunch so the WKWebView proxy config stays valid, but
+/// if another process took it while this one was suspended, an OS-assigned
+/// port beats failing the whole session — the caller reads the actual port
+/// from the result JSON either way.
+async fn bind_socks_listener(requested: u16) -> std::io::Result<TcpListener> {
+    match TcpListener::bind((Ipv4Addr::LOCALHOST, requested)).await {
+        Err(e) if requested != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            log::warn!("preferred SOCKS port {requested} is in use; binding an OS-assigned port");
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await
+        }
+        bound => bound,
+    }
+}
+
 fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     // The proxy holds a socket per connection; lift the app process's soft fd
     // limit (per-process, best-effort) before serving.
@@ -280,14 +299,8 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let (listener, port) = match cfg.socks_port {
         Some(requested) => {
             let listener = runtime
-                .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, requested)))
-                .map_err(|e| {
-                    if requested == 0 {
-                        format!("failed to bind an ephemeral loopback SOCKS port: {e}")
-                    } else {
-                        format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}")
-                    }
-                })?;
+                .block_on(bind_socks_listener(requested))
+                .map_err(|e| format!("failed to bind a loopback SOCKS port: {e}"))?;
             let port = listener
                 .local_addr()
                 .map_err(|e| format!("failed to read bound SOCKS port: {e}"))?
@@ -433,8 +446,11 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
 
 /// Snapshot server-direct forward states as JSON.
 ///
-/// Returns 1 on success, 0 when the output buffer is too small, and -1 for a
-/// null handle or internal lock failure.
+/// Returns the number of bytes the JSON needs **including the trailing NUL**,
+/// or -1 for a null handle or internal lock failure. The buffer holds the
+/// complete JSON iff the return value is `<= out_len`; on a larger return the
+/// buffer holds a NUL-terminated truncation and the caller must call again
+/// with a buffer of at least the returned size.
 ///
 /// # Safety
 /// The handle must still be owned by the caller, and `out_buf` must be valid
@@ -444,7 +460,7 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
     handle: *const FlextunnelHandle,
     out_buf: *mut c_char,
     out_len: usize,
-) -> c_int {
+) -> isize {
     if handle.is_null() {
         write_cstr(out_buf, out_len, "");
         return -1;
@@ -475,7 +491,8 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
         })
         .collect();
     let json = serde_json::json!({ "forwards": statuses }).to_string();
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    write_cstr(out_buf, out_len, &json);
+    (json.len() + 1) as isize
 }
 
 /// Stop the proxy and free the handle. After this call `handle` is invalid and
@@ -712,4 +729,27 @@ fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
         *buf.add(copy) = 0;
     }
     copy == bytes.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preferred_socks_port_falls_back_when_taken() {
+        let occupier = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let taken = occupier.local_addr().unwrap().port();
+        let listener = bind_socks_listener(taken).await.unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), taken);
+    }
+
+    #[tokio::test]
+    async fn preferred_socks_port_is_honored_when_free() {
+        // Find a port that is free by binding-then-releasing an ephemeral one.
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listener = bind_socks_listener(port).await.unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
 }

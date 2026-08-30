@@ -21,8 +21,10 @@
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
  * Pass a numeric "socks_port" to bind the browser's loopback SOCKS5 listener
- * (0 requests an OS-assigned port). Pass null or omit it for a forwarding-only
- * session with no SOCKS5 listener.
+ * (0 requests an OS-assigned port; a nonzero port is a preference — if it is
+ * in use the start binds an OS-assigned port instead of failing, so always
+ * read the bound port from the result JSON). Pass null or omit it for a
+ * forwarding-only session with no SOCKS5 listener.
  *
  * All functions are NULL-safe and never unwind into Swift.
  */
@@ -74,8 +76,10 @@ int flextunnel_client_public_key(const char *secret_key, char *out_buf, size_t o
  *   auth_key is this client's secret key (from flextunnel_generate_client_key
  *   or `flexaccess-keys generate-auth-key`); its public half must be on the
  *   server's authorized_keys_file.
- *   socks_port is optional; null/omitted disables SOCKS5, while 0 requests an
- *   OS-assigned port (read it from the result JSON). relay_auth_token is
+ *   socks_port is optional; null/omitted disables SOCKS5, 0 requests an
+ *   OS-assigned port, and a nonzero port is a preference (an in-use port falls
+ *   back to OS-assigned). Read the bound port from the result JSON.
+ *   relay_auth_token is
  *   optional: a shared bearer token sent to every custom relay's WebSocket
  *   upgrade; it is only valid with custom relay_urls (rejected with the default
  *   iroh relays). The routed set
@@ -112,10 +116,13 @@ int flextunnel_set_forwards(const FlextunnelHandle *handle, const char *forwards
  * Snapshot direct-forward states:
  *   {"forwards":[{"id":"uuid","state":"listening","error":null,
  *     "active":1,"last_conn_error":null}]}
- * Returns 1 on success, 0 when out_buf is too small, and -1 for NULL/lock error.
+ * Returns the byte count the JSON needs including the trailing NUL, or -1 for
+ * NULL/lock error. out_buf holds the complete JSON iff the return value is
+ * <= out_len; on a larger return it holds a NUL-terminated truncation and the
+ * call must be repeated with a buffer of at least the returned size.
  */
-int flextunnel_forward_statuses(const FlextunnelHandle *handle,
-                                char *out_buf, size_t out_len);
+ptrdiff_t flextunnel_forward_statuses(const FlextunnelHandle *handle,
+                                      char *out_buf, size_t out_len);
 
 /*
  * Liveness probe. Returns 1 while the connect/serve loop is running, 0 once it

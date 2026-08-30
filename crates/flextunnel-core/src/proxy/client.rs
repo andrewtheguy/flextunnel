@@ -23,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::sync::Semaphore;
 
 /// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
 const RECONNECT_BACKOFF_MAX: u64 = 60;
@@ -90,6 +91,13 @@ const ACCEPT_RETRY_WARN_EVERY: u64 = 40;
 /// ECONNABORTED forever — yields it on *every* call. A short uniform burst
 /// (~1s at [`ACCEPT_RETRY_DELAY`] pacing) separates the two.
 const REBIND_AFTER_CONSECUTIVE_ABORTS: u64 = 4;
+/// Cap on concurrent proxied connections per local front-end listener. At the
+/// cap the loop pauses accepting — further connections wait in the kernel
+/// backlog — until one closes, so a runaway local app degrades into queueing
+/// instead of exhausting the process's file descriptors (each proxied
+/// connection holds a socket plus a QUIC stream). Generous for the real
+/// client: a browser's worst case is a few dozen parallel fetches.
+const MAX_ACTIVE_LOCAL_CONNS: usize = 256;
 
 /// The live QUIC connection shared with the always-on accept loop; `None` while
 /// disconnected (during a drop/backoff), so off-list targets still connect
@@ -1070,6 +1078,32 @@ impl AcceptRetry {
     }
 }
 
+/// Acquire a permit against the per-listener connection cap, warning once per
+/// saturation episode. At the cap this pauses the accept loop — further
+/// connections queue in the kernel backlog — until a connection closes.
+async fn acquire_conn_permit(
+    limiter: &Arc<Semaphore>,
+    warned_saturated: &mut bool,
+    label: &str,
+) -> tokio::sync::OwnedSemaphorePermit {
+    if limiter.available_permits() == 0 {
+        if !*warned_saturated {
+            *warned_saturated = true;
+            log::warn!(
+                "{label} reached {MAX_ACTIVE_LOCAL_CONNS} concurrent connections; \
+                 pausing accepts until one closes"
+            );
+        }
+    } else {
+        *warned_saturated = false;
+    }
+    limiter
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("connection limiter is never closed")
+}
+
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
 /// the SOCKS5 and HTTP listeners.
@@ -1079,7 +1113,8 @@ impl AcceptRetry {
 /// abort burst, the signature of a socket the OS invalidated underneath us
 /// (iOS defuncts every socket of a suspended process, and the health probe
 /// would otherwise keep reading "alive" while nothing can connect) — is
-/// **rebound** in place on the same address. Returns only when a rebind fails.
+/// **rebound** in place on the same address. Concurrency is bounded by
+/// [`MAX_ACTIVE_LOCAL_CONNS`]. Returns only when a rebind fails.
 async fn accept_loop<P: LocalProto>(
     mut listener: TcpListener,
     current: &SharedConn,
@@ -1088,6 +1123,8 @@ async fn accept_loop<P: LocalProto>(
 ) -> ProxyResult<()> {
     let addr = listener.local_addr()?;
     let mut retry = AcceptRetry::new("Local proxy");
+    let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
+    let mut warned_saturated = false;
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => {
@@ -1110,10 +1147,12 @@ async fn accept_loop<P: LocalProto>(
             }
         };
         log::debug!("proxy connection from {peer}");
+        let permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Local proxy").await;
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         let proto = proto.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_local_conn(proto, tcp, current, routed_set_shared).await {
                 log::debug!("proxy connection from {peer} ended: {e}");
             }
@@ -1138,6 +1177,8 @@ async fn accept_loop_unix(
         .ok()
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
     let mut retry = AcceptRetry::new("Unix SOCKS5");
+    let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
+    let mut warned_saturated = false;
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -1160,9 +1201,11 @@ async fn accept_loop_unix(
             }
         };
         log::debug!("unix proxy connection accepted");
+        let permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Unix SOCKS5").await;
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) =
                 handle_local_conn(Socks5Proto, stream, current, routed_set_shared).await
             {
