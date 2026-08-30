@@ -4,8 +4,12 @@
 //! authenticated iroh connection and sends the target directly to the server.
 //! No local SOCKS5 listener or handshake is involved. The server remains the
 //! authority: it enforces its routed set before resolving or dialing the target.
+//!
+//! A forward binds both loopback stacks (`127.0.0.1` and `[::1]`). Each stack
+//! binds and recovers independently — one stack stuck reclaiming its port never
+//! blocks accepts on the other — and concurrent relays are capped per forward.
 
-use super::client::{AcceptOutcome, AcceptRetry, ServerForwarder, rebind_listener};
+use super::client::{AcceptOutcome, AcceptRetry, ServerForwarder};
 use super::signaling::Target;
 use std::collections::HashMap;
 use std::io;
@@ -15,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// One server-direct local forward.
@@ -42,17 +47,81 @@ pub struct ForwardStatus {
     pub last_conn_error: Option<String>,
 }
 
+const STACK_V4: usize = 0;
+const STACK_V6: usize = 1;
+
+/// Bind/accept health of one loopback stack's listener.
+#[derive(Default)]
+struct StackHealth {
+    up: bool,
+    error: Option<(io::ErrorKind, String)>,
+}
+
+impl StackHealth {
+    fn up() -> Self {
+        Self {
+            up: true,
+            error: None,
+        }
+    }
+
+    fn down(e: &io::Error) -> Self {
+        Self {
+            up: false,
+            error: Some((e.kind(), e.to_string())),
+        }
+    }
+}
+
 struct ForwardShared {
+    port: u16,
     state: Mutex<ForwardState>,
+    stacks: Mutex<[StackHealth; 2]>,
     active: AtomicUsize,
     last_conn_error: Mutex<Option<String>>,
+}
+
+impl ForwardShared {
+    fn new(port: u16) -> Self {
+        Self {
+            port,
+            state: Mutex::new(ForwardState::Starting),
+            stacks: Mutex::new(Default::default()),
+            active: AtomicUsize::new(0),
+            last_conn_error: Mutex::new(None),
+        }
+    }
+
+    /// Record one stack's health and refold the forward state: listening while
+    /// either stack is bound, failed once both are down, and starting until
+    /// both have resolved their first bind.
+    fn set_stack(&self, stack: usize, health: StackHealth) {
+        let mut stacks = lock(&self.stacks);
+        stacks[stack] = health;
+        *lock(&self.state) = if stacks.iter().any(|s| s.up) {
+            ForwardState::Listening
+        } else if stacks.iter().all(|s| s.error.is_some()) {
+            let in_use = stacks
+                .iter()
+                .any(|s| matches!(s.error, Some((io::ErrorKind::AddrInUse, _))));
+            let reason = if in_use {
+                format!("port {} is in use", self.port)
+            } else {
+                let (_, msg) = stacks[STACK_V4].error.as_ref().unwrap();
+                msg.clone()
+            };
+            ForwardState::Failed(reason)
+        } else {
+            ForwardState::Starting
+        };
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// First delay between listener rebind attempts while a forward's port is
+/// First delay between listener (re)bind attempts while a forward's port is
 /// unavailable; doubles up to [`FORWARD_REBIND_MAX_BACKOFF`].
 const FORWARD_REBIND_BASE_BACKOFF: Duration = Duration::from_millis(250);
 /// Ceiling on the rebind backoff — keeps a forward whose port is held by
@@ -63,6 +132,12 @@ const FORWARD_REBIND_MAX_BACKOFF: Duration = Duration::from_secs(5);
 fn rebind_backoff(attempt: u32) -> Duration {
     (FORWARD_REBIND_BASE_BACKOFF * (1u32 << attempt.min(5))).min(FORWARD_REBIND_MAX_BACKOFF)
 }
+
+/// Cap on concurrent relayed connections per forward. Backpressure, not an
+/// error: at the cap the forward stops accepting (connections wait in the
+/// kernel backlog) until a relay closes, so a runaway client can't exhaust the
+/// process's file descriptors.
+const MAX_ACTIVE_RELAYS_PER_FORWARD: usize = 128;
 
 struct ForwardTask {
     spec: ForwardSpec,
@@ -106,11 +181,7 @@ impl ForwardManager {
             if self.tasks.contains_key(&spec.id) {
                 continue;
             }
-            let shared = Arc::new(ForwardShared {
-                state: Mutex::new(ForwardState::Starting),
-                active: AtomicUsize::new(0),
-                last_conn_error: Mutex::new(None),
-            });
+            let shared = Arc::new(ForwardShared::new(spec.local_port));
             let handle = self.runtime.spawn(run_forward(
                 spec.clone(),
                 self.forwarder.clone(),
@@ -163,134 +234,160 @@ impl Drop for ActiveGuard {
     }
 }
 
-async fn accept_on(listener: Option<&TcpListener>) -> io::Result<(TcpStream, SocketAddr)> {
-    match listener {
-        Some(listener) => listener.accept().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Handle a failed `accept()` on one of the forward's loopback listeners.
+/// Drive one loopback stack of a forward: bind, accept, and hand each accepted
+/// connection to the forward's relay loop.
 ///
-/// Classifies the error like the client's front-end loops: a broken listener
-/// (or an abort burst — the signature of a socket the OS defuncted underneath
-/// us, as iOS does on suspend) is rebound in place; transient failures back off
-/// and retry.
-///
-/// Rebinding retries **until it succeeds**, marking the forward
-/// [`ForwardState::Failed`] while its port is unavailable and restoring
-/// [`ForwardState::Listening`] once rebound. Unlike the SOCKS5 front-end — whose
-/// accept loop ends the whole session on a rebind failure, so the embedder's
-/// health probe relaunches it — an individual forward has no session-level
-/// restart to fall back on. Giving up after a few attempts would leave it dead
-/// but still "enabled", recoverable only by toggling it off and on, which is
-/// exactly the stuck-forever symptom this avoids.
-async fn handle_accept_error(
-    listener: &mut Option<TcpListener>,
+/// Binding retries **until it succeeds**, folding initial-bind failures and
+/// mid-session listener deaths (an abort burst or broken accept — the
+/// signature of a socket the OS defuncted underneath us, as iOS does on
+/// suspend) into one reclaim loop paced by [`rebind_backoff`]. Unlike the
+/// SOCKS5 front-end — whose accept loop ends the whole session on a rebind
+/// failure, so the embedder's health probe relaunches it — an individual
+/// forward has no session-level restart to fall back on. Giving up after a few
+/// attempts would leave it dead but still "enabled", recoverable only by
+/// toggling it off and on, which is exactly the stuck-forever symptom this
+/// avoids. The stacks recover independently: one stack sleeping between
+/// reclaim attempts never blocks accepts on the other.
+async fn run_stack(
     addr: SocketAddr,
-    retry: &mut AcceptRetry,
-    e: &io::Error,
-    port: u16,
-    shared: &ForwardShared,
+    stack: usize,
+    shared: Arc<ForwardShared>,
+    accepted: mpsc::Sender<TcpStream>,
 ) {
-    match retry.record_error(e) {
-        AcceptOutcome::Rebind => {
-            log::warn!("Forward localhost:{port} listener on {addr} is dead ({e}); rebinding");
-            // Drop the dead socket first; it still owns the port.
-            *listener = None;
-            let mut attempt: u32 = 0;
-            loop {
-                match rebind_listener(addr).await {
-                    Ok(rebound) => {
-                        *listener = Some(rebound);
-                        retry.record_rebind();
-                        log::info!("Forward localhost:{port} listener rebound on {addr}");
-                        *lock(&shared.state) = ForwardState::Listening;
-                        return;
+    let port = shared.port;
+    let label = if stack == STACK_V4 {
+        "Forward IPv4"
+    } else {
+        "Forward IPv6"
+    };
+    let mut retry = AcceptRetry::new(label);
+    'bind: loop {
+        let mut attempt: u32 = 0;
+        let listener = loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(e) => {
+                    if attempt == 0 {
+                        log::warn!("Forward localhost:{port} failed to bind {addr}; retrying: {e}");
+                    } else {
+                        log::debug!("Forward localhost:{port} bind {addr} retry failed: {e}");
                     }
-                    Err(err) => {
-                        let reason = format!("listener on {addr} is down; retrying: {err}");
-                        if attempt == 0 {
-                            log::error!("Forward localhost:{port} {reason}");
-                        } else {
-                            log::debug!("Forward localhost:{port} {reason}");
-                        }
-                        *lock(&shared.state) = ForwardState::Failed(reason);
-                        tokio::time::sleep(rebind_backoff(attempt)).await;
-                        attempt = attempt.saturating_add(1);
-                    }
+                    shared.set_stack(stack, StackHealth::down(&e));
+                    tokio::time::sleep(rebind_backoff(attempt)).await;
+                    attempt = attempt.saturating_add(1);
                 }
             }
+        };
+        retry.record_rebind();
+        shared.set_stack(stack, StackHealth::up());
+        log::info!("Forward localhost:{port} listening on {addr}");
+        loop {
+            match listener.accept().await {
+                Ok((inbound, _)) => {
+                    retry.record_success();
+                    if accepted.send(inbound).await.is_err() {
+                        // The forward task is gone; nothing left to serve.
+                        return;
+                    }
+                }
+                Err(e) => match retry.record_error(&e) {
+                    AcceptOutcome::Rebind => {
+                        log::warn!(
+                            "Forward localhost:{port} listener on {addr} is dead ({e}); rebinding"
+                        );
+                        shared.set_stack(stack, StackHealth::down(&e));
+                        // Re-enter the bind loop, dropping the dead socket
+                        // first; it still owns the port.
+                        continue 'bind;
+                    }
+                    AcceptOutcome::Retry => retry.wait_retry(&e).await,
+                },
+            }
         }
-        AcceptOutcome::Retry => retry.wait_retry(e).await,
     }
 }
 
-async fn run_forward(
-    spec: ForwardSpec,
-    forwarder: ServerForwarder,
-    shared: Arc<ForwardShared>,
-) {
+async fn run_forward(spec: ForwardSpec, forwarder: ServerForwarder, shared: Arc<ForwardShared>) {
     let port = spec.local_port;
-    let v4_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let v6_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
-    let v4 = TcpListener::bind(v4_addr).await;
-    let v6 = TcpListener::bind(v6_addr).await;
-    let (mut v4, mut v6) = match (v4, v6) {
-        (Err(e4), Err(e6)) => {
-            let reason = if e4.kind() == io::ErrorKind::AddrInUse
-                || e6.kind() == io::ErrorKind::AddrInUse
-            {
-                format!("port {port} is in use")
-            } else {
-                e4.to_string()
-            };
-            log::error!("Forward localhost:{port} failed to bind: {reason}");
-            *lock(&shared.state) = ForwardState::Failed(reason);
-            return;
-        }
-        (v4, v6) => (v4.ok(), v6.ok()),
-    };
-    *lock(&shared.state) = ForwardState::Listening;
     log::info!(
-        "Forwarding localhost:{port} → {:?} directly through the server ({}{})",
-        spec.target,
-        if v4.is_some() { "IPv4" } else { "" },
-        match (&v4, &v6) {
-            (Some(_), Some(_)) => "+IPv6",
-            (None, Some(_)) => "IPv6",
-            _ => "",
-        }
+        "Forwarding localhost:{port} → {:?} directly through the server",
+        spec.target
     );
-
-    let mut v4_retry = AcceptRetry::new("Forward IPv4");
-    let mut v6_retry = AcceptRetry::new("Forward IPv6");
+    // Capacity 1: once the relay cap pauses this loop, at most one accepted
+    // connection queues here before the stacks stop accepting too.
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+    // Owning the stack tasks ties their lifetime to this task's: aborting the
+    // forward aborts its listeners. The ids identify which stack a supervised
+    // termination came from.
+    let mut stacks = JoinSet::new();
+    let v4_task = stacks
+        .spawn(run_stack(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            STACK_V4,
+            shared.clone(),
+            accepted_tx.clone(),
+        ))
+        .id();
+    stacks.spawn(run_stack(
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        STACK_V6,
+        shared.clone(),
+        accepted_tx,
+    ));
+    let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_RELAYS_PER_FORWARD));
     let mut relays = JoinSet::new();
+    let mut warned_saturated = false;
     loop {
-        let (is_v4, accepted) = tokio::select! {
-            accepted = accept_on(v4.as_ref()) => (true, accepted),
-            accepted = accept_on(v6.as_ref()) => (false, accepted),
+        let inbound = tokio::select! {
+            inbound = accepted_rx.recv() => match inbound {
+                // Both stack tasks are gone (reaped by the supervision arm
+                // below, or torn down with this task); nothing left to serve.
+                Some(inbound) => inbound,
+                None => return,
+            },
             Some(_) = relays.join_next(), if !relays.is_empty() => continue,
-        };
-        let inbound = match accepted {
-            Ok((inbound, _)) => {
-                if is_v4 { v4_retry.record_success() } else { v6_retry.record_success() }
-                inbound
-            }
-            Err(e) => {
-                let (listener, addr, retry) = if is_v4 {
-                    (&mut v4, v4_addr, &mut v4_retry)
-                } else {
-                    (&mut v6, v6_addr, &mut v6_retry)
+            // Supervise the stacks: a stack task ending here is abnormal — a
+            // normal `run_stack` return only happens once this task is already
+            // gone, so this is a panic (debug builds unwind into a JoinError;
+            // the iOS release profile aborts before reaching it). Mark the
+            // stack down so statuses() stops reporting a dead listener as
+            // Listening.
+            Some(ended) = stacks.join_next_with_id() => {
+                let (id, detail) = match ended {
+                    Ok((id, ())) => (id, "ended unexpectedly".to_string()),
+                    Err(e) => (e.id(), format!("failed: {e}")),
                 };
-                handle_accept_error(listener, addr, retry, &e, port, &shared).await;
+                let stack = if id == v4_task { STACK_V4 } else { STACK_V6 };
+                let label = if stack == STACK_V4 { "IPv4" } else { "IPv6" };
+                log::error!("Forward localhost:{port} {label} listener task {detail}");
+                shared.set_stack(
+                    stack,
+                    StackHealth::down(&io::Error::other(format!("{label} listener task {detail}"))),
+                );
                 continue;
             }
         };
+        if limiter.available_permits() == 0 {
+            if !warned_saturated {
+                warned_saturated = true;
+                log::warn!(
+                    "Forward localhost:{port} reached {MAX_ACTIVE_RELAYS_PER_FORWARD} \
+                     concurrent connections; pausing accepts until one closes"
+                );
+            }
+        } else {
+            warned_saturated = false;
+        }
+        let permit = limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("relay limiter is never closed");
         let shared = shared.clone();
         let forwarder = forwarder.clone();
         let target = spec.target.clone();
         relays.spawn(async move {
+            let _permit = permit;
             let _guard = ActiveGuard::new(shared.clone());
             match forwarder.relay(inbound, &target).await {
                 Ok(()) => *lock(&shared.last_conn_error) = None,
@@ -316,36 +413,99 @@ mod tests {
         assert_eq!(rebind_backoff(50), FORWARD_REBIND_MAX_BACKOFF);
     }
 
-    /// A dead listener whose port is momentarily held (e.g. the defunct socket
-    /// after iOS resume, or another process) must keep retrying and self-heal
-    /// once the port frees — never park permanently in `Failed`. This is the
-    /// regression guard for the stuck-until-toggled bug.
+    #[test]
+    fn folded_state_tracks_stack_health() {
+        let shared = ForwardShared::new(8080);
+        assert_eq!(*lock(&shared.state), ForwardState::Starting);
+        // One stack resolving down keeps it starting until the other resolves.
+        let in_use = io::Error::new(io::ErrorKind::AddrInUse, "taken");
+        shared.set_stack(STACK_V4, StackHealth::down(&in_use));
+        assert_eq!(*lock(&shared.state), ForwardState::Starting);
+        shared.set_stack(STACK_V6, StackHealth::up());
+        assert_eq!(*lock(&shared.state), ForwardState::Listening);
+        // Both down, either with AddrInUse, folds to the port-in-use reason.
+        shared.set_stack(STACK_V6, StackHealth::down(&io::Error::other("defunct")));
+        assert_eq!(
+            *lock(&shared.state),
+            ForwardState::Failed("port 8080 is in use".into())
+        );
+        // Either stack recovering flips it back to listening.
+        shared.set_stack(STACK_V4, StackHealth::up());
+        assert_eq!(*lock(&shared.state), ForwardState::Listening);
+    }
+
+    /// Wait until the forward folds to `state`, or panic after ~5s.
+    async fn wait_for_state(shared: &ForwardShared, state: ForwardState) {
+        for _ in 0..100 {
+            if *lock(&shared.state) == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "forward never reached {state:?}; last: {:?}",
+            *lock(&shared.state)
+        );
+    }
+
+    /// A stack whose port is held — at initial bind or after the OS defuncts a
+    /// bound socket, one shared reclaim loop — must keep retrying and self-heal
+    /// once the port frees, never park permanently. This is the regression
+    /// guard for the stuck-until-toggled bug.
     #[tokio::test]
-    async fn rebind_retries_until_the_port_frees() {
-        // Occupy an ephemeral loopback port so the first rebinds fail.
+    async fn stack_reclaims_its_port_once_freed() {
+        // Occupy an ephemeral loopback port so the first binds fail.
         let occupier = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = occupier.local_addr().unwrap();
+        let shared = Arc::new(ForwardShared::new(addr.port()));
+        // Only the v4 stack runs; mark v6 down so the folded state reflects v4.
+        shared.set_stack(STACK_V6, StackHealth::down(&io::Error::other("unused")));
+        let (tx, mut rx) = mpsc::channel(1);
+        let stack = tokio::spawn(run_stack(addr, STACK_V4, shared.clone(), tx));
 
-        // Free the port shortly, after several rebind attempts have failed.
-        let freer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(700)).await;
-            drop(occupier);
-        });
+        // Let several bind attempts fail, then free the port.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            *lock(&shared.state),
+            ForwardState::Failed(format!("port {} is in use", addr.port()))
+        );
+        drop(occupier);
 
-        let shared = ForwardShared {
-            state: Mutex::new(ForwardState::Listening),
-            active: AtomicUsize::new(0),
-            last_conn_error: Mutex::new(None),
-        };
-        let mut listener: Option<TcpListener> = None;
-        let mut retry = AcceptRetry::new("test");
-        // A non-abort error classifies as Broken → immediate Rebind outcome.
-        let err = io::Error::other("listener defunct");
+        wait_for_state(&shared, ForwardState::Listening).await;
+        TcpStream::connect(addr).await.unwrap();
+        rx.recv().await.expect("accepted connection should be handed off");
+        stack.abort();
+    }
 
-        handle_accept_error(&mut listener, addr, &mut retry, &err, addr.port(), &shared).await;
+    /// One stack stuck reclaiming its port must not block the other: the
+    /// forward stays listening and accepting on the healthy stack. (Both
+    /// stacks bind IPv4 loopback here so the test doesn't depend on ::1;
+    /// `run_stack` only uses the index as its health slot.)
+    #[tokio::test]
+    async fn one_stuck_stack_does_not_block_the_other() {
+        let occupier = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let held_addr = occupier.local_addr().unwrap();
+        // Reserve a distinct free port for the healthy stack (probe-and-drop;
+        // the reuse race is negligible for a test).
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let free_addr = probe.local_addr().unwrap();
+        drop(probe);
 
-        assert!(listener.is_some(), "listener should be rebound, not parked None");
-        assert_eq!(*lock(&shared.state), ForwardState::Listening);
-        freer.await.unwrap();
+        let shared = Arc::new(ForwardShared::new(held_addr.port()));
+        let (tx, mut rx) = mpsc::channel(1);
+        let stuck = tokio::spawn(run_stack(held_addr, STACK_V4, shared.clone(), tx.clone()));
+        let healthy = tokio::spawn(run_stack(free_addr, STACK_V6, shared.clone(), tx));
+
+        wait_for_state(&shared, ForwardState::Listening).await;
+        TcpStream::connect(free_addr).await.unwrap();
+        rx.recv()
+            .await
+            .expect("healthy stack should accept while the other reclaims");
+        assert!(
+            !lock(&shared.stacks)[STACK_V4].up,
+            "occupied stack must still be down"
+        );
+        stuck.abort();
+        healthy.abort();
     }
 }

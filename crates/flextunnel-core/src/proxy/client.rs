@@ -23,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::sync::{Semaphore, watch};
 
 /// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
 const RECONNECT_BACKOFF_MAX: u64 = 60;
@@ -90,6 +91,13 @@ const ACCEPT_RETRY_WARN_EVERY: u64 = 40;
 /// ECONNABORTED forever — yields it on *every* call. A short uniform burst
 /// (~1s at [`ACCEPT_RETRY_DELAY`] pacing) separates the two.
 const REBIND_AFTER_CONSECUTIVE_ABORTS: u64 = 4;
+/// Cap on concurrent proxied connections per local front-end listener. At the
+/// cap the loop pauses accepting — further connections wait in the kernel
+/// backlog — until one closes, so a runaway local app degrades into queueing
+/// instead of exhausting the process's file descriptors (each proxied
+/// connection holds a socket plus a QUIC stream). Generous for the real
+/// client: a browser's worst case is a few dozen parallel fetches.
+const MAX_ACTIVE_LOCAL_CONNS: usize = 256;
 
 /// The live QUIC connection shared with the always-on accept loop; `None` while
 /// disconnected (during a drop/backoff), so off-list targets still connect
@@ -259,6 +267,10 @@ pub struct ProxyClient {
     /// Latches once a duplicate server has been observed; thereafter every
     /// `Hello` carries the advisory so the server can self-block.
     duplicate_server: AtomicBool,
+    /// One-way close signal for the local front-end listeners, latched by
+    /// [`Self::close_local_listeners`]. The accept loops watch the receiving
+    /// side and drop their listener when it flips.
+    local_close: watch::Sender<bool>,
 }
 
 impl ProxyClient {
@@ -270,7 +282,21 @@ impl ProxyClient {
             instance_nonce: rand::rng().random(),
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
             duplicate_server: AtomicBool::new(false),
+            local_close: watch::Sender::new(false),
         }
+    }
+
+    /// Close the local proxy front-end listeners (SOCKS5/HTTP/Unix) while
+    /// leaving the session — the connection manager and established relays —
+    /// running. One-way: there is no reopen for this client; the embedder
+    /// relaunches the session when it wants listeners back.
+    ///
+    /// For embedders whose process is about to be suspended (iOS): the kernel
+    /// keeps accepting into a frozen process's listen backlog, so a suspended
+    /// listener is a black hole — local clients connect and then hang. Closing
+    /// the listeners first turns that into an immediate connection-refused.
+    pub fn close_local_listeners(&self) {
+        self.local_close.send_replace(true);
     }
 
     /// Record a server instance nonce observed in a `HelloResponse` and apply the
@@ -509,14 +535,20 @@ impl ProxyClient {
         // bound, so the `select!` shape is the same either way.
         let http_accept = async {
             match http_listener {
-                Some(l) => accept_loop(l, &current, &routed_set, HttpProto).await,
+                Some(l) => {
+                    accept_loop(l, &current, &routed_set, HttpProto, self.local_close.subscribe())
+                        .await
+                }
                 None => std::future::pending::<ProxyResult<()>>().await,
             }
         };
 
         let socks_accept = async {
             match socks_listener {
-                Some(l) => accept_loop(l, &current, &routed_set, Socks5Proto).await,
+                Some(l) => {
+                    accept_loop(l, &current, &routed_set, Socks5Proto, self.local_close.subscribe())
+                        .await
+                }
                 None => std::future::pending::<ProxyResult<()>>().await,
             }
         };
@@ -527,7 +559,8 @@ impl ProxyClient {
         let unix_accept = async {
             #[cfg(unix)]
             if let Some(l) = unix_listener {
-                return accept_loop_unix(l, &current, &routed_set).await;
+                return accept_loop_unix(l, &current, &routed_set, self.local_close.subscribe())
+                    .await;
             }
             std::future::pending::<ProxyResult<()>>().await
         };
@@ -1070,6 +1103,42 @@ impl AcceptRetry {
     }
 }
 
+/// Acquire a permit against the per-listener connection cap, warning once per
+/// saturation episode. At the cap this pauses the accept loop — further
+/// connections queue in the kernel backlog — until a connection closes.
+async fn acquire_conn_permit(
+    limiter: &Arc<Semaphore>,
+    warned_saturated: &mut bool,
+    label: &str,
+) -> tokio::sync::OwnedSemaphorePermit {
+    if limiter.available_permits() == 0 {
+        if !*warned_saturated {
+            *warned_saturated = true;
+            log::warn!(
+                "{label} reached {MAX_ACTIVE_LOCAL_CONNS} concurrent connections; \
+                 pausing accepts until one closes"
+            );
+        }
+    } else {
+        *warned_saturated = false;
+    }
+    limiter
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("connection limiter is never closed")
+}
+
+/// Resolve once the local-listener close signal latches. Pends forever if the
+/// signal's sender is gone — no close can arrive anymore — so a `select!` arm
+/// built on this never fires spuriously. Cancel-safe (`watch::Receiver::wait_for`
+/// is).
+async fn listener_closed(close: &mut watch::Receiver<bool>) {
+    if close.wait_for(|closed| *closed).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Accept loop for a local front-end listener. Each accepted connection is
 /// handled by [`handle_local_conn`] parameterized on `proto`. Shared verbatim by
 /// the SOCKS5 and HTTP listeners.
@@ -1079,17 +1148,30 @@ impl AcceptRetry {
 /// abort burst, the signature of a socket the OS invalidated underneath us
 /// (iOS defuncts every socket of a suspended process, and the health probe
 /// would otherwise keep reading "alive" while nothing can connect) — is
-/// **rebound** in place on the same address. Returns only when a rebind fails.
+/// **rebound** in place on the same address. Concurrency is bounded by
+/// [`MAX_ACTIVE_LOCAL_CONNS`]. Returns only when a rebind fails; on the
+/// [`ProxyClient::close_local_listeners`] signal the listener is dropped and
+/// the loop parks forever so the enclosing `select!` keeps the session alive.
 async fn accept_loop<P: LocalProto>(
     mut listener: TcpListener,
     current: &SharedConn,
     routed_set_shared: &SharedRoutedSet,
     proto: P,
+    mut close: watch::Receiver<bool>,
 ) -> ProxyResult<()> {
     let addr = listener.local_addr()?;
     let mut retry = AcceptRetry::new("Local proxy");
+    let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
+    let mut warned_saturated = false;
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = listener_closed(&mut close) => {
+                log::info!("Local proxy listener on {addr} closed on request");
+                break;
+            }
+        };
+        let (tcp, peer) = match accepted {
             Ok(accepted) => {
                 retry.record_success();
                 accepted
@@ -1110,15 +1192,30 @@ async fn accept_loop<P: LocalProto>(
             }
         };
         log::debug!("proxy connection from {peer}");
+        // A saturated listener parks here, not in accept, so the close signal
+        // must preempt this wait too (dropping the just-accepted socket).
+        let permit = tokio::select! {
+            permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Local proxy") => permit,
+            _ = listener_closed(&mut close) => {
+                log::info!("Local proxy listener on {addr} closed on request");
+                break;
+            }
+        };
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         let proto = proto.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_local_conn(proto, tcp, current, routed_set_shared).await {
                 log::debug!("proxy connection from {peer} ended: {e}");
             }
         });
     }
+    // Closed on request. Release the socket so new local connections get an
+    // immediate refusal, then park: returning would resolve the session's
+    // `select!` and tear down the tunnel, which must outlive its front-ends.
+    drop(listener);
+    std::future::pending().await
 }
 
 /// Accept loop for the optional Unix-domain SOCKS5 front-end. Mirrors
@@ -1132,14 +1229,24 @@ async fn accept_loop_unix(
     mut listener: UnixListener,
     current: &SharedConn,
     routed_set_shared: &SharedRoutedSet,
+    mut close: watch::Receiver<bool>,
 ) -> ProxyResult<()> {
     let path = listener
         .local_addr()
         .ok()
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
     let mut retry = AcceptRetry::new("Unix SOCKS5");
+    let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
+    let mut warned_saturated = false;
     loop {
-        let stream = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = listener_closed(&mut close) => {
+                log::info!("Unix SOCKS5 listener at {path:?} closed on request");
+                break;
+            }
+        };
+        let stream = match accepted {
             Ok((stream, _addr)) => {
                 retry.record_success();
                 stream
@@ -1160,9 +1267,18 @@ async fn accept_loop_unix(
             }
         };
         log::debug!("unix proxy connection accepted");
+        // As in `accept_loop`: the close signal must preempt a saturated wait.
+        let permit = tokio::select! {
+            permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Unix SOCKS5") => permit,
+            _ = listener_closed(&mut close) => {
+                log::info!("Unix SOCKS5 listener at {path:?} closed on request");
+                break;
+            }
+        };
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) =
                 handle_local_conn(Socks5Proto, stream, current, routed_set_shared).await
             {
@@ -1170,6 +1286,11 @@ async fn accept_loop_unix(
             }
         });
     }
+    // Closed on request: as in `accept_loop`, release the socket and park so
+    // the session outlives its front-ends. The socket file is left behind;
+    // connecting to it now fails with ECONNREFUSED.
+    drop(listener);
+    std::future::pending().await
 }
 
 /// Rebind a Unix-domain listener: remove the stale socket file (a defunct socket
@@ -1392,6 +1513,128 @@ mod tests {
         }
     }
 
+    /// `close_local_listeners` must drop the front-end listener — local
+    /// connects turn into refusals — while the accept future stays pending, so
+    /// the session `select!` it lives in keeps the tunnel running.
+    #[tokio::test]
+    async fn close_signal_drops_listener_without_ending_loop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = test_client();
+        let close = client.local_close.subscribe();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
+        let task = {
+            let (current, routed) = (current.clone(), routed.clone());
+            tokio::spawn(async move {
+                accept_loop(listener, &current, &routed, Socks5Proto, close).await
+            })
+        };
+        // Live: a local connect lands.
+        TcpStream::connect(addr).await.unwrap();
+
+        client.close_local_listeners();
+        // Closed: once the loop observes the signal and drops the listener,
+        // connects are refused. Poll — the drop happens on the spawned task.
+        let refused = async {
+            loop {
+                if TcpStream::connect(addr).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("listener still accepting after close signal");
+        // ...but the loop itself parks instead of resolving the session.
+        assert!(!task.is_finished());
+    }
+
+    /// At the connection cap the loop parks awaiting a permit, not in accept;
+    /// the close signal must preempt that wait too and still drop the listener.
+    #[tokio::test]
+    async fn close_signal_preempts_saturated_listener() {
+        // ~2×(cap+1) sockets live at once; don't let the soft fd limit flake it.
+        crate::app::raise_fd_limit();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = test_client();
+        let close = client.local_close.subscribe();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
+        let task = {
+            let (current, routed) = (current.clone(), routed.clone());
+            tokio::spawn(async move {
+                accept_loop(listener, &current, &routed, Socks5Proto, close).await
+            })
+        };
+        // Saturate every permit with idle connections (each accepted handler
+        // sits in the SOCKS handshake read for LOCAL_HANDSHAKE_TIMEOUT, holding
+        // its permit), plus one more so the loop parks in permit acquisition.
+        let mut held = Vec::new();
+        for _ in 0..=MAX_ACTIVE_LOCAL_CONNS {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        client.close_local_listeners();
+        let refused = async {
+            loop {
+                if TcpStream::connect(addr).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("saturated listener still accepting after close signal");
+        assert!(!task.is_finished());
+        drop(held);
+    }
+
+    /// Unix-domain twin of `close_signal_preempts_saturated_listener`: the
+    /// close-vs-permit race is duplicated in `accept_loop_unix`, so cover it
+    /// there as well (a closed Unix listener refuses instead of accepting).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_signal_preempts_saturated_unix_listener() {
+        crate::app::raise_fd_limit();
+        let path = std::env::temp_dir().join(format!("ftsat{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = test_client();
+        let close = client.local_close.subscribe();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
+        let task = {
+            let (current, routed) = (current.clone(), routed.clone());
+            tokio::spawn(async move {
+                accept_loop_unix(listener, &current, &routed, close).await
+            })
+        };
+        let mut held = Vec::new();
+        for _ in 0..=MAX_ACTIVE_LOCAL_CONNS {
+            held.push(UnixStream::connect(&path).await.unwrap());
+        }
+
+        client.close_local_listeners();
+        let refused = async {
+            loop {
+                if UnixStream::connect(&path).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("saturated unix listener still accepting after close signal");
+        assert!(!task.is_finished());
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The accept loop must survive its listener dying: a defunct listener
     /// (simulated with an abort burst via `classify_accept_error` is not
     /// injectable on a real socket, so exercise the rebind path directly) is
@@ -1437,8 +1680,9 @@ mod tests {
             .unwrap();
         let current: SharedConn = Arc::new(Mutex::new(None));
         let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
+        let (_close_tx, close_rx) = watch::channel(false);
         tokio::spawn(async move {
-            accept_loop_unix(listener, &current, &policy).await.ok();
+            accept_loop_unix(listener, &current, &policy, close_rx).await.ok();
         });
 
         // SOCKS5 client over the unix socket: greet, CONNECT 127.0.0.1:origin.

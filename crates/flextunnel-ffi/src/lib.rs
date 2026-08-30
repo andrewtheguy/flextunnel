@@ -15,14 +15,18 @@
 //! 4. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
 //! 5. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
 //!    for an on-demand "connection path" status readout.
-//! 6. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//! 6. [`flextunnel_close_listeners`] — one-way suspend-side close of every
+//!    local listener, so backlogged clients get refused instead of hanging.
+//! 7. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace proxying and server-direct forwarding over QUIC,
 //! so its optional proxy and forwarding listeners run entirely inside the app
 //! process. The app is expected to work only in the foreground —
 //! when iOS suspends it the runtime freezes and the QUIC connection idle-times
-//! out; the reconnect loop re-establishes on return to the foreground.
+//! out. The app calls [`flextunnel_close_listeners`] just before an unavoidable
+//! suspension (so local clients get refused instead of hanging on a frozen
+//! backlog) and relaunches the session on return to the foreground.
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the
 //! release profile is `panic = "abort"`, so a panic terminates the process
@@ -102,7 +106,10 @@ struct FfiConfig {
     /// in the iOS keychain and passes it here at start.
     auth_key: String,
     /// Loopback SOCKS5 port to bind. `None` disables the SOCKS5 front-end;
-    /// `Some(0)` binds an OS-assigned ephemeral port.
+    /// `Some(0)` binds an OS-assigned ephemeral port. A nonzero port is a
+    /// preference: if it is already in use the start falls back to an
+    /// OS-assigned port instead of failing (the result JSON reports the port
+    /// actually bound).
     #[serde(default)]
     socks_port: Option<u16>,
     #[serde(default)]
@@ -264,6 +271,22 @@ pub unsafe extern "C" fn flextunnel_start(
     }
 }
 
+/// Bind the browser's loopback SOCKS listener. A nonzero `requested` port is a
+/// *preference*, not a requirement: the app replays the previous session's
+/// OS-assigned port on relaunch so the WKWebView proxy config stays valid, but
+/// if another process took it while this one was suspended, an OS-assigned
+/// port beats failing the whole session — the caller reads the actual port
+/// from the result JSON either way.
+async fn bind_socks_listener(requested: u16) -> std::io::Result<TcpListener> {
+    match TcpListener::bind((Ipv4Addr::LOCALHOST, requested)).await {
+        Err(e) if requested != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            log::warn!("preferred SOCKS port {requested} is in use; binding an OS-assigned port");
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await
+        }
+        bound => bound,
+    }
+}
+
 fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     // The proxy holds a socket per connection; lift the app process's soft fd
     // limit (per-process, best-effort) before serving.
@@ -280,14 +303,8 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let (listener, port) = match cfg.socks_port {
         Some(requested) => {
             let listener = runtime
-                .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, requested)))
-                .map_err(|e| {
-                    if requested == 0 {
-                        format!("failed to bind an ephemeral loopback SOCKS port: {e}")
-                    } else {
-                        format!("failed to bind 127.0.0.1:{requested} (already in use?): {e}")
-                    }
-                })?;
+                .block_on(bind_socks_listener(requested))
+                .map_err(|e| format!("failed to bind a loopback SOCKS port: {e}"))?;
             let port = listener
                 .local_addr()
                 .map_err(|e| format!("failed to read bound SOCKS port: {e}"))?
@@ -433,8 +450,11 @@ pub unsafe extern "C" fn flextunnel_set_forwards(
 
 /// Snapshot server-direct forward states as JSON.
 ///
-/// Returns 1 on success, 0 when the output buffer is too small, and -1 for a
-/// null handle or internal lock failure.
+/// Returns the number of bytes the JSON needs **including the trailing NUL**,
+/// or -1 for a null handle or internal lock failure. The buffer holds the
+/// complete JSON iff the return value is `<= out_len`; on a larger return the
+/// buffer holds a NUL-terminated truncation and the caller must call again
+/// with a buffer of at least the returned size.
 ///
 /// # Safety
 /// The handle must still be owned by the caller, and `out_buf` must be valid
@@ -444,7 +464,7 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
     handle: *const FlextunnelHandle,
     out_buf: *mut c_char,
     out_len: usize,
-) -> c_int {
+) -> isize {
     if handle.is_null() {
         write_cstr(out_buf, out_len, "");
         return -1;
@@ -475,7 +495,43 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
         })
         .collect();
     let json = serde_json::json!({ "forwards": statuses }).to_string();
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    write_cstr(out_buf, out_len, &json);
+    (json.len() + 1) as isize
+}
+
+/// Close every local listener — the SOCKS5/HTTP front-ends and all
+/// server-direct forward listeners — while keeping the session handle alive.
+///
+/// One-way, for the moment iOS is about to suspend the app: a frozen process's
+/// listeners keep accepting into the kernel backlog and then serve nothing, so
+/// local clients hang instead of failing. Closing first turns that into an
+/// immediate connection-refused. There is no reopen for this handle: on return
+/// to the foreground the app relaunches the session ([`flextunnel_stop`] +
+/// [`flextunnel_start`]) and re-applies its forwards, which rebinds everything.
+/// [`flextunnel_health`] stays `1` after this call, and a later
+/// [`flextunnel_set_forwards`] would bind its listeners again — don't call it
+/// between close and relaunch.
+///
+/// Returns 1 on success, 0 for an internal lock failure (front-end listeners
+/// are closed regardless), and -1 for a null handle.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. Passing null returns `-1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHandle) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    handle.client.close_local_listeners();
+    match handle.forwards.lock() {
+        Ok(mut manager) => {
+            manager.apply(&[]);
+            1
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Stop the proxy and free the handle. After this call `handle` is invalid and
@@ -712,4 +768,27 @@ fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
         *buf.add(copy) = 0;
     }
     copy == bytes.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preferred_socks_port_falls_back_when_taken() {
+        let occupier = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let taken = occupier.local_addr().unwrap().port();
+        let listener = bind_socks_listener(taken).await.unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), taken);
+    }
+
+    #[tokio::test]
+    async fn preferred_socks_port_is_honored_when_free() {
+        // Find a port that is free by binding-then-releasing an ephemeral one.
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listener = bind_socks_listener(port).await.unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
 }
