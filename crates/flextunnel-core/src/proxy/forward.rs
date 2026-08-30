@@ -317,14 +317,17 @@ async fn run_forward(spec: ForwardSpec, forwarder: ServerForwarder, shared: Arc<
     // connection queues here before the stacks stop accepting too.
     let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
     // Owning the stack tasks ties their lifetime to this task's: aborting the
-    // forward aborts its listeners.
+    // forward aborts its listeners. The ids identify which stack a supervised
+    // termination came from.
     let mut stacks = JoinSet::new();
-    stacks.spawn(run_stack(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        STACK_V4,
-        shared.clone(),
-        accepted_tx.clone(),
-    ));
+    let v4_task = stacks
+        .spawn(run_stack(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            STACK_V4,
+            shared.clone(),
+            accepted_tx.clone(),
+        ))
+        .id();
     stacks.spawn(run_stack(
         SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
         STACK_V6,
@@ -337,11 +340,32 @@ async fn run_forward(spec: ForwardSpec, forwarder: ServerForwarder, shared: Arc<
     loop {
         let inbound = tokio::select! {
             inbound = accepted_rx.recv() => match inbound {
+                // Both stack tasks are gone (reaped by the supervision arm
+                // below, or torn down with this task); nothing left to serve.
                 Some(inbound) => inbound,
-                // Both stack tasks are gone; they only end during teardown.
                 None => return,
             },
             Some(_) = relays.join_next(), if !relays.is_empty() => continue,
+            // Supervise the stacks: a stack task ending here is abnormal — a
+            // normal `run_stack` return only happens once this task is already
+            // gone, so this is a panic (debug builds unwind into a JoinError;
+            // the iOS release profile aborts before reaching it). Mark the
+            // stack down so statuses() stops reporting a dead listener as
+            // Listening.
+            Some(ended) = stacks.join_next_with_id() => {
+                let (id, detail) = match ended {
+                    Ok((id, ())) => (id, "ended unexpectedly".to_string()),
+                    Err(e) => (e.id(), format!("failed: {e}")),
+                };
+                let stack = if id == v4_task { STACK_V4 } else { STACK_V6 };
+                let label = if stack == STACK_V4 { "IPv4" } else { "IPv6" };
+                log::error!("Forward localhost:{port} {label} listener task {detail}");
+                shared.set_stack(
+                    stack,
+                    StackHealth::down(&io::Error::other(format!("{label} listener task {detail}"))),
+                );
+                continue;
+            }
         };
         if limiter.available_permits() == 0 {
             if !warned_saturated {

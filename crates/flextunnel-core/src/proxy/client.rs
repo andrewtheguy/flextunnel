@@ -1192,7 +1192,15 @@ async fn accept_loop<P: LocalProto>(
             }
         };
         log::debug!("proxy connection from {peer}");
-        let permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Local proxy").await;
+        // A saturated listener parks here, not in accept, so the close signal
+        // must preempt this wait too (dropping the just-accepted socket).
+        let permit = tokio::select! {
+            permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Local proxy") => permit,
+            _ = listener_closed(&mut close) => {
+                log::info!("Local proxy listener on {addr} closed on request");
+                break;
+            }
+        };
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         let proto = proto.clone();
@@ -1259,7 +1267,14 @@ async fn accept_loop_unix(
             }
         };
         log::debug!("unix proxy connection accepted");
-        let permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Unix SOCKS5").await;
+        // As in `accept_loop`: the close signal must preempt a saturated wait.
+        let permit = tokio::select! {
+            permit = acquire_conn_permit(&limiter, &mut warned_saturated, "Unix SOCKS5") => permit,
+            _ = listener_closed(&mut close) => {
+                log::info!("Unix SOCKS5 listener at {path:?} closed on request");
+                break;
+            }
+        };
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         tokio::spawn(async move {
@@ -1534,6 +1549,90 @@ mod tests {
             .expect("listener still accepting after close signal");
         // ...but the loop itself parks instead of resolving the session.
         assert!(!task.is_finished());
+    }
+
+    /// At the connection cap the loop parks awaiting a permit, not in accept;
+    /// the close signal must preempt that wait too and still drop the listener.
+    #[tokio::test]
+    async fn close_signal_preempts_saturated_listener() {
+        // ~2×(cap+1) sockets live at once; don't let the soft fd limit flake it.
+        crate::app::raise_fd_limit();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = test_client();
+        let close = client.local_close.subscribe();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
+        let task = {
+            let (current, routed) = (current.clone(), routed.clone());
+            tokio::spawn(async move {
+                accept_loop(listener, &current, &routed, Socks5Proto, close).await
+            })
+        };
+        // Saturate every permit with idle connections (each accepted handler
+        // sits in the SOCKS handshake read for LOCAL_HANDSHAKE_TIMEOUT, holding
+        // its permit), plus one more so the loop parks in permit acquisition.
+        let mut held = Vec::new();
+        for _ in 0..=MAX_ACTIVE_LOCAL_CONNS {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        client.close_local_listeners();
+        let refused = async {
+            loop {
+                if TcpStream::connect(addr).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("saturated listener still accepting after close signal");
+        assert!(!task.is_finished());
+        drop(held);
+    }
+
+    /// Unix-domain twin of `close_signal_preempts_saturated_listener`: the
+    /// close-vs-permit race is duplicated in `accept_loop_unix`, so cover it
+    /// there as well (a closed Unix listener refuses instead of accepting).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_signal_preempts_saturated_unix_listener() {
+        crate::app::raise_fd_limit();
+        let path = std::env::temp_dir().join(format!("ftsat{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = test_client();
+        let close = client.local_close.subscribe();
+        let current: SharedConn = Arc::new(Mutex::new(None));
+        let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
+        let task = {
+            let (current, routed) = (current.clone(), routed.clone());
+            tokio::spawn(async move {
+                accept_loop_unix(listener, &current, &routed, close).await
+            })
+        };
+        let mut held = Vec::new();
+        for _ in 0..=MAX_ACTIVE_LOCAL_CONNS {
+            held.push(UnixStream::connect(&path).await.unwrap());
+        }
+
+        client.close_local_listeners();
+        let refused = async {
+            loop {
+                if UnixStream::connect(&path).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("saturated unix listener still accepting after close signal");
+        assert!(!task.is_finished());
+        drop(held);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The accept loop must survive its listener dying: a defunct listener
