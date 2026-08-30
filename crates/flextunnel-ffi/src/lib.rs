@@ -15,14 +15,18 @@
 //! 4. [`flextunnel_routes`] — snapshot the server-pushed split-tunnel set for UI.
 //! 5. [`flextunnel_conn_path`] — snapshot the live iroh path(s) (relay/direct)
 //!    for an on-demand "connection path" status readout.
-//! 6. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//! 6. [`flextunnel_close_listeners`] — one-way suspend-side close of every
+//!    local listener, so backlogged clients get refused instead of hanging.
+//! 7. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace proxying and server-direct forwarding over QUIC,
 //! so its optional proxy and forwarding listeners run entirely inside the app
 //! process. The app is expected to work only in the foreground —
 //! when iOS suspends it the runtime freezes and the QUIC connection idle-times
-//! out; the reconnect loop re-establishes on return to the foreground.
+//! out. The app calls [`flextunnel_close_listeners`] just before an unavoidable
+//! suspension (so local clients get refused instead of hanging on a frozen
+//! backlog) and relaunches the session on return to the foreground.
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the
 //! release profile is `panic = "abort"`, so a panic terminates the process
@@ -493,6 +497,41 @@ pub unsafe extern "C" fn flextunnel_forward_statuses(
     let json = serde_json::json!({ "forwards": statuses }).to_string();
     write_cstr(out_buf, out_len, &json);
     (json.len() + 1) as isize
+}
+
+/// Close every local listener — the SOCKS5/HTTP front-ends and all
+/// server-direct forward listeners — while keeping the session handle alive.
+///
+/// One-way, for the moment iOS is about to suspend the app: a frozen process's
+/// listeners keep accepting into the kernel backlog and then serve nothing, so
+/// local clients hang instead of failing. Closing first turns that into an
+/// immediate connection-refused. There is no reopen for this handle: on return
+/// to the foreground the app relaunches the session ([`flextunnel_stop`] +
+/// [`flextunnel_start`]) and re-applies its forwards, which rebinds everything.
+/// [`flextunnel_health`] stays `1` after this call, and a later
+/// [`flextunnel_set_forwards`] would bind its listeners again — don't call it
+/// between close and relaunch.
+///
+/// Returns 1 on success, 0 for an internal lock failure (front-end listeners
+/// are closed regardless), and -1 for a null handle.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. Passing null returns `-1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHandle) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    handle.client.close_local_listeners();
+    match handle.forwards.lock() {
+        Ok(mut manager) => {
+            manager.apply(&[]);
+            1
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Stop the proxy and free the handle. After this call `handle` is invalid and

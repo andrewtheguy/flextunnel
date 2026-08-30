@@ -18,6 +18,7 @@
  *        at a time; a second start while one is live returns NULL.
  *   3. flextunnel_health(handle) -> 1 running / 0 ended / -1 null  (poll)
  *   -  flextunnel_conn_path(handle, buf, len)             (on-demand path readout)
+ *   -  flextunnel_close_listeners(handle)                 (just before suspension)
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
  * Pass a numeric "socks_port" to bind the browser's loopback SOCKS5 listener
@@ -123,6 +124,21 @@ int flextunnel_set_forwards(const FlextunnelHandle *handle, const char *forwards
  */
 ptrdiff_t flextunnel_forward_statuses(const FlextunnelHandle *handle,
                                       char *out_buf, size_t out_len);
+
+/*
+ * Close every local listener — the SOCKS5 front-end and all server-direct
+ * forward listeners — while keeping the session handle alive. One-way: call it
+ * when suspension is imminent, so local clients get an immediate
+ * connection-refused instead of hanging on the frozen process's backlog. There
+ * is no reopen — relaunch the session (flextunnel_stop + flextunnel_start, then
+ * re-apply forwards) on return to the foreground. flextunnel_health stays 1
+ * after this call; don't call flextunnel_set_forwards between close and
+ * relaunch (it would bind listeners again).
+ *
+ * Returns 1 on success, 0 for an internal lock failure (the proxy front-end is
+ * closed regardless), and -1 for a NULL handle.
+ */
+int flextunnel_close_listeners(const FlextunnelHandle *handle);
 
 /*
  * Liveness probe. Returns 1 while the connect/serve loop is running, 0 once it
