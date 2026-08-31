@@ -7,7 +7,7 @@ use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
 use crate::proxy::{dial, http, reserved, socks5, RoutedSet};
 use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::{connection_paths, ConnPath, ConnectionSnapshot};
-use crate::transport::{HEARTBEAT_INTERVAL, LIVENESS_WINDOW};
+use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_window};
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
@@ -271,6 +271,17 @@ pub struct ProxyClient {
     /// [`Self::close_local_listeners`]. The accept loops watch the receiving
     /// side and drop their listener when it flips.
     local_close: watch::Sender<bool>,
+    /// Whether the embedding app is backgrounded (mobile embedders flip this
+    /// from their scene lifecycle via [`Self::set_background`]). Drives the
+    /// heartbeat cadence: [`HEARTBEAT_INTERVAL`] in the foreground,
+    /// [`HEARTBEAT_INTERVAL_IDLE`] in the background, switching mid-wait.
+    background: watch::Sender<bool>,
+    /// Whether the device reports a usable network path
+    /// ([`Self::set_network_available`]; defaults to available for embedders
+    /// that never report). While unavailable the reconnect loop parks with no
+    /// timers at all — retrying into a dead path is pure battery burn — and a
+    /// flip back to available reconnects immediately with a fresh backoff.
+    network_available: watch::Sender<bool>,
 }
 
 impl ProxyClient {
@@ -283,7 +294,26 @@ impl ProxyClient {
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
             duplicate_server: AtomicBool::new(false),
             local_close: watch::Sender::new(false),
+            background: watch::Sender::new(false),
+            network_available: watch::Sender::new(true),
         }
+    }
+
+    /// Report the embedding app's scene state. Backgrounded, the heartbeat
+    /// slows to [`HEARTBEAT_INTERVAL_IDLE`] (one radio wake a minute instead of
+    /// six); foregrounded, it snaps back to [`HEARTBEAT_INTERVAL`] — a beat
+    /// already overdue at the faster cadence is sent immediately. Safe to call
+    /// repeatedly with the same value.
+    pub fn set_background(&self, background: bool) {
+        self.background.send_replace(background);
+    }
+
+    /// Report whether the device has a usable network path (e.g. from
+    /// `NWPathMonitor`). While unavailable the reconnect loop parks instead of
+    /// burning backoff retries into a dead path; the flip back to available
+    /// triggers an immediate reconnect with a fresh backoff series.
+    pub fn set_network_available(&self, available: bool) {
+        self.network_available.send_replace(available);
     }
 
     /// Close the local proxy front-end listeners (SOCKS5/HTTP/Unix) while
@@ -616,7 +646,7 @@ impl ProxyClient {
                 }
                 Err(e) => match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
-                        tokio::time::sleep(backoff).await;
+                        self.wait_backoff(backoff, &mut attempt).await;
                         continue;
                     }
                     Err(fatal) => return Err(fatal),
@@ -638,7 +668,7 @@ impl ProxyClient {
             if let Err(e) = maintained {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
-                        tokio::time::sleep(backoff).await;
+                        self.wait_backoff(backoff, &mut attempt).await;
                         continue;
                     }
                     Err(fatal) => return Err(fatal),
@@ -680,6 +710,35 @@ impl ProxyClient {
         Ok(backoff)
     }
 
+    /// Sit out a reconnect backoff, gated on network availability: while the
+    /// device reports no usable path, park with **no timers at all** (retrying
+    /// into a dead path detects nothing and, on cellular, wakes the radio for
+    /// nothing) and return as soon as the path comes back — resetting the
+    /// backoff series so the restored network gets an immediate, fresh
+    /// reconnect. While the path is up this is a plain backoff sleep, except
+    /// that a mid-sleep loss switches to parking.
+    async fn wait_backoff(&self, backoff: Duration, attempt: &mut u32) {
+        let mut available = self.network_available.subscribe();
+        if !*available.borrow() {
+            log::info!("Network unavailable; pausing reconnects until a path returns");
+            // The sender lives in self, so this cannot error while we run.
+            let _ = available.wait_for(|a| *a).await;
+            log::info!("Network available again; reconnecting now");
+            *attempt = 0;
+            return;
+        }
+        let lost_mid_sleep = tokio::select! {
+            _ = tokio::time::sleep(backoff) => false,
+            r = available.wait_for(|a| !*a) => r.is_ok(),
+        };
+        if lost_mid_sleep {
+            log::info!("Network unavailable; pausing reconnects until a path returns");
+            let _ = available.wait_for(|a| *a).await;
+            log::info!("Network available again; reconnecting now");
+            *attempt = 0;
+        }
+    }
+
     /// Connect to the server and complete the auth handshake, returning the
     /// connection, the routed set the server pushed, and the control-stream halves
     /// (kept open for heartbeats).
@@ -712,7 +771,7 @@ impl ProxyClient {
         // lifetime of this connection. Guard is dropped when `maintain` returns.
         let _path_watcher = crate::transport::paths::watch_connection_paths(connection);
         tokio::select! {
-            r = client_heartbeat_loop(ctrl_send, ctrl_recv) => r,
+            r = client_heartbeat_loop(ctrl_send, ctrl_recv, self.background.subscribe()) => r,
             reason = connection.closed() => Err(ProxyError::ConnectionLost(reason.to_string())),
         }
     }
@@ -839,19 +898,46 @@ impl ProxyClient {
 }
 
 /// Client-side heartbeat loop over the retained control stream: send a
-/// `Heartbeat` every [`HEARTBEAT_INTERVAL`] and await its `HeartbeatAck` within
-/// [`LIVENESS_WINDOW`]. A missing ack (or stream error) returns
-/// [`ProxyError::ConnectionLost`] (recoverable), which drives the reconnect loop.
+/// `Heartbeat` at the current cadence — [`HEARTBEAT_INTERVAL`] while
+/// foregrounded, [`HEARTBEAT_INTERVAL_IDLE`] while `background` reads true —
+/// and await its `HeartbeatAck` within [`liveness_window`] of that cadence. A
+/// missing ack (or stream error) returns [`ProxyError::ConnectionLost`]
+/// (recoverable), which drives the reconnect loop.
+///
+/// A cadence flip takes effect on the *current* wait: the deadline is
+/// recomputed from the last heartbeat, so a foreground flip 50s into an idle
+/// minute sends the overdue beat immediately, and a background flip stretches
+/// the pending wait instead of firing one more fast beat.
 ///
 /// Shared with [`crate::proxy::bridge`]: a bridge also sends heartbeats over its
-/// retained control stream, so it reuses this loop.
+/// retained control stream, so it reuses this loop (with a receiver that is
+/// permanently foreground — servers have no battery to protect).
 pub(crate) async fn client_heartbeat_loop(
     mut send: SendStream,
     mut recv: RecvStream,
+    mut background: watch::Receiver<bool>,
 ) -> ProxyResult<()> {
     let mut seq: u64 = 0;
     loop {
-        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        let last_beat = tokio::time::Instant::now();
+        let interval = loop {
+            let interval = if *background.borrow() {
+                HEARTBEAT_INTERVAL_IDLE
+            } else {
+                HEARTBEAT_INTERVAL
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(last_beat + interval) => break interval,
+                changed = background.changed() => {
+                    // A dropped sender can't change the cadence any more; sleep
+                    // out the current interval plainly instead of spinning.
+                    if changed.is_err() {
+                        tokio::time::sleep_until(last_beat + interval).await;
+                        break interval;
+                    }
+                }
+            }
+        };
         seq = seq.wrapping_add(1);
         signaling::write_message(
             &mut send,
@@ -861,7 +947,7 @@ pub(crate) async fn client_heartbeat_loop(
         send.flush().await?;
 
         let data = tokio::time::timeout(
-            LIVENESS_WINDOW,
+            liveness_window(interval),
             signaling::read_message(&mut recv, signaling::MAX_CONTROL_MSG_SIZE),
         )
         .await
@@ -1706,6 +1792,45 @@ mod tests {
         assert_eq!(&got, b"pong");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// With the network reported unavailable, a reconnect backoff must park
+    /// (not sleep out its delay), then return promptly — with the backoff
+    /// series reset — the moment the path comes back.
+    #[tokio::test]
+    async fn backoff_parks_offline_and_resumes_on_path_return() {
+        let client = Arc::new(test_client());
+        client.set_network_available(false);
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            let mut attempt = 5;
+            // Far longer than the test timeout: only the path-return signal can
+            // end the wait in time.
+            c.wait_backoff(Duration::from_secs(300), &mut attempt).await;
+            attempt
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "backoff ended while offline");
+        client.set_network_available(true);
+        let attempt = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("backoff did not resume on path return")
+            .unwrap();
+        assert_eq!(attempt, 0, "restored path should reset the backoff series");
+    }
+
+    /// While the network is available a backoff is a plain sleep: it must run
+    /// its full delay and leave the attempt counter alone.
+    #[tokio::test]
+    async fn backoff_sleeps_normally_while_online() {
+        let client = test_client();
+        let mut attempt = 3;
+        let started = std::time::Instant::now();
+        client
+            .wait_backoff(Duration::from_millis(200), &mut attempt)
+            .await;
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(attempt, 3);
     }
 
     #[test]

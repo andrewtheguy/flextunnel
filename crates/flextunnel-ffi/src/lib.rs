@@ -17,7 +17,14 @@
 //!    for an on-demand "connection path" status readout.
 //! 6. [`flextunnel_close_listeners`] — one-way suspend-side close of every
 //!    local listener, so backlogged clients get refused instead of hanging.
-//! 7. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
+//! 7. [`flextunnel_set_background`] — scene-lifecycle hint: backgrounded, the
+//!    core's heartbeat slows from 10s to 60s so an idle session wakes the
+//!    cellular radio once a minute instead of six times.
+//! 8. [`flextunnel_set_network_available`] — path hint (`NWPathMonitor`): while
+//!    no path is usable the reconnect loop parks with no timers instead of
+//!    burning backoff retries into a dead network, and reconnects immediately
+//!    when a path returns.
+//! 9. [`flextunnel_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! Unlike the ezvpn FFI there is **no VPN / Network Extension and no `utun` fd**:
 //! flextunnel is pure-userspace proxying and server-direct forwarding over QUIC,
@@ -534,6 +541,55 @@ pub unsafe extern "C" fn flextunnel_close_listeners(handle: *const FlextunnelHan
     }
 }
 
+/// Report the app's scene state so the core can pace itself: `1` when the app
+/// is backgrounded, `0` when foregrounded. Backgrounded, the app-level
+/// heartbeat — the connection's only periodic traffic — slows from 10s to 60s,
+/// keeping the cellular radio in its low-power state almost the whole time; the
+/// foreground flip snaps it back and sends any overdue beat immediately.
+/// Idempotent; safe to call with the same value repeatedly.
+///
+/// Returns 1 on success and -1 for a null handle.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. Passing null returns `-1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_set_background(
+    handle: *const FlextunnelHandle,
+    background: c_int,
+) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    handle.client.set_background(background != 0);
+    1
+}
+
+/// Report whether the device currently has a usable network path (`1`/`0`),
+/// e.g. from `NWPathMonitor`. While unavailable the core's reconnect loop parks
+/// with no timers at all — instead of waking the radio for backoff retries that
+/// cannot succeed — and a flip back to available reconnects immediately with a
+/// fresh backoff series. Defaults to available if never called.
+///
+/// Returns 1 on success and -1 for a null handle.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`flextunnel_start`] and not yet
+/// passed to [`flextunnel_stop`]. Passing null returns `-1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flextunnel_set_network_available(
+    handle: *const FlextunnelHandle,
+    available: c_int,
+) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    handle.client.set_network_available(available != 0);
+    1
+}
+
 /// Stop the proxy and free the handle. After this call `handle` is invalid and
 /// must not be used again. Passing null is a safe no-op.
 ///
@@ -669,8 +725,15 @@ pub unsafe extern "C" fn flextunnel_routes(
 /// { "paths": [
 ///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
 ///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
-/// ] }
+///   ],
+///   "udp_tx_datagrams": 1234, "udp_rx_datagrams": 1201 }
 /// ```
+///
+/// `udp_tx_datagrams`/`udp_rx_datagrams` count the UDP datagrams the live
+/// connection has sent/received since it was established (0 while
+/// disconnected). On cellular, energy is per-wakeup rather than per-byte, so
+/// sampling the tx count across an interval — e.g. across a backgrounded stint
+/// — is the cheap proxy for the tunnel's radio cost.
 ///
 /// This is a **point-in-time** snapshot of how the client currently reaches the
 /// server, showing *all* discovered paths (not just the selected one); `kind` is
@@ -728,8 +791,13 @@ pub unsafe extern "C" fn flextunnel_conn_path(
         .into_iter()
         .map(|r| serde_json::json!({ "url": r.url, "working": r.working, "error": r.error }))
         .collect();
-    let json =
-        serde_json::json!({ "paths": paths, "custom_relays": custom_relays }).to_string();
+    let json = serde_json::json!({
+        "paths": paths,
+        "custom_relays": custom_relays,
+        "udp_tx_datagrams": snapshot.udp_tx_datagrams,
+        "udp_rx_datagrams": snapshot.udp_rx_datagrams,
+    })
+    .to_string();
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 

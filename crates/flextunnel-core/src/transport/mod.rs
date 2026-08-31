@@ -12,41 +12,67 @@ use anyhow::{Context, Result};
 use iroh::endpoint::QuicTransportConfig;
 use std::time::Duration;
 
-/// QUIC keep-alive interval. Active connections send pings at this interval to
-/// keep NAT mappings alive and detect dead peers promptly. Matches iroh's relay
-/// ping interval (15s), comfortably under the 30s idle timeout.
-pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
-
-/// QUIC idle timeout. A connection with no activity (data or keep-alive) for
-/// this long is considered dead and closed, resolving `Connection::closed()`.
-pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// QUIC idle timeout. A connection with no activity for this long is considered
+/// dead and closed, resolving `Connection::closed()`.
+///
+/// There is deliberately **no QUIC-level keep-alive**: the app-level heartbeat
+/// below is the sole periodic sender, so an idle connection costs exactly one
+/// radio wake per heartbeat instead of two overlapping ping schedules. On
+/// cellular every transmission buys ~10s of high-power radio tail, so the
+/// heartbeat cadence — not payload size — is the battery cost. The timeout must
+/// comfortably exceed the widest heartbeat cadence
+/// ([`HEARTBEAT_INTERVAL_IDLE`], 60s) so a healthy-but-quiet connection never
+/// idles out; a genuinely dead one is detected sooner by the heartbeat's own
+/// liveness window while active, with this as the backstop while idle.
+pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.
 /// 1452 is the IPv6-safe maximum for a standard 1500-byte Ethernet path
 /// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's DPLPMTUD upper-bound default.
 pub const QUIC_INITIAL_MTU: u16 = 1452;
 
-/// App-level heartbeat interval. After the auth handshake the control stream is
+/// App-level heartbeat interval while the client is **active** (foregrounded,
+/// or a non-mobile embedder). After the auth handshake the control stream is
 /// kept open and the client sends a `Heartbeat` this often; the server replies
-/// with a `HeartbeatAck`. This is a semantic liveness signal on top of QUIC's
-/// keep-alive: it refreshes the server's per-client connection registry (used
-/// for duplicate-id detection) faster than the 30s QUIC idle timeout would.
+/// with a `HeartbeatAck`. The heartbeat is both the liveness probe (a missing
+/// ack within [`liveness_window`] means a dead link) and, with no QUIC
+/// keep-alive configured, the traffic that keeps NAT mappings and the idle
+/// timeout refreshed.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// App-level heartbeat interval while the client is **idle in the background**
+/// (a mobile embedder reported the app backgrounded — see
+/// `ProxyClient::set_background`). One send per minute keeps the cellular radio
+/// in its low-power state almost the whole time (anything periodic under
+/// ~15–20s keeps it high continuously), matching where battery-conscious peers
+/// converged: Tailscale stops idle-session heartbeats entirely, DERP relays
+/// keepalive at 60s, and Apple's historical background-heartbeat floor was 10
+/// minutes. Liveness detection widens to [`liveness_window`] of this — a dead
+/// link found within ~3 minutes is fine for a backgrounded session, and the
+/// foreground flip snaps the cadence (and detection) back immediately.
+pub const HEARTBEAT_INTERVAL_IDLE: Duration = Duration::from_secs(60);
 
 /// Grace added to the heartbeat liveness window so a heartbeat delayed by
 /// scheduler/network jitter isn't misread as a dead connection right at the
 /// 3×-interval boundary.
 const LIVENESS_GRACE: Duration = Duration::from_secs(3);
 
-/// Liveness window for the app-level heartbeat. A connection whose control
-/// stream produces no heartbeat traffic for this long is treated as dead (on the
-/// server) or as a lost connection (on the client). Derived as 3× the interval
+/// Liveness window for an app-level heartbeat cadence: 3× the interval
 /// (tolerating a couple of dropped heartbeats) plus [`LIVENESS_GRACE`], so a
-/// late-but-valid heartbeat doesn't race the timeout at exactly 3× the interval.
-/// For a genuinely dead peer the QUIC idle timeout (30s) is the backstop that
-/// closes the connection first.
-pub const LIVENESS_WINDOW: Duration =
-    Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * 3 + LIVENESS_GRACE.as_secs());
+/// late-but-valid heartbeat doesn't race the timeout at exactly 3× the
+/// interval. The client sizes the window from the cadence it is actually using.
+pub const fn liveness_window(interval: Duration) -> Duration {
+    Duration::from_secs(interval.as_secs() * 3 + LIVENESS_GRACE.as_secs())
+}
+
+/// The server's liveness window for client heartbeats. A connection whose
+/// control stream produces no heartbeat for this long is treated as dead. Sized
+/// for the **widest** client cadence ([`HEARTBEAT_INTERVAL_IDLE`]) because the
+/// server cannot know which cadence a client is on; an active client going
+/// silent is still closed by the QUIC idle timeout, just later than its own
+/// 3×10s window would have been. Slower server-side reaping only delays
+/// duplicate-id detection and registry cleanup for genuinely dead clients.
+pub const LIVENESS_WINDOW: Duration = liveness_window(HEARTBEAT_INTERVAL_IDLE);
 
 /// QUIC ALPN protocol identifier for flextunnel.
 ///
@@ -77,16 +103,16 @@ pub const BRIDGE_ALPN: &[u8] = b"flextunnel-bridge/1";
 /// quick client is served exactly like a keypair client.
 pub const QUICK_ALPN: &[u8] = b"flextunnel-quick/1";
 
-/// Build a QUIC transport config with keep-alive, idle timeout, and a larger
-/// initial MTU. Shared by client and server endpoint creation so both sides
-/// apply identical settings.
+/// Build a QUIC transport config with the idle timeout and a larger initial
+/// MTU — and **no transport keep-alive** (see [`QUIC_IDLE_TIMEOUT`]; the
+/// app-level heartbeat is the sole periodic sender). Shared by client and
+/// server endpoint creation so both sides apply identical settings.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
         .try_into()
         .context("converting QUIC_IDLE_TIMEOUT to IdleTimeout")?;
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
-    transport_config = transport_config.keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL);
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
     Ok(transport_config.build())
 }
