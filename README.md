@@ -566,8 +566,8 @@ in the handshake response, so there is no client list to keep in sync:
   targets keep connecting even while the tunnel is down; an on-list target during
   a drop/backoff is held for the client's own reconnect (up to 45s, deploy-style
   connection holding) and proceeds transparently once the link is back — only a
-  reconnect that never lands within the hold gets a SOCKS5 network-unreachable
-  reply (`0x03`).
+  reconnect that never lands within the hold gets a network-unreachable failure
+  (SOCKS5 reply `0x03`; the HTTP front-end maps it to `502 Bad Gateway`).
 - **Server** — it also enforces the same list independently as a **whitelist**,
   **rejecting** any tunnel request for a target not on it (SOCKS5 reply `0x02`).
   This is a defense-in-depth boundary against a misconfigured or untrusted
