@@ -619,6 +619,11 @@ impl ProxyClient {
     ) -> ProxyResult<()> {
         let mut ever_connected = false;
         let mut attempt: u32 = 0;
+        // Set when the last backoff resumed from a parked (path-lost) state:
+        // the backoff series was reset, but the endpoint still needs the rebind
+        // nudge below — the network genuinely changed underneath it. Every
+        // retry passes through `wait_backoff`, which reassigns it.
+        let mut path_returned = false;
         loop {
             // Until (re)authenticated, nothing is being forwarded.
             self.set_connected(false);
@@ -630,7 +635,7 @@ impl ProxyClient {
             // that by itself, leaving reconnects wedged forever. Nudging it
             // re-checks and rebinds the transports — harmless when nothing
             // actually changed.
-            if attempt > 0 {
+            if attempt > 0 || path_returned {
                 endpoint.network_change().await;
             }
 
@@ -646,7 +651,7 @@ impl ProxyClient {
                 }
                 Err(e) => match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
-                        self.wait_backoff(backoff, &mut attempt).await;
+                        path_returned = self.wait_backoff(backoff, &mut attempt).await;
                         continue;
                     }
                     Err(fatal) => return Err(fatal),
@@ -668,7 +673,7 @@ impl ProxyClient {
             if let Err(e) = maintained {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
-                        self.wait_backoff(backoff, &mut attempt).await;
+                        path_returned = self.wait_backoff(backoff, &mut attempt).await;
                         continue;
                     }
                     Err(fatal) => return Err(fatal),
@@ -717,7 +722,11 @@ impl ProxyClient {
     /// backoff series so the restored network gets an immediate, fresh
     /// reconnect. While the path is up this is a plain backoff sleep, except
     /// that a mid-sleep loss switches to parking.
-    async fn wait_backoff(&self, backoff: Duration, attempt: &mut u32) {
+    ///
+    /// Returns whether the wait resumed from a parked state — i.e. the network
+    /// went away and came back — so the caller can nudge
+    /// `Endpoint::network_change()` even though the attempt counter was reset.
+    async fn wait_backoff(&self, backoff: Duration, attempt: &mut u32) -> bool {
         let mut available = self.network_available.subscribe();
         if !*available.borrow() {
             log::info!("Network unavailable; pausing reconnects until a path returns");
@@ -725,7 +734,7 @@ impl ProxyClient {
             let _ = available.wait_for(|a| *a).await;
             log::info!("Network available again; reconnecting now");
             *attempt = 0;
-            return;
+            return true;
         }
         let lost_mid_sleep = tokio::select! {
             _ = tokio::time::sleep(backoff) => false,
@@ -736,7 +745,9 @@ impl ProxyClient {
             let _ = available.wait_for(|a| *a).await;
             log::info!("Network available again; reconnecting now");
             *attempt = 0;
+            return true;
         }
+        false
     }
 
     /// Connect to the server and complete the auth handshake, returning the
@@ -1806,17 +1817,46 @@ mod tests {
             let mut attempt = 5;
             // Far longer than the test timeout: only the path-return signal can
             // end the wait in time.
-            c.wait_backoff(Duration::from_secs(300), &mut attempt).await;
-            attempt
+            let resumed = c.wait_backoff(Duration::from_secs(300), &mut attempt).await;
+            (attempt, resumed)
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!task.is_finished(), "backoff ended while offline");
         client.set_network_available(true);
-        let attempt = tokio::time::timeout(Duration::from_secs(5), task)
+        let (attempt, resumed) = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("backoff did not resume on path return")
             .unwrap();
         assert_eq!(attempt, 0, "restored path should reset the backoff series");
+        assert!(resumed, "a parked backoff must report the path return");
+    }
+
+    /// A path lost *during* the backoff sleep switches it to parking: the wait
+    /// outlives its original delay, then resumes — backoff series reset, path
+    /// return reported — once the path comes back.
+    #[tokio::test(start_paused = true)]
+    async fn backoff_parks_when_path_lost_mid_sleep() {
+        let client = Arc::new(test_client());
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            let mut attempt = 5;
+            let resumed = c.wait_backoff(Duration::from_millis(100), &mut attempt).await;
+            (attempt, resumed)
+        });
+        // Part-way into the 100ms sleep, drop the path (paused time only
+        // advances while every task is idle, so this lands mid-sleep).
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.set_network_available(false);
+        // Well past the original delay: the wait must be parked, not timing out.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "backoff ended while offline");
+        client.set_network_available(true);
+        let (attempt, resumed) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("backoff did not resume on path return")
+            .unwrap();
+        assert_eq!(attempt, 0, "restored path should reset the backoff series");
+        assert!(resumed, "a mid-sleep loss must report the path return");
     }
 
     /// While the network is available a backoff is a plain sleep: it must run
@@ -1826,11 +1866,12 @@ mod tests {
         let client = test_client();
         let mut attempt = 3;
         let started = std::time::Instant::now();
-        client
+        let resumed = client
             .wait_backoff(Duration::from_millis(200), &mut attempt)
             .await;
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert_eq!(attempt, 3);
+        assert!(!resumed, "an uninterrupted sleep saw no path return");
     }
 
     #[test]
