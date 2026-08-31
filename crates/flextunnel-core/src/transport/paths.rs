@@ -61,6 +61,13 @@ pub struct CustomRelayStatus {
 pub struct ConnectionSnapshot {
     pub paths: Vec<ConnPath>,
     pub custom_relays: Vec<CustomRelayStatus>,
+    /// UDP datagrams sent on this connection since it was established. On
+    /// cellular, energy is per-wakeup rather than per-byte (every send buys
+    /// ~10s of high-power radio tail), so datagram counts sampled across an
+    /// interval are the cheap proxy for the connection's radio cost.
+    pub udp_tx_datagrams: u64,
+    /// UDP datagrams received on this connection since it was established.
+    pub udp_rx_datagrams: u64,
 }
 
 /// Snapshot the current path(s) of a live connection for a status UI, showing
@@ -108,9 +115,12 @@ pub async fn connection_snapshot(
 ) -> ConnectionSnapshot {
     let paths = connection_paths_from(&conn.paths());
     let custom_relays = probe_custom_relay_health(relay_config).await;
+    let stats = conn.stats();
     ConnectionSnapshot {
         paths,
         custom_relays,
+        udp_tx_datagrams: stats.udp_tx.datagrams,
+        udp_rx_datagrams: stats.udp_rx.datagrams,
     }
 }
 

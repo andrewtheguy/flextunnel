@@ -140,7 +140,11 @@ impl BridgeUpstream {
             // Log the selected path (relay/direct) and any later switch for the
             // lifetime of this connection.
             let _path_watcher = crate::transport::paths::watch_connection_paths(&connection);
-            let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv);
+            // A bridge runs server-to-server with no battery to protect, so its
+            // heartbeat stays at the foreground cadence permanently (the sender
+            // is held here so the receiver never reads as disconnected).
+            let (_always_foreground, foreground_rx) = tokio::sync::watch::channel(false);
+            let heartbeat = client_heartbeat_loop(ctrl_send, ctrl_recv, foreground_rx);
             let ended: ProxyResult<()> = tokio::select! {
                 r = heartbeat => r,
                 reason = connection.closed() => {

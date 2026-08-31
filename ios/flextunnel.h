@@ -18,6 +18,8 @@
  *        at a time; a second start while one is live returns NULL.
  *   3. flextunnel_health(handle) -> 1 running / 0 ended / -1 null  (poll)
  *   -  flextunnel_conn_path(handle, buf, len)             (on-demand path readout)
+ *   -  flextunnel_set_background(handle, 1|0)             (scene-phase changes)
+ *   -  flextunnel_set_network_available(handle, 1|0)      (NWPathMonitor updates)
  *   -  flextunnel_close_listeners(handle)                 (just before suspension)
  *   4. flextunnel_stop(handle)                            (on teardown)
  *
@@ -141,6 +143,28 @@ ptrdiff_t flextunnel_forward_statuses(const FlextunnelHandle *handle,
 int flextunnel_close_listeners(const FlextunnelHandle *handle);
 
 /*
+ * Report the app's scene state: 1 when backgrounded, 0 when foregrounded.
+ * Backgrounded, the core's app-level heartbeat — the connection's only periodic
+ * traffic — slows from 10s to 60s so an idle session wakes the cellular radio
+ * once a minute instead of six times; the foreground flip snaps it back and
+ * sends any overdue beat immediately. Idempotent.
+ *
+ * Returns 1 on success and -1 for a NULL handle.
+ */
+int flextunnel_set_background(const FlextunnelHandle *handle, int background);
+
+/*
+ * Report whether the device has a usable network path (from NWPathMonitor):
+ * 1 available, 0 unavailable. While unavailable the core's reconnect loop parks
+ * with no timers instead of burning backoff retries into a dead network; the
+ * flip back to available reconnects immediately with a fresh backoff series.
+ * Defaults to available if never called.
+ *
+ * Returns 1 on success and -1 for a NULL handle.
+ */
+int flextunnel_set_network_available(const FlextunnelHandle *handle, int available);
+
+/*
  * Liveness probe. Returns 1 while the connect/serve loop is running, 0 once it
  * has ended (gave up on a fatal error: bad node id, auth failure, or an
  * unreachable server on the first connect), and -1 for a NULL handle.
@@ -185,7 +209,8 @@ int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_
  *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
  *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}],
  *    "custom_relays":[
- *     {"url":"https://relay.example/","working":true,"error":null}]}
+ *     {"url":"https://relay.example/","working":true,"error":null}],
+ *    "udp_tx_datagrams":1234,"udp_rx_datagrams":1201}
  * A point-in-time snapshot of how the client currently reaches the server,
  * showing ALL discovered paths (not just the selected one). kind is "direct",
  * "relay", or "other" (forward-compatible catch-all); selected marks the path
@@ -199,6 +224,11 @@ int flextunnel_routes(const FlextunnelHandle *handle, char *out_buf, size_t out_
  * and null if the check could not run; error carries the failure detail. The
  * array is empty when the default relays are used. /healthz is unauthenticated:
  * it confirms the relay is up, not that a relay_auth_token is accepted.
+ *
+ * udp_tx_datagrams/udp_rx_datagrams count the UDP datagrams the live connection
+ * has sent/received since it was established (0 while disconnected). On cellular
+ * energy is per-wakeup rather than per-byte, so sampling the tx count over an
+ * interval is the cheap proxy for the tunnel's radio cost.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
  * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
