@@ -446,7 +446,12 @@ pub async fn create_server_endpoint(
         .await
         .context("Failed to create iroh endpoint")?;
 
-    wait_online(&endpoint).await?;
+    if let Err(e) = wait_online(&endpoint).await {
+        // Close before propagating: dropping a bound endpoint without
+        // `close()` is fatal under the release profile's panic=abort.
+        endpoint.close().await;
+        return Err(e);
+    }
     Ok(endpoint)
 }
 
