@@ -3,7 +3,7 @@
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use futures::future::join_all;
+use futures::future::{BoxFuture, join_all};
 use iroh::{
     Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     endpoint::{
@@ -450,48 +450,154 @@ pub async fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create a client endpoint (ephemeral identity).
-pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<Endpoint> {
-    create_client_endpoint_inner(relay_config, None).await
-}
-
-/// Create a **quick-mode** client endpoint: same as [`create_client_endpoint`]
-/// but bound to the given (session-ephemeral) `secret`, so the endpoint id the
-/// user entered on the quick server is the id this endpoint presents in the
-/// TLS handshake — that id is the quick client's sole credential. The identity
-/// is still never published (the client only dials), so pkarr publishing stays
-/// off exactly as for an anonymous client.
-pub async fn create_quick_client_endpoint(
-    relay_config: &RelayConfig,
-    secret: SecretKey,
-) -> Result<Endpoint> {
-    create_client_endpoint_inner(relay_config, Some(secret)).await
-}
-
-async fn create_client_endpoint_inner(
+/// Bind a client endpoint: no relay probe, no online wait — callers layer
+/// their own creation-vs-rebuild policy over this.
+async fn bind_client_endpoint(
     relay_config: &RelayConfig,
     secret: Option<SecretKey>,
 ) -> Result<Endpoint> {
-    print_relay_status(relay_config);
-
-    // Validate each custom relay individually (fail if any is unreachable); a
-    // no-op for the default relays.
-    probe_custom_relays(relay_config).await?;
-
     // `None` for the builder's lookup decision even with a quick secret: a
     // client never publishes its address (it only dials out).
     let mut builder = create_endpoint_builder(relay_config, None)?;
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
     }
+    builder.bind().await.context("Failed to create iroh endpoint")
+}
 
-    let endpoint = builder
-        .bind()
-        .await
-        .context("Failed to create iroh endpoint")?;
+/// Recipe producing a fresh, fully bound client endpoint — how a
+/// [`ClientEndpoint`] rebuilds itself mid-session.
+pub type EndpointFactory = Arc<dyn Fn() -> BoxFuture<'static, Result<Endpoint>> + Send + Sync>;
 
-    wait_online(&endpoint).await?;
-    Ok(endpoint)
+/// Bound wait on the old endpoint's graceful close during a rebuild. The close
+/// runs as its own task and is never cancelled (dropping a bound endpoint
+/// without `close()` is fatal under panic=abort — see the CLI's
+/// `close_endpoint_or_exit`); the bound only keeps the reconnect loop from
+/// stalling behind it, letting a slow close finish in the background.
+const REBUILD_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A client endpoint that can be **rebuilt** from scratch mid-session.
+///
+/// `Endpoint::network_change()` re-binds dead UDP transports, but a wedged
+/// endpoint can be broken beyond what a rebind repairs: a relay link lost to a
+/// ping timeout that never re-establishes, stale cached paths for the peer,
+/// dead discovery state. A process restart always recovers because it builds a
+/// brand-new endpoint; [`Self::rebuild`] gives the reconnect loop that same
+/// remedy in-process — fresh sockets, fresh relay connections, fresh discovery
+/// — without dropping the bound proxy listeners or the control socket.
+///
+/// The handle is `Clone` and shared: the reconnect loop escalates to
+/// [`Self::rebuild`] after repeated failures, while the embedder logs
+/// [`Self::id`] and [`Self::close`]s whatever endpoint is current at teardown.
+#[derive(Clone)]
+pub struct ClientEndpoint {
+    /// The live endpoint, swapped by [`Self::rebuild`]. Std lock: accessors
+    /// clone the handle out synchronously and never hold it across an await.
+    current: Arc<std::sync::RwLock<Endpoint>>,
+    factory: EndpointFactory,
+}
+
+impl ClientEndpoint {
+    /// Create a client endpoint (ephemeral identity).
+    pub async fn create(relay_config: &RelayConfig) -> Result<Self> {
+        Self::create_inner(relay_config, None).await
+    }
+
+    /// Create a **quick-mode** client endpoint: same as [`Self::create`] but
+    /// bound to the given (session-ephemeral) `secret`, so the endpoint id the
+    /// user entered on the quick server is the id this endpoint presents in the
+    /// TLS handshake — that id is the quick client's sole credential. The
+    /// identity is still never published (the client only dials), so pkarr
+    /// publishing stays off exactly as for an anonymous client.
+    pub async fn create_quick(relay_config: &RelayConfig, secret: SecretKey) -> Result<Self> {
+        Self::create_inner(relay_config, Some(secret)).await
+    }
+
+    async fn create_inner(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<Self> {
+        print_relay_status(relay_config);
+
+        // Validate each custom relay individually (fail if any is unreachable);
+        // a no-op for the default relays.
+        probe_custom_relays(relay_config).await?;
+
+        let endpoint = bind_client_endpoint(relay_config, secret.clone()).await?;
+        wait_online(&endpoint).await?;
+        Ok(Self::from_parts(
+            endpoint,
+            client_rebuild_factory(relay_config.clone(), secret),
+        ))
+    }
+
+    /// Wrap an externally bound endpoint with a caller-supplied rebuild recipe
+    /// (tests bind hermetic loopback endpoints and rebuild them the same way).
+    pub fn from_parts(endpoint: Endpoint, factory: EndpointFactory) -> Self {
+        Self {
+            current: Arc::new(std::sync::RwLock::new(endpoint)),
+            factory,
+        }
+    }
+
+    /// A clone of the current endpoint handle. Take it fresh per use: a handle
+    /// held across a [`Self::rebuild`] keeps pointing at the old, closed
+    /// endpoint.
+    pub fn endpoint(&self) -> Endpoint {
+        self.current.read().expect("client endpoint lock").clone()
+    }
+
+    /// The current endpoint id. Changes on rebuild for an ephemeral (keypair)
+    /// client; stable for a quick client (fixed secret).
+    pub fn id(&self) -> EndpointId {
+        self.endpoint().id()
+    }
+
+    /// Swap in a freshly built endpoint and close the old one. On error the
+    /// current endpoint stays in place, so the caller can simply retry with it.
+    pub async fn rebuild(&self) -> Result<()> {
+        let fresh = (self.factory)().await?;
+        let old = {
+            let mut current = self.current.write().expect("client endpoint lock");
+            std::mem::replace(&mut *current, fresh)
+        };
+        // Graceful close on its own task: bounded wait here, but the task is
+        // never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]).
+        let mut close = tokio::task::spawn(async move { old.close().await });
+        if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, &mut close)
+            .await
+            .is_err()
+        {
+            log::warn!("Old endpoint's close is slow; leaving it to finish in the background");
+        }
+        info!("Endpoint rebuilt; client node ID: {}", self.id());
+        Ok(())
+    }
+
+    /// Close the current endpoint gracefully (session teardown).
+    pub async fn close(&self) {
+        self.endpoint().close().await;
+    }
+}
+
+/// The rebuild recipe for a real client endpoint. Differs from first creation
+/// deliberately:
+///
+/// - **No per-relay probe.** At creation the probe validates the configuration
+///   (fail fast if *any* relay is down); during an outage that strictness
+///   would block recovery through the one relay that still answers.
+/// - **The online wait is tolerated failing.** Even fully offline, a fresh
+///   endpoint's mDNS discovery can still reach a LAN server — and the endpoint
+///   being replaced is known-bad anyway, so the swap can only help.
+fn client_rebuild_factory(relay_config: RelayConfig, secret: Option<SecretKey>) -> EndpointFactory {
+    Arc::new(move || {
+        let relay_config = relay_config.clone();
+        let secret = secret.clone();
+        Box::pin(async move {
+            let endpoint = bind_client_endpoint(&relay_config, secret).await?;
+            if let Err(e) = wait_online(&endpoint).await {
+                log::warn!("Rebuilt endpoint: {e:#}; continuing (local discovery may still work)");
+            }
+            Ok(endpoint)
+        })
+    })
 }
 
 #[cfg(test)]

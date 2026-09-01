@@ -230,6 +230,15 @@ Implemented in `ProxyClient::run` / `handle_failure`:
   backoff + jitter** (1s → 60s), indefinitely, unless `--max-reconnect-attempts`
   caps it or `--no-auto-reconnect` disables it.
 - Permanent errors (`AuthenticationFailed` / `Config`) never retry.
+- Every retry nudges `Endpoint::network_change()` (rebinds dead UDP sockets);
+  every **third** consecutive failure escalates to a **full endpoint rebuild**
+  (`ClientEndpoint::rebuild`): a freshly bound endpoint — new sockets, new
+  relay connections, fresh discovery — is swapped in and the wedged one is
+  closed in the background. This is the in-process equivalent of restarting the
+  client, for wedges a rebind can't fix (a relay link lost to a ping timeout
+  and never re-established, stale cached paths for the server). The rebuild
+  skips the startup per-relay probe and tolerates the online-wait failing, so
+  a partial outage never blocks recovery.
 - The local proxy listeners stay bound across reconnects. Off-list targets keep
   connecting directly; on-list requests are held for the reconnect — up to 45s
   (`TUNNEL_RECOVERY_HOLD`), deploy-style connection holding — and only then fail

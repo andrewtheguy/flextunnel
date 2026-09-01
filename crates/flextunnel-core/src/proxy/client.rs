@@ -5,7 +5,7 @@
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::signaling::{self, ControlMsg, Hello, Target};
 use crate::proxy::{dial, http, reserved, socks5, RoutedSet};
-use crate::transport::endpoint::RelayConfig;
+use crate::transport::endpoint::{ClientEndpoint, RelayConfig};
 use crate::transport::paths::{connection_paths, ConnPath, ConnectionSnapshot};
 use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL_IDLE, liveness_window};
 use anyhow::Result;
@@ -27,6 +27,16 @@ use tokio::sync::{Semaphore, watch};
 
 /// Reconnect backoff: base 1s, doubling per attempt, capped at 60s.
 const RECONNECT_BACKOFF_MAX: u64 = 60;
+/// Escalate to a full endpoint rebuild every this many consecutive failed
+/// reconnect attempts. The early attempts get the cheap `network_change()`
+/// nudge, which repairs dead UDP sockets; a wedge that survives the nudge plus
+/// two full connect timeouts is endpoint state a rebind cannot fix — a relay
+/// link lost to a ping timeout and never re-established, stale cached paths
+/// for the server — which only a fresh endpoint repairs (observed as "restart
+/// the client process and it connects instantly"; the rebuild is that restart,
+/// in-process). Rebuilding every Nth attempt (not once) keeps a long outage
+/// retrying from fresh state without paying the rebuild on every backoff.
+const REBUILD_ENDPOINT_ATTEMPTS: u32 = 3;
 /// Max jitter (ms) added to each backoff to avoid thundering reconnects.
 const RECONNECT_JITTER_MAX_MS: u64 = 500;
 /// Deadline for the server's handshake response. The QUIC keep-alive keeps the
@@ -448,8 +458,9 @@ impl ProxyClient {
     /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects:
     /// off-list targets keep connecting directly, while on-list requests are held
     /// for the reconnect (failing with network-unreachable only after
-    /// [`TUNNEL_RECOVERY_HOLD`]).
-    pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
+    /// [`TUNNEL_RECOVERY_HOLD`]). Reconnects that keep failing escalate to a
+    /// full endpoint rebuild every [`REBUILD_ENDPOINT_ATTEMPTS`] attempts.
+    pub async fn run(&self, endpoint: &ClientEndpoint) -> ProxyResult<()> {
         let socks = match self.config.socks_listen {
             Some(addr) => Some(TcpListener::bind(addr).await?),
             None => None,
@@ -469,7 +480,7 @@ impl ProxyClient {
     /// This path never enables the HTTP front-end.
     pub async fn run_with_listener(
         &self,
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoint,
         listener: TcpListener,
     ) -> ProxyResult<()> {
         self.run_with_listeners(endpoint, listener, None).await
@@ -483,7 +494,7 @@ impl ProxyClient {
     /// proxy listener.
     pub async fn run_with_listeners(
         &self,
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoint,
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
     ) -> ProxyResult<()> {
@@ -499,7 +510,7 @@ impl ProxyClient {
     /// connection. Both may be absent for a forwarding-only GUI session.
     pub async fn run_with_optional_listeners(
         &self,
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoint,
         socks_listener: Option<TcpListener>,
         http_listener: Option<TcpListener>,
     ) -> ProxyResult<()> {
@@ -526,7 +537,7 @@ impl ProxyClient {
     /// [`run_with_listeners`].
     pub async fn run_with_listeners_ext(
         &self,
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoint,
         socks_listener: TcpListener,
         http_listener: Option<TcpListener>,
         #[cfg(unix)] unix_listener: Option<UnixListener>,
@@ -543,7 +554,7 @@ impl ProxyClient {
 
     async fn run_with_optional_listeners_ext(
         &self,
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoint,
         socks_listener: Option<TcpListener>,
         http_listener: Option<TcpListener>,
         #[cfg(unix)] unix_listener: Option<UnixListener>,
@@ -628,7 +639,7 @@ impl ProxyClient {
     /// must succeed (fail fast); once connected, transient drops are retried.
     async fn manage_connection(
         &self,
-        endpoint: &Endpoint,
+        endpoint: &ClientEndpoint,
         current: &SharedConn,
         routed_set_shared: &SharedRoutedSet,
     ) -> ProxyResult<()> {
@@ -644,20 +655,34 @@ impl ProxyClient {
             self.set_connected(false);
             current.send_replace(None);
 
-            // Retrying after a failure: the endpoint's UDP sockets may be dead
-            // underneath it (iOS defuncts them while the process is suspended;
-            // a sleeping laptop can do the same) and iroh cannot always detect
-            // that by itself, leaving reconnects wedged forever. Nudging it
-            // re-checks and rebinds the transports — harmless when nothing
-            // actually changed.
-            if attempt > 0 || path_returned {
-                endpoint.network_change().await;
+            if attempt > 0 && attempt.is_multiple_of(REBUILD_ENDPOINT_ATTEMPTS) {
+                // Escalation: the nudge below wasn't enough — rebuild the
+                // endpoint from scratch (see [`REBUILD_ENDPOINT_ATTEMPTS`]).
+                // On a rebuild failure (e.g. no route to bind on a dead
+                // network) the current endpoint stays in place and this
+                // attempt proceeds with it — the next multiple retries the
+                // rebuild.
+                log::warn!("Reconnect still failing after {attempt} attempts; rebuilding the endpoint from scratch");
+                if let Err(e) = endpoint.rebuild().await {
+                    log::warn!("Endpoint rebuild failed ({e:#}); retrying with the current endpoint");
+                }
+            } else if attempt > 0 || path_returned {
+                // Retrying after a failure: the endpoint's UDP sockets may be dead
+                // underneath it (iOS defuncts them while the process is suspended;
+                // a sleeping laptop can do the same) and iroh cannot always detect
+                // that by itself, leaving reconnects wedged forever. Nudging it
+                // re-checks and rebinds the transports — harmless when nothing
+                // actually changed.
+                endpoint.endpoint().network_change().await;
             }
 
             // Establish (connect + auth). The handshake also learns the server's
             // tunnel set (drives split-tunneling) and returns the control-stream
-            // halves kept open for heartbeats.
-            let (connection, routed_set, ctrl_send, ctrl_recv) = match self.establish(endpoint).await
+            // halves kept open for heartbeats. The endpoint handle is taken
+            // fresh per attempt — a rebuild above swapped it.
+            let (connection, routed_set, ctrl_send, ctrl_recv) = match self
+                .establish(&endpoint.endpoint())
+                .await
             {
                 Ok(established) => {
                     ever_connected = true;

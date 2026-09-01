@@ -8,13 +8,16 @@
 //!
 //! [`BRIDGE_ALPN`]: crate::transport::BRIDGE_ALPN
 //!
-//! The connect/auth/heartbeat machinery mirrors [`super::client`], with one
-//! deliberate difference in reconnect policy: a bridge retries **forever** (no
+//! The connect/auth/heartbeat machinery mirrors [`super::client`], with two
+//! deliberate differences in reconnect policy: a bridge retries **forever** (no
 //! fail-fast first connect, no attempt cap). The peer server may simply not be
 //! up yet, and a server daemon must not exit — or stop serving its other
 //! routes — because a peer is down. While the upstream is down, matching
 //! streams fail with host-unreachable (see `route_to_bridge` in
-//! [`super::server`]).
+//! [`super::server`]). And a bridge never escalates to the client's endpoint
+//! rebuild: it dials on the **server's own endpoint**, which is also accepting
+//! inbound clients on its persistent identity — rebuilding it to unwedge one
+//! upstream would sever every connected client.
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::proxy::client::{calculate_backoff, client_heartbeat_loop, connect_with_timeout};
