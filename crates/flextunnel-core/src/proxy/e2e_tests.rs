@@ -22,7 +22,7 @@ use crate::proxy::{
     BridgeUpstream, BridgeUpstreamConfig, ClientAuth, ClientConfig, ForwardManager, ForwardSpec,
     ProxyClient, ProxyServer, ProxyServerParams, RoutedSet, ServerForwarder,
 };
-use crate::transport::endpoint::{AllowlistHook, EndpointAllowlists};
+use crate::transport::endpoint::{AllowlistHook, ClientEndpoint, EndpointAllowlists};
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
@@ -465,6 +465,101 @@ async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
     let _ = std::fs::remove_file(bl_path);
 }
 
+/// Endpoint-rebuild escalation: when reconnect attempts keep failing on an
+/// endpoint that is broken beyond repair (here: closed out from under the
+/// session — the loopback stand-in for a wedged endpoint whose relay link or
+/// path state never recovers), the reconnect loop must escalate to rebuilding
+/// the endpoint via its factory and reconnect on the fresh one. The old
+/// endpoint can never connect again, so recovery itself proves the rebuild
+/// ran; the changed node id confirms it.
+#[tokio::test]
+async fn reconnect_rebuilds_a_dead_endpoint() {
+    let server_ep = loopback_endpoint(SecretKey::generate(), true).await;
+    let server_id = server_ep.id();
+    let server_addr = EndpointAddr::new(server_id).with_ip_addr(server_ep.bound_sockets()[0]);
+    let bl_path = temp_blocklist("rebuild-endpoint");
+    let (routed_set, routed_cidrs) = loopback_cidr_set();
+    spawn_server_params(
+        server_ep.clone(),
+        ProxyServerParams {
+            routed_set,
+            routed_cidrs,
+            ..base_params(server_id, bl_path.clone())
+        },
+    );
+
+    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
+    let first_ep = loopback_endpoint_full(
+        SecretKey::generate(),
+        false,
+        lookup.clone(),
+        EndpointAllowlists::default(),
+    )
+    .await;
+    let client_ep = ClientEndpoint::from_parts(first_ep.clone(), {
+        let lookup = lookup.clone();
+        Arc::new(move || {
+            let lookup = lookup.clone();
+            Box::pin(async move {
+                Ok(loopback_endpoint_full(
+                    SecretKey::generate(),
+                    false,
+                    lookup,
+                    EndpointAllowlists::default(),
+                )
+                .await)
+            })
+        })
+    });
+    let first_id = client_ep.id();
+
+    let client = Arc::new(ProxyClient::new(ClientConfig {
+        server_node_id: server_id.to_string(),
+        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
+        socks_listen: None,
+        http_listen: None,
+        relay_urls: Vec::new(),
+        relay_auth_token: None,
+        auto_reconnect: true,
+        max_reconnect_attempts: None,
+    }));
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    {
+        let (client, ep) = (client.clone(), client_ep.clone());
+        tokio::spawn(async move {
+            if let Err(e) = client.run_with_listener(&ep, socks_listener).await {
+                eprintln!("e2e rebuild test client session ended: {e}");
+            }
+        });
+    }
+    let connected = || client.routes().lock().unwrap().connected;
+    wait_until("client to connect", connected).await;
+
+    // Kill the client's own endpoint. Every reconnect attempt on it fails
+    // immediately, so the backoff series reaches the rebuild escalation well
+    // inside the wait window.
+    first_ep.close().await;
+    wait_until("client to notice the drop", || !connected()).await;
+    // Own, longer bound: reaching the rebuild takes the full early backoff
+    // series (1s + 2s + 4s plus jitter), which crowds `wait_until`'s 10s.
+    let start = Instant::now();
+    while !connected() {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for client to reconnect on a rebuilt endpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_ne!(
+        client_ep.id(),
+        first_id,
+        "recovery must have swapped in a freshly built endpoint"
+    );
+
+    let _ = std::fs::remove_file(bl_path);
+}
+
 /// Deploy-style connection holding: a SOCKS request for an on-list target
 /// arriving while the tunnel link is down is *held* for the client's own
 /// reconnect and then proceeds transparently on the fresh connection, instead
@@ -502,6 +597,24 @@ async fn on_list_request_is_held_across_reconnect() {
         EndpointAllowlists::default(),
     )
     .await;
+    // Hermetic rebuild recipe: should the session escalate to an endpoint
+    // rebuild mid-test, the replacement is another loopback endpoint sharing
+    // the same externally-held lookup.
+    let client_ep = ClientEndpoint::from_parts(client_ep, {
+        let lookup = lookup.clone();
+        Arc::new(move || {
+            let lookup = lookup.clone();
+            Box::pin(async move {
+                Ok(loopback_endpoint_full(
+                    SecretKey::generate(),
+                    false,
+                    lookup,
+                    EndpointAllowlists::default(),
+                )
+                .await)
+            })
+        })
+    });
 
     // The full reconnecting client session with a real SOCKS front-end.
     let client = Arc::new(ProxyClient::new(ClientConfig {

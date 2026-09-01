@@ -78,7 +78,7 @@ use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
 };
-use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig};
 use flextunnel_core::transport::paths::ConnPathKind;
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
@@ -92,7 +92,7 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 pub struct FlextunnelHandle {
     runtime: tokio::runtime::Runtime,
     /// Kept so [`flextunnel_stop`] can close it gracefully before drop.
-    endpoint: iroh::Endpoint,
+    endpoint: ClientEndpoint,
     /// The client driving the serve loop. Shared with the spawned `task` (which
     /// holds a clone) so status callers can snapshot its live iroh paths on
     /// demand via [`flextunnel_conn_path`].
@@ -326,7 +326,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let endpoint = runtime
-        .block_on(create_client_endpoint(&relay_config))
+        .block_on(ClientEndpoint::create(&relay_config))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
 
     let client = Arc::new(ProxyClient::new(ClientConfig {

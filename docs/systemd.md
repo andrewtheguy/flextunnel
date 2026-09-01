@@ -58,10 +58,13 @@ The client already supervises itself where it matters:
 
 - After the **first** successful connection, auto-reconnect (on by default)
   retries transient drops internally with exponential backoff, indefinitely.
-  The process does not exit, so systemd never gets involved. Don't disable
-  `auto_reconnect` or set `max_reconnect_attempts` under systemd — that just
-  replaces the client's backoff with unit restarts, which re-bind listeners
-  and drop held proxy requests.
+  Reconnects that keep failing escalate every third attempt to rebuilding the
+  iroh endpoint from scratch — the in-process equivalent of a unit restart,
+  covering wedges (a dead relay link, stale path state) that only a fresh
+  endpoint repairs. The process does not exit, so systemd never gets involved.
+  Don't disable `auto_reconnect` or set `max_reconnect_attempts` under
+  systemd — that just replaces the client's backoff with unit restarts, which
+  re-bind listeners and drop held proxy requests.
 - The client **exits nonzero** when the *first* connection fails (server down,
   network not up yet at boot) and on permanent auth/config errors.
   `Restart=on-failure` + `RestartSec` covers the boot-time window where the

@@ -19,9 +19,7 @@ use flextunnel_core::forwards::{
 };
 use flextunnel_core::iroh::SecretKey;
 use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, reserved};
-use flextunnel_core::transport::endpoint::{
-    RelayConfig, create_client_endpoint, create_quick_client_endpoint,
-};
+use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig};
 use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
 use flextunnel_core::{app, auth, config};
 
@@ -157,7 +155,7 @@ pub async fn run_quick(r: config::ResolvedClient, client_secret: SecretKey) -> R
 /// endpoint, the proxy client and its live routes, the bound proxy listeners,
 /// the forward manager + set, and the status/mutation state.
 struct SessionRuntime {
-    endpoint: flextunnel_core::iroh::Endpoint,
+    endpoint: ClientEndpoint,
     client: std::sync::Arc<ProxyClient>,
     routes: std::sync::Arc<std::sync::Mutex<flextunnel_core::proxy::TunnelRoutes>>,
     socks_listener: Option<tokio::net::TcpListener>,
@@ -199,11 +197,11 @@ async fn build_session(
         .context("Invalid relay configuration")?;
     let (endpoint, auth) = match auth {
         SessionAuth::Key(client_key) => (
-            create_client_endpoint(&relay_config).await,
+            ClientEndpoint::create(&relay_config).await,
             ClientAuth::Key(Box::new(client_key)),
         ),
         SessionAuth::Quick(secret) => (
-            create_quick_client_endpoint(&relay_config, secret).await,
+            ClientEndpoint::create_quick(&relay_config, secret).await,
             ClientAuth::QuickAllowlisted,
         ),
     };
@@ -353,6 +351,10 @@ async fn drive_session(
                     fwd_mgr.apply(&forwards);
                 }
                 state.observe_connection(routes.lock().map(|r| r.connected).unwrap_or(false));
+                // The reconnect loop rebuilds the endpoint after repeated
+                // failures, which changes the (ephemeral) node id — keep the
+                // status display current.
+                state.client_node_id = endpoint.id().to_string();
             }
             cmd = ipc_rx.recv() => match cmd {
                 Some(IpcCmd::Status(reply)) => {
@@ -420,7 +422,7 @@ async fn drive_session(
         }
         IpcSink::Panel(panel) => Some(panel),
     };
-    crate::close_endpoint_or_exit(&endpoint).await;
+    crate::close_endpoint_or_exit(&endpoint.endpoint()).await;
     if let Some(panel) = panel {
         let _ = panel.await;
     }

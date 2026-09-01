@@ -11,7 +11,7 @@
 use crate::config::Profile;
 use flextunnel_core::forwards::{ForwardManager, ForwardStatus, PortForward};
 use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, TunnelRoutes};
-use flextunnel_core::transport::endpoint::{RelayConfig, create_client_endpoint};
+use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig};
 use flextunnel_core::transport::paths::ConnectionSnapshot;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -443,7 +443,7 @@ async fn run_session(
     };
     let mut create = tokio::spawn({
         let relay_config = relay_config.clone();
-        async move { create_client_endpoint(&relay_config).await }
+        async move { ClientEndpoint::create(&relay_config).await }
     });
     let endpoint = loop {
         tokio::select! {
