@@ -648,6 +648,9 @@ Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to
 - [`docs/local-ci.md`](docs/local-ci.md) — running the CI workflow's clippy and
   test steps locally on all three host platforms (macOS natively, Linux and
   Windows over ssh) against the working tree, via `ci/all.sh`.
+- [`docs/systemd.md`](docs/systemd.md) — running the CLI client under systemd:
+  one template-unit instance per server, why `Restart=on-failure` is the whole
+  restart policy, attaching the control panel, journald logging.
 - [`docs/http-proxy-roadmap.md`](docs/http-proxy-roadmap.md) — the HTTP proxy
   front-end (CONNECT tunneling + absolute-URI forwarding): motivation, design,
   and remaining hardening work.
