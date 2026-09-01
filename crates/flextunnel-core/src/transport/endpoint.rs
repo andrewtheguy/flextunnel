@@ -521,7 +521,12 @@ impl ClientEndpoint {
         probe_custom_relays(relay_config).await?;
 
         let endpoint = bind_client_endpoint(relay_config, secret.clone()).await?;
-        wait_online(&endpoint).await?;
+        if let Err(e) = wait_online(&endpoint).await {
+            // Close before propagating: dropping a bound endpoint without
+            // `close()` is fatal under the release profile's panic=abort.
+            endpoint.close().await;
+            return Err(e);
+        }
         Ok(Self::from_parts(
             endpoint,
             client_rebuild_factory(relay_config.clone(), secret),
