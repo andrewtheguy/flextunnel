@@ -19,8 +19,8 @@ use crate::blocklist::BlockList;
 use crate::proxy::signaling::{self, BridgeHello, Hello, HelloResponse, Target};
 use crate::proxy::dns_forward::DnsForwarder;
 use crate::proxy::{
-    BridgeUpstream, BridgeUpstreamConfig, ForwardManager, ForwardSpec, ProxyServer,
-    ProxyServerParams, RoutedSet, ServerForwarder,
+    BridgeUpstream, BridgeUpstreamConfig, ClientAuth, ClientConfig, ForwardManager, ForwardSpec,
+    ProxyClient, ProxyServer, ProxyServerParams, RoutedSet, ServerForwarder,
 };
 use crate::transport::endpoint::{AllowlistHook, EndpointAllowlists};
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
@@ -462,6 +462,122 @@ async fn server_direct_forward_relays_and_server_rejects_off_list_target() {
     assert_eq!(manager.statuses()[0].active, 1);
 
     drop(manager);
+    let _ = std::fs::remove_file(bl_path);
+}
+
+/// Deploy-style connection holding: a SOCKS request for an on-list target
+/// arriving while the tunnel link is down is *held* for the client's own
+/// reconnect and then proceeds transparently on the fresh connection, instead
+/// of being refused with network-unreachable. Runs the full [`ProxyClient`]
+/// session, kills the server endpoint mid-session, issues the request during
+/// the outage, resurrects the server on the same identity, and asserts the
+/// held request completes end-to-end.
+#[tokio::test]
+async fn on_list_request_is_held_across_reconnect() {
+    let echo_port = spawn_echo().await;
+
+    // First server incarnation, on a secret the test keeps to resurrect it.
+    let server_secret = SecretKey::generate();
+    let server_ep = loopback_endpoint(server_secret.clone(), true).await;
+    let server_id = server_ep.id();
+    let server_addr = EndpointAddr::new(server_id).with_ip_addr(server_ep.bound_sockets()[0]);
+    let bl_path = temp_blocklist("hold-reconnect");
+    let (routed_set, routed_cidrs) = loopback_cidr_set();
+    spawn_server_params(
+        server_ep.clone(),
+        ProxyServerParams {
+            routed_set,
+            routed_cidrs,
+            ..base_params(server_id, bl_path.clone())
+        },
+    );
+
+    // The client endpoint's lookup is held externally so the resurrected
+    // server's fresh address can be published mid-test.
+    let lookup = MemoryLookup::from_endpoint_info(vec![server_addr]);
+    let client_ep = loopback_endpoint_full(
+        SecretKey::generate(),
+        false,
+        lookup.clone(),
+        EndpointAllowlists::default(),
+    )
+    .await;
+
+    // The full reconnecting client session with a real SOCKS front-end.
+    let client = Arc::new(ProxyClient::new(ClientConfig {
+        server_node_id: server_id.to_string(),
+        auth: ClientAuth::Key(Box::new(test_client_key().clone())),
+        socks_listen: None,
+        http_listen: None,
+        relay_urls: Vec::new(),
+        relay_auth_token: None,
+        auto_reconnect: true,
+        max_reconnect_attempts: None,
+    }));
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_addr = socks_listener.local_addr().unwrap();
+    {
+        let (client, ep) = (client.clone(), client_ep.clone());
+        tokio::spawn(async move {
+            if let Err(e) = client.run_with_listener(&ep, socks_listener).await {
+                eprintln!("e2e hold test client session ended: {e}");
+            }
+        });
+    }
+    let connected = || client.routes().lock().unwrap().connected;
+    wait_until("client to connect", connected).await;
+
+    // Drop the tunnel out from under the session and wait for it to notice.
+    server_ep.close().await;
+    wait_until("client to notice the drop", || !connected()).await;
+
+    // Issue the on-list request during the outage: handshake completes (the
+    // listener is up), but the CONNECT reply is held for the reconnect.
+    let mut app = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
+    app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    with_timeout(app.read_exact(&mut method)).await.unwrap();
+    assert_eq!(method, [0x05, 0x00], "no-auth method selected");
+    let p = echo_port.to_be_bytes();
+    app.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, p[0], p[1]])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    let held = tokio::time::timeout(Duration::from_millis(500), app.read_exact(&mut reply)).await;
+    assert!(held.is_err(), "on-list request was answered instead of held");
+
+    // Resurrect the server on the same identity (a fresh nonce — a restart,
+    // not a duplicate) and publish its new address to the client's lookup.
+    let server_ep2 = loopback_endpoint(server_secret, true).await;
+    lookup.set_endpoint_info(
+        EndpointAddr::new(server_id).with_ip_addr(server_ep2.bound_sockets()[0]),
+    );
+    let (routed_set, routed_cidrs) = loopback_cidr_set();
+    spawn_server_params(
+        server_ep2,
+        ProxyServerParams {
+            routed_set,
+            routed_cidrs,
+            ..base_params(server_id, bl_path.clone())
+        },
+    );
+
+    // The reconnect (backoff ~1s) wakes the held request, which then proceeds:
+    // the echo greeting arriving through the SOCKS stream proves it.
+    with_timeout(app.read_exact(&mut reply)).await.unwrap();
+    assert_eq!(
+        reply[1],
+        signaling::REP_SUCCESS,
+        "held request should succeed once the tunnel is back"
+    );
+    let mut greeting = [0u8; 5];
+    with_timeout(app.read_exact(&mut greeting)).await.unwrap();
+    assert_eq!(&greeting, b"HELLO");
+    app.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    with_timeout(app.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+
     let _ = std::fs::remove_file(bl_path);
 }
 

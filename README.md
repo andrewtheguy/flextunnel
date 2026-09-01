@@ -564,8 +564,10 @@ in the handshake response, so there is no client list to keep in sync:
   targets and connects everything else **directly** from its own network
   (split-tunneling). The direct path is independent of the tunnel, so off-list
   targets keep connecting even while the tunnel is down; an on-list target during
-  a drop/backoff gets a SOCKS5 network-unreachable reply (`0x03`) rather than
-  hanging.
+  a drop/backoff is held for the client's own reconnect (up to 45s, deploy-style
+  connection holding) and proceeds transparently once the link is back — only a
+  reconnect that never lands within the hold gets a network-unreachable failure
+  (SOCKS5 reply `0x03`; the HTTP front-end maps it to `502 Bad Gateway`).
 - **Server** — it also enforces the same list independently as a **whitelist**,
   **rejecting** any tunnel request for a target not on it (SOCKS5 reply `0x02`).
   This is a defense-in-depth boundary against a misconfigured or untrusted
@@ -614,8 +616,8 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   `--max-reconnect-attempts` caps it or auto-reconnect is disabled.
 - A permanent error (auth/config) never retries.
 - The local proxy listeners stay bound across reconnects. Off-list targets keep
-  connecting directly; on-list requests fail immediately with a network-unreachable
-  reply until the tunnel recovers.
+  connecting directly; on-list requests are held for the reconnect (up to 45s)
+  and only then fail with a network-unreachable reply.
 
 ## Logging
 

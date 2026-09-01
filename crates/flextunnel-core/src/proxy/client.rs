@@ -68,6 +68,17 @@ pub(crate) async fn connect_with_timeout(
 /// off; without it a server that stalls after accepting the stream would hang
 /// the local SOCKS5 connection forever.
 const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an on-list request arriving while the tunnel link is down is held
+/// waiting for the core's own reconnect before being refused with a
+/// network-unreachable reply — connection holding in the style of a deploy
+/// router: a routed page load racing a transient drop waits out the reconnect
+/// and then proceeds as if nothing happened, instead of surfacing an error the
+/// user must retry by hand. Sized to cover a silent drop end-to-end in the
+/// foreground: detection takes up to [`liveness_window`] of
+/// [`HEARTBEAT_INTERVAL`] (33s), then the early backoff steps plus the
+/// connect+handshake; a reconnect that hasn't landed by then is genuinely
+/// stuck, and the bound keeps the failure inside a browser's own patience.
+const TUNNEL_RECOVERY_HOLD: Duration = Duration::from_secs(45);
 /// Deadline for the local app to complete its SOCKS5 handshake (method
 /// negotiation + CONNECT request). A peer that connects to the loopback
 /// listener but sends nothing would otherwise pin the spawned task and socket
@@ -98,11 +109,20 @@ const REBIND_AFTER_CONSECUTIVE_ABORTS: u64 = 4;
 /// connection holds a socket plus a QUIC stream). Generous for the real
 /// client: a browser's worst case is a few dozen parallel fetches.
 const MAX_ACTIVE_LOCAL_CONNS: usize = 256;
+/// Cap on requests concurrently *held* for a tunnel reconnect per local
+/// front-end listener (see [`wait_for_tunnel`]). A held request parks with its
+/// [`MAX_ACTIVE_LOCAL_CONNS`] permit for up to [`TUNNEL_RECOVERY_HOLD`], so
+/// without a separate bound a burst of on-list retries during an outage could
+/// pin every permit and starve the off-list/direct traffic a drop is supposed
+/// to leave working. At this cap further on-list requests fall back to the
+/// pre-hold behavior: an immediate network-unreachable reply.
+const MAX_HELD_CONNS: usize = 64;
 
 /// The live QUIC connection shared with the always-on accept loop; `None` while
 /// disconnected (during a drop/backoff), so off-list targets still connect
-/// directly and on-list targets get a clean unreachable reply.
-type SharedConn = Arc<Mutex<Option<Connection>>>;
+/// directly. Published over a watch channel so on-list requests arriving during
+/// the gap can subscribe and hold for the reconnect (see [`wait_for_tunnel`]).
+type SharedConn = Arc<watch::Sender<Option<Connection>>>;
 /// The route policy (tunnel set) shared with the accept loop. `None` until the
 /// first handshake learns it, then `Some` for the rest of the process — retained
 /// across drops so split-tunnel routing keeps working while the connection is
@@ -166,8 +186,7 @@ impl ServerForwarder {
     ) -> Result<tokio::io::Join<RecvStream, SendStream>> {
         let conn = self
             .current
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("tunnel is not connected"))?;
         let opened = tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, open_tunnel(&conn, target))
@@ -193,7 +212,7 @@ impl ServerForwarder {
     #[cfg(test)]
     pub(crate) fn connected(connection: Connection) -> Self {
         Self {
-            current: Arc::new(Mutex::new(Some(connection))),
+            current: Arc::new(watch::Sender::new(Some(connection))),
         }
     }
 }
@@ -289,7 +308,7 @@ impl ProxyClient {
         Self {
             config,
             routes: Arc::new(Mutex::new(TunnelRoutes::default())),
-            current: Arc::new(Mutex::new(None)),
+            current: Arc::new(watch::Sender::new(None)),
             instance_nonce: rand::rng().random(),
             nonce_tracker: Mutex::new(ServerNonceTracker::default()),
             duplicate_server: AtomicBool::new(false),
@@ -376,7 +395,7 @@ impl ProxyClient {
     /// connect). Cheap and synchronous — [`connection_paths`] reads a
     /// point-in-time snapshot, so no background watcher is involved.
     pub fn conn_paths(&self) -> Vec<ConnPath> {
-        match self.current.lock().expect("connection lock").as_ref() {
+        match self.current.borrow().as_ref() {
             Some(conn) => connection_paths(conn),
             None => Vec::new(),
         }
@@ -388,15 +407,10 @@ impl ProxyClient {
     /// Async because the relay health check performs on-demand HTTP; awaited when
     /// a snapshot is built so it never blocks the runtime. Returns an empty
     /// snapshot while disconnected (custom-relay health is only reported while the
-    /// tunnel is up, matching the paths list). The connection is cloned out from
-    /// under the std lock before the `.await`, so the lock is never held across it.
+    /// tunnel is up, matching the paths list). The connection is cloned out of the
+    /// watch borrow before the `.await`, so the borrow is never held across it.
     pub async fn connection_snapshot(&self) -> ConnectionSnapshot {
-        let conn = self
-            .current
-            .lock()
-            .expect("connection lock")
-            .as_ref()
-            .cloned();
+        let conn = self.current.borrow().clone();
         let Some(conn) = conn else {
             return ConnectionSnapshot::default();
         };
@@ -432,8 +446,9 @@ impl ProxyClient {
     /// Once connected at least once, transient drops are retried with exponential
     /// backoff, indefinitely (unless `--max-reconnect-attempts` caps it or
     /// `--no-auto-reconnect` is set). The listeners stay bound across reconnects:
-    /// off-list targets keep connecting directly, while on-list requests fail with
-    /// network-unreachable until the tunnel recovers.
+    /// off-list targets keep connecting directly, while on-list requests are held
+    /// for the reconnect (failing with network-unreachable only after
+    /// [`TUNNEL_RECOVERY_HOLD`]).
     pub async fn run(&self, endpoint: &Endpoint) -> ProxyResult<()> {
         let socks = match self.config.socks_listen {
             Some(addr) => Some(TcpListener::bind(addr).await?),
@@ -627,7 +642,7 @@ impl ProxyClient {
         loop {
             // Until (re)authenticated, nothing is being forwarded.
             self.set_connected(false);
-            *current.lock().expect("connection lock") = None;
+            current.send_replace(None);
 
             // Retrying after a failure: the endpoint's UDP sockets may be dead
             // underneath it (iOS defuncts them while the process is suspended;
@@ -662,14 +677,17 @@ impl ProxyClient {
             // against them; the policy is retained on the next drop (never reset to
             // None once known, so we only fail closed before the *first* connect).
             *routed_set_shared.lock().expect("routed-set lock") = Some(routed_set);
-            *current.lock().expect("connection lock") = Some(connection.clone());
+            // Publishing the reconnected handle wakes every request held in
+            // [`wait_for_tunnel`], which then proceeds on the fresh connection.
+            current.send_replace(Some(connection.clone()));
 
             // Keep the connection alive until it drops, then reconnect (or exit).
             let maintained = self.maintain(&connection, ctrl_send, ctrl_recv).await;
             // The connection is no longer live; clear the FFI-visible flag and the
-            // shared handle so on-list targets fail cleanly during the gap.
+            // shared handle so on-list targets hold for the reconnect (and fail
+            // cleanly if it doesn't land) during the gap.
             self.set_connected(false);
-            *current.lock().expect("connection lock") = None;
+            current.send_replace(None);
             if let Err(e) = maintained {
                 match self.handle_failure(e, ever_connected, &mut attempt) {
                     Ok(backoff) => {
@@ -1259,6 +1277,7 @@ async fn accept_loop<P: LocalProto>(
     let addr = listener.local_addr()?;
     let mut retry = AcceptRetry::new("Local proxy");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
+    let hold_limiter = Arc::new(Semaphore::new(MAX_HELD_CONNS));
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1301,9 +1320,12 @@ async fn accept_loop<P: LocalProto>(
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
         let proto = proto.clone();
+        let hold_limiter = hold_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_local_conn(proto, tcp, current, routed_set_shared).await {
+            if let Err(e) =
+                handle_local_conn(proto, tcp, current, routed_set_shared, hold_limiter).await
+            {
                 log::debug!("proxy connection from {peer} ended: {e}");
             }
         });
@@ -1334,6 +1356,7 @@ async fn accept_loop_unix(
         .and_then(|a| a.as_pathname().map(|p| p.to_path_buf()));
     let mut retry = AcceptRetry::new("Unix SOCKS5");
     let limiter = Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_CONNS));
+    let hold_limiter = Arc::new(Semaphore::new(MAX_HELD_CONNS));
     let mut warned_saturated = false;
     loop {
         let accepted = tokio::select! {
@@ -1374,10 +1397,12 @@ async fn accept_loop_unix(
         };
         let current = current.clone();
         let routed_set_shared = routed_set_shared.clone();
+        let hold_limiter = hold_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(e) =
-                handle_local_conn(Socks5Proto, stream, current, routed_set_shared).await
+                handle_local_conn(Socks5Proto, stream, current, routed_set_shared, hold_limiter)
+                    .await
             {
                 log::debug!("unix proxy connection ended: {e}");
             }
@@ -1407,13 +1432,16 @@ async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListene
 /// Handle one local proxy connection: parse the front-end request, then route by
 /// the current route policy — refused with a general-failure reply until the
 /// policy is known (fail closed), otherwise an on-list target is tunneled to the
-/// server (or answered with a network-unreachable reply if the tunnel is down)
-/// and an off-list target is dialed directly from this device.
+/// server (held up to [`TUNNEL_RECOVERY_HOLD`] for the reconnect if the tunnel
+/// is down — concurrent holds capped by `hold_limiter` — then answered with a
+/// network-unreachable reply) and an off-list target is dialed directly from
+/// this device.
 async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     proto: P,
     mut tcp: S,
     current: SharedConn,
     routed_set_shared: SharedRoutedSet,
+    hold_limiter: Arc<Semaphore>,
 ) -> Result<()> {
     // Bound the local handshake so a peer that connects and sends nothing can't
     // pin this task and its socket indefinitely.
@@ -1449,11 +1477,13 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     }
 
     // On-list: needs a live tunnel. If the connection is down (a drop/backoff),
-    // answer with a network-unreachable reply so the app shows a connection error
-    // for this routed target instead of hanging on a dead stream.
-    let conn = { current.lock().expect("connection lock").clone() };
-    let Some(conn) = conn else {
-        log::debug!("Tunnel down; on-list target unreachable: {target:?}");
+    // hold the request for the core's own reconnect — up to
+    // [`TUNNEL_RECOVERY_HOLD`] — so a routed page load racing a transient drop
+    // proceeds transparently once the link is back. Only a reconnect that never
+    // lands answers with a network-unreachable reply, so the app shows a
+    // connection error for this routed target instead of hanging forever.
+    let Some(conn) = wait_for_tunnel(&current, &hold_limiter).await else {
+        log::debug!("Tunnel still down after hold; on-list target unreachable: {target:?}");
         let _ = proto.reply(&mut tcp, signaling::REP_NET_UNREACHABLE).await;
         return Ok(());
     };
@@ -1499,6 +1529,36 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     let mut iroh = tokio::io::join(recv, send);
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut iroh).await;
     Ok(())
+}
+
+/// The live tunnel connection, immediately when one is up, otherwise a bounded
+/// wait for the reconnect loop to publish a replacement. `None` once
+/// [`TUNNEL_RECOVERY_HOLD`] elapses — or the session is tearing down (sender
+/// gone) — without a connection. Concurrent holds are capped by `holds`
+/// ([`MAX_HELD_CONNS`] per listener): at the cap the wait is skipped entirely,
+/// so parked on-list requests can never pin the whole
+/// [`MAX_ACTIVE_LOCAL_CONNS`] budget that off-list/direct traffic shares.
+async fn wait_for_tunnel(current: &SharedConn, holds: &Semaphore) -> Option<Connection> {
+    let mut live = current.subscribe();
+    if let Some(conn) = live.borrow().clone() {
+        return Some(conn);
+    }
+    let Ok(_hold) = holds.try_acquire() else {
+        // Re-check before giving up: a reconnect landing between the borrow
+        // above and the failed acquire should still be served.
+        log::debug!("Hold capacity exhausted; not holding on-list request");
+        return live.borrow().clone();
+    };
+    log::debug!(
+        "Tunnel down; holding on-list request up to {}s for the reconnect",
+        TUNNEL_RECOVERY_HOLD.as_secs()
+    );
+    // `wait_for` re-inspects the current value first, so a publish racing the
+    // borrow above is never missed.
+    match tokio::time::timeout(TUNNEL_RECOVERY_HOLD, live.wait_for(|conn| conn.is_some())).await {
+        Ok(Ok(conn)) => conn.clone(),
+        _ => None,
+    }
 }
 
 /// Connect to `target` directly from this device (bypassing the tunnel) and pipe
@@ -1619,7 +1679,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = test_client();
         let close = client.local_close.subscribe();
-        let current: SharedConn = Arc::new(Mutex::new(None));
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
         let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
         let task = {
             let (current, routed) = (current.clone(), routed.clone());
@@ -1658,7 +1718,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = test_client();
         let close = client.local_close.subscribe();
-        let current: SharedConn = Arc::new(Mutex::new(None));
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
         let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
         let task = {
             let (current, routed) = (current.clone(), routed.clone());
@@ -1702,7 +1762,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let client = test_client();
         let close = client.local_close.subscribe();
-        let current: SharedConn = Arc::new(Mutex::new(None));
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
         let routed: SharedRoutedSet = Arc::new(Mutex::new(None));
         let task = {
             let (current, routed) = (current.clone(), routed.clone());
@@ -1775,7 +1835,7 @@ mod tests {
         // 127.0.0.1 is off-list, so the CONNECT takes the direct path.
         let routed = RoutedSet::new(&["nothing.internal".to_string()], &["10.0.0.0/8".to_string()])
             .unwrap();
-        let current: SharedConn = Arc::new(Mutex::new(None));
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
         let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
         let (_close_tx, close_rx) = watch::channel(false);
         tokio::spawn(async move {
@@ -1874,6 +1934,67 @@ mod tests {
         assert!(!resumed, "an uninterrupted sleep saw no path return");
     }
 
+    /// While the tunnel stays down a held request must wait out the full
+    /// recovery window before giving up — the hold is a real wait, not a
+    /// fail-fast with extra steps.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_hold_times_out_after_recovery_window() {
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
+        let holds = Semaphore::new(MAX_HELD_CONNS);
+        let started = tokio::time::Instant::now();
+        assert!(wait_for_tunnel(&current, &holds).await.is_none());
+        assert!(started.elapsed() >= TUNNEL_RECOVERY_HOLD);
+        // The hold permit is released once the wait gives up.
+        assert_eq!(holds.available_permits(), MAX_HELD_CONNS);
+    }
+
+    /// At the hold cap the wait is skipped: with no permits left a hold must
+    /// give up immediately (the pre-hold fail-fast) instead of parking.
+    #[tokio::test]
+    async fn tunnel_hold_fails_fast_at_hold_cap() {
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
+        let exhausted = Semaphore::new(0);
+        let started = std::time::Instant::now();
+        assert!(wait_for_tunnel(&current, &exhausted).await.is_none());
+        assert!(
+            started.elapsed() < TUNNEL_RECOVERY_HOLD,
+            "an at-cap request must not wait out the recovery hold"
+        );
+    }
+
+    /// An on-list request arriving while the tunnel is down is *held* for the
+    /// reconnect — the SOCKS reply must not arrive in the window where the old
+    /// fail-fast behavior answered network-unreachable immediately. (The
+    /// held-then-proceeds path needs a real reconnect; see the e2e test
+    /// `on_list_request_is_held_across_reconnect`.)
+    #[tokio::test]
+    async fn on_list_request_holds_while_tunnel_down() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Loopback is on-list; no connection is published (drop/backoff).
+        let routed = RoutedSet::new(&[], &["127.0.0.0/8".to_string()]).unwrap();
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
+        let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
+        tokio::spawn(async move {
+            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = handle_local_conn(Socks5Proto, tcp, current, policy, holds).await;
+        });
+
+        let mut app = TcpStream::connect(addr).await.unwrap();
+        app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        app.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00], "no-auth method selected");
+        app.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        let held =
+            tokio::time::timeout(Duration::from_millis(750), app.read_exact(&mut reply)).await;
+        assert!(held.is_err(), "on-list request was answered instead of held");
+    }
+
     #[test]
     fn restart_sequence_not_flagged_as_duplicate() {
         let c = test_client();
@@ -1942,11 +2063,14 @@ mod tests {
             &["10.0.0.0/8".to_string()],
         )
         .unwrap();
-        let current: SharedConn = Arc::new(Mutex::new(None));
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
         let policy: SharedRoutedSet = Arc::new(Mutex::new(Some(Arc::new(routed))));
         tokio::spawn(async move {
+            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
             let (tcp, _) = proxy.accept().await.unwrap();
-            handle_local_conn(HttpProto, tcp, current, policy).await.unwrap();
+            handle_local_conn(HttpProto, tcp, current, policy, holds)
+                .await
+                .unwrap();
         });
 
         let mut app = TcpStream::connect(proxy_addr).await.unwrap();
