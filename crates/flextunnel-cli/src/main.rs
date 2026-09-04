@@ -940,13 +940,17 @@ async fn run_server(
                         "Endpoint rebuild failed: {e:#}; retrying in {}s",
                         REBUILD_RETRY.as_secs()
                     );
+                    // Nothing is bound while waiting here, so both exits
+                    // below return directly: there is no endpoint to close.
                     tokio::select! {
                         _ = tokio::time::sleep(REBUILD_RETRY) => {}
                         sig = &mut shutdown => {
-                            // Nothing is bound right now, so there is no
-                            // endpoint to close on the way out.
                             sig?;
                             log::info!("Received shutdown signal, stopping server");
+                            return Ok(());
+                        }
+                        _ = &mut grace => {
+                            log::warn!("Quick mode: no client connected within 5 minutes — exiting");
                             return Ok(());
                         }
                     }
