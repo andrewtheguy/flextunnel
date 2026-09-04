@@ -137,7 +137,9 @@ type SharedConn = Arc<watch::Sender<Option<Connection>>>;
 /// first handshake learns it, then `Some` for the rest of the process — retained
 /// across drops so split-tunnel routing keeps working while the connection is
 /// down. While it is `None` the client **fails closed**: no connection is routed
-/// (directly or tunneled) before the policy is known, so nothing leaks out.
+/// (directly or tunneled) before the policy is known, so nothing leaks out —
+/// requests arriving in that window hold for the first handshake rather than
+/// being refused outright (see [`wait_for_route_policy`]).
 type SharedRoutedSet = Arc<Mutex<Option<Arc<RoutedSet>>>>;
 
 /// How the client authenticates to the server.
@@ -1455,8 +1457,9 @@ async fn rebind_unix_listener(path: &std::path::Path) -> ProxyResult<UnixListene
 }
 
 /// Handle one local proxy connection: parse the front-end request, then route by
-/// the current route policy — refused with a general-failure reply until the
-/// policy is known (fail closed), otherwise an on-list target is tunneled to the
+/// the current route policy — held (fail closed) up to [`TUNNEL_RECOVERY_HOLD`]
+/// while the policy is still unknown and refused with a general-failure reply if
+/// it never lands, otherwise an on-list target is tunneled to the
 /// server (held up to [`TUNNEL_RECOVERY_HOLD`] for the reconnect if the tunnel
 /// is down — concurrent holds capped by `hold_limiter` — then answered with a
 /// network-unreachable reply) and an off-list target is dialed directly from
@@ -1479,11 +1482,14 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
 
     // Fail closed until the route policy is known: before the first handshake
     // learns the tunnel set we don't route anything, so no traffic leaks out
-    // (directly or tunneled) before we know how it should be routed. Answer with a
-    // general-failure reply rather than leaving the app hanging.
-    let policy = { routed_set_shared.lock().expect("routed-set lock").clone() };
-    let Some(routed_set) = policy else {
-        log::debug!("Route policy not yet known; refusing: {target:?}");
+    // (directly or tunneled) before we know how it should be routed. A request
+    // arriving in that window is held for the handshake rather than refused
+    // outright (see [`wait_for_route_policy`]); only one that never lands
+    // answers with a general-failure reply, so the app shows an error instead
+    // of hanging.
+    let Some(routed_set) = wait_for_route_policy(&routed_set_shared, &current, &hold_limiter).await
+    else {
+        log::debug!("Route policy still not known after hold; refusing: {target:?}");
         let _ = proto.reply(&mut tcp, signaling::REP_GENERAL_FAILURE).await;
         return Ok(());
     };
@@ -1554,6 +1560,33 @@ async fn handle_local_conn<P: LocalProto, S: LocalStream>(
     let mut iroh = tokio::io::join(recv, send);
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut iroh).await;
     Ok(())
+}
+
+/// The route policy, immediately when a handshake has already published one,
+/// otherwise a bounded wait for one to land — the same
+/// [`TUNNEL_RECOVERY_HOLD`] the on-list path uses, since what an unknown policy
+/// waits on *is* a connection: the policy is published just before the
+/// connection, so a live connection means the policy is set.
+///
+/// `None` means no policy is known once the wait gives up, and the caller fails
+/// closed. Holding matters most on mobile, where the app relaunches the whole
+/// session after the OS suspends it: every local request between the relaunch
+/// and its first handshake would otherwise be refused, and for the browser a
+/// refusal there is worse than a wait — an unroutable name is handed back to the
+/// device's own DNS, which answers NXDOMAIN for hosts that only resolve
+/// server-side, seconds before the session is back.
+async fn wait_for_route_policy(
+    shared: &SharedRoutedSet,
+    current: &SharedConn,
+    holds: &Semaphore,
+) -> Option<Arc<RoutedSet>> {
+    let known = { shared.lock().expect("routed-set lock").clone() };
+    if known.is_some() {
+        return known;
+    }
+    log::debug!("Route policy not yet known; holding for the first handshake");
+    wait_for_tunnel(current, holds).await?;
+    shared.lock().expect("routed-set lock").clone()
 }
 
 /// The live tunnel connection, immediately when one is up, otherwise a bounded
@@ -2018,6 +2051,43 @@ mod tests {
         let held =
             tokio::time::timeout(Duration::from_millis(750), app.read_exact(&mut reply)).await;
         assert!(held.is_err(), "on-list request was answered instead of held");
+    }
+
+    /// A request arriving before the first handshake has published a route
+    /// policy is *held* for it, not refused: the relaunch-after-suspension
+    /// window is exactly when the browser would otherwise see a page fail
+    /// seconds before the session is back.
+    #[tokio::test]
+    async fn request_holds_while_route_policy_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // No policy and no connection: a freshly (re)launched session.
+        let current: SharedConn = Arc::new(watch::Sender::new(None));
+        let policy: SharedRoutedSet = Arc::new(Mutex::new(None));
+        tokio::spawn(async move {
+            let holds = Arc::new(Semaphore::new(MAX_HELD_CONNS));
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = handle_local_conn(Socks5Proto, tcp, current, policy, holds).await;
+        });
+
+        let mut app = TcpStream::connect(addr).await.unwrap();
+        app.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        app.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00], "no-auth method selected");
+        // A hostname that only resolves server-side (conditional DNS forwarding).
+        let host = b"private.corp.example";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&[0x01, 0xbb]);
+        app.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 10];
+        let held =
+            tokio::time::timeout(Duration::from_millis(750), app.read_exact(&mut reply)).await;
+        assert!(
+            held.is_err(),
+            "request was refused instead of held for the first handshake"
+        );
     }
 
     #[test]
