@@ -118,9 +118,7 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
 }
 
 /// A server endpoint builder: persistent identity (published on the default
-/// relays), all three server ALPNs, the allowlist hook. Binding policy is the
-/// caller's — [`create_server_endpoint`] and [`server_rebuild_factory`] each
-/// layer their own.
+/// relays), all three server ALPNs, and the allowlist hook.
 fn server_builder(
     relay_config: &RelayConfig,
     secret: SecretKey,
@@ -149,28 +147,6 @@ pub async fn create_server_endpoint(
     allowlists: EndpointAllowlists,
 ) -> Result<Endpoint> {
     create_endpoint(relay_config, server_builder(relay_config, secret, allowlists)?).await
-}
-
-/// The rebuild recipe for the server endpoint, used when the relay watchdog
-/// gives up on the current one. Same identity and allowlists as the original,
-/// so the server's id — what clients dial — never changes. Tolerant rebuild
-/// policy (see [`rebuild_endpoint`]): no relay probe, and the online wait may
-/// fail — the watchdog trips again if the relays stay unreachable, with a
-/// lengthening deadline so a dead relay does not churn the endpoint every few
-/// minutes (see the CLI's serve loop).
-pub fn server_rebuild_factory(
-    relay_config: RelayConfig,
-    secret: SecretKey,
-    allowlists: EndpointAllowlists,
-) -> EndpointFactory {
-    Arc::new(move || {
-        let relay_config = relay_config.clone();
-        let secret = secret.clone();
-        let allowlists = allowlists.clone();
-        Box::pin(async move {
-            rebuild_endpoint(server_builder(&relay_config, secret, allowlists)?).await
-        })
-    })
 }
 
 /// A client endpoint builder. A client never publishes its address (it only

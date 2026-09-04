@@ -106,10 +106,6 @@ impl BridgeUpstream {
     /// only when `endpoint` closes underneath it, failing each retry.
     pub async fn run(self: Arc<Self>, endpoint: Endpoint) {
         let name = &self.config.name;
-        // A previous run (on a since-closed endpoint, see the server's relay
-        // watchdog rebuild) may have been aborted while connected; its stale
-        // connection must not read as live until this run establishes its own.
-        *self.conn.lock().expect("bridge conn lock") = None;
         let mut attempt: u32 = 0;
         loop {
             if attempt > 0 {

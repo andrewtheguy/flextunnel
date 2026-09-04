@@ -245,49 +245,12 @@ Implemented in `ProxyClient::run` / `handle_failure`:
   (`TUNNEL_RECOVERY_HOLD`), deploy-style connection holding — and only then fail
   with a network-unreachable reply.
 
-## Relay watchdog (server, custom relays)
+## Server relay recovery
 
-Implemented once for every FlexAccess program in the shared
-[flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) crate
-(`relay_watchdog`), driven here by the serve loop in the CLI's `run_server`. A custom-relay server is dialable from off the LAN only
-while it is **registered on its home relay** (n0 discovery is off; clients dial
-by relay hint, and a relay forwards Initials only to endpoints connected to it).
-iroh has been seen to silently lose its home relay for good after a routine
-relay reconnect: no dial retries, no warnings, no registration on any relay —
-the server stops being reachable through the relays until the process restarts,
-while LAN clients that find it over mDNS keep working and hide the outage (the
-mac desktop reconnects, the iOS app times out). Observed on v1.0.3; no fix for
-it is called out through v1.1.0, so the watchdog stays.
-
-The watchdog observes `Endpoint::home_relay_status()` and escalates like the
-client's reconnect loop:
-
-1. no connected home relay for `RELAY_OUTAGE_NUDGE` (60s) → log a warning and
-   call `Endpoint::network_change()` (forces a fresh net report and relay
-   re-selection — enough when only the bookkeeping went stale);
-2. still none at `RELAY_OUTAGE_REBUILD` (180s from the outage start) → the
-   serve loop closes the endpoint, binds a fresh one with the **same identity
-   and allowlists** (`server_rebuild_factory`: no per-relay probe, online-wait
-   tolerated failing), and calls `ProxyServer::run` again on it. The
-   `ProxyServer` — registries, blocklist, status state — carries over; the old
-   endpoint's connections end with it, and its bridge tasks are aborted with
-   the previous `run` future (they are owned by a `JoinSet` per run). A failed
-   rebuild is retried every `REBUILD_RETRY` (30s).
-
-A rebuild only helps when iroh's bookkeeping went stale; when the relay itself
-is unreachable the fresh endpoint never registers either, and rebuilding again
-every three minutes would keep dropping the LAN clients that still work. The
-watchdog therefore reports whether the endpoint held a home relay at any point
-(`RelayOutage::relay_seen`), and the serve loop doubles the rebuild deadline
-for each consecutive endpoint that never did (`rebuild_deadline`: 180s, 6m,
-12m, 24m, then capped at `REBUILD_DEADLINE_MAX`, 30m). An endpoint that
-registers resets the escalation to the usual 180s. The 60s nudge is unaffected.
-
-A reconnect at any point resets the outage clock. Non-home relays are
-connected on demand and dropped after a minute idle, which is normal and never
-counts as an outage. With the default relays the watchdog is not armed:
-reachability there rests on n0 publishing/resolution, not on one relay
-registration.
+Servers rely on iroh 1.1.x for relay reconnects and keep the same endpoint
+during relay outages. The former server watchdog has been removed; see the
+[relay recovery history and workaround](https://github.com/flexaccessdev/iroh-common-architecture/blob/9eacd43b80d867a8a4a76e3051237b854b4b0cd5/home-relay-watchdog.md)
+if permanent loss of relay registration recurs.
 
 On every exit path both `run_server` and `run_client` call
 `endpoint.close().await` before the `Endpoint` drops; skipping it makes iroh tear
@@ -345,10 +308,6 @@ defenses.
 | `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
 | `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | flexaccess-iroh `relay` |
-| `RELAY_OUTAGE_NUDGE` (server relay watchdog) | 60s | flexaccess-iroh `relay_watchdog` |
-| `RELAY_OUTAGE_REBUILD` (server relay watchdog, default deadline) | 180s | flexaccess-iroh `relay_watchdog` |
-| `REBUILD_DEADLINE_MAX` (server relay watchdog, escalated deadline cap) | 30m | `flextunnel-cli/src/main.rs` |
-| `REBUILD_RETRY` (server endpoint rebuild) | 30s | `flextunnel-cli/src/main.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/bridge.rs` |
 | `LOCAL_HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs` |

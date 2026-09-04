@@ -619,12 +619,10 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   connecting directly; on-list requests are held for the reconnect (up to 45s)
   and only then fail with a network-unreachable reply.
 
-A **server** with custom relays watches its own home-relay registration: if it
-has no connected home relay for 60s it re-checks the network, and if that
-has not helped by 180s it rebuilds its endpoint in place (same server id) —
-the in-process equivalent of a restart, so relay-only clients (the iOS app,
-anything off the LAN) are not stranded until someone restarts the service.
-See [`docs/architecture.md`](docs/architecture.md#relay-watchdog-server-custom-relays).
+Servers rely on iroh 1.1.x for relay reconnects and keep the same endpoint
+during relay outages. The former server watchdog has been removed; see the
+[relay recovery history and workaround](https://github.com/flexaccessdev/iroh-common-architecture/blob/9eacd43b80d867a8a4a76e3051237b854b4b0cd5/home-relay-watchdog.md)
+if permanent loss of relay registration recurs.
 
 ## Logging
 
