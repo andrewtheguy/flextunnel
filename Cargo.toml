@@ -10,7 +10,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.71"
+version = "0.0.72"
 edition = "2024"
 description = "SOCKS5/HTTP-proxy-over-QUIC split tunnel via iroh P2P"
 
