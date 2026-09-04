@@ -877,7 +877,7 @@ impl ProxyClient {
             ClientAuth::Key(key) => Some(signaling::ClientAuthPayload {
                 public_key: key.public_str(),
                 endpoint_id: own_id.to_string(),
-                signature: key.sign_endpoint_id(&own_id),
+                signature: crate::auth::sign_endpoint_id(key, &own_id),
             }),
             // Quick mode: the endpoint id is the credential; the server's
             // allowlist hook already authenticated it at the TLS handshake.
@@ -1647,7 +1647,7 @@ mod tests {
     fn test_client() -> ProxyClient {
         ProxyClient::new(ClientConfig {
             server_node_id: "server".to_string(),
-            auth: ClientAuth::Key(Box::new(crate::auth::ClientKey::generate())),
+            auth: ClientAuth::Key(Box::new(crate::auth::ClientKey::generate().unwrap())),
             socks_listen: Some("127.0.0.1:0".parse().unwrap()),
             http_listen: None,
             relay_urls: Vec::new(),

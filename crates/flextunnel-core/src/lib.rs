@@ -17,7 +17,10 @@
 pub use iroh;
 
 // Same for the shared FlexAccess key crate (`ed25519-sec:` / `ed25519-pub:`
-// tokens, key files, authorized-keys parsing) that `auth` builds on.
+// tokens, key files, authorized-keys parsing) that `auth` builds on, and the
+// shared iroh transport crate (relay config, endpoint rebuild, relay
+// watchdog) that `transport` builds on.
+pub use flexaccess_iroh;
 pub use flexaccess_keys;
 
 pub mod app;

@@ -39,12 +39,12 @@ server.
 |---|---|
 | `main.rs` | clap CLI, command dispatch, logger/runtime, graceful `endpoint.close()`, shutdown signal |
 | `config.rs` | TOML config files (`-c`/`--default-config`), `deny_unknown_fields`, CLI>file>default merge, `~` expansion |
-| `auth.rs` | client keypair auth (ed25519): endpoint-id-bound sign/verify over flextunnel's domain-separated transcript; key format, key files, and authorized-keys parsing (`ed25519-pub:`/`ed25519-sec:`) are delegated to the shared [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) crate |
+| `auth.rs` | client keypair auth (ed25519): flextunnel's domain-separation context over the shared endpoint-id-bound sign/verify transcript in [flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh); key format, key files, and authorized-keys parsing (`ed25519-pub:`/`ed25519-sec:`) come from [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys) |
 | `blocklist.rs` | persisted duplicate-id blocklist (JSON): confirmed duplicate client ids + the server's own conflicted id |
 | `secret.rs` | iroh identity key commands (`generate-iroh-key`/`show-iroh-id`); client auth keypairs are generated with the standalone `flexaccess-keys` CLI |
 | `error.rs` | `ProxyError` (`Network`/`Config`/`Signaling`/`AuthenticationFailed`/`ConnectionLost`) + `is_recoverable()` |
 | `transport/mod.rs` | QUIC transport config, ALPN, heartbeat/liveness timing |
-| `transport/endpoint.rs` | iroh `Endpoint` creation (`RelayConfig`, relay mode + relay-mode-dependent n0 discovery, per-relay startup probe), secret/relay helpers, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients) |
+| `transport/endpoint.rs` | flextunnel's layer over the shared [flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) endpoint builder: the three ALPNs, client/server identity rules, native per-ALPN allowlist hook (`AllowlistHook` over `EndpointAllowlists`: bridges + quick clients). `RelayConfig`, relay-mode-dependent n0 discovery, the per-relay startup probe, the create-vs-rebuild policy, and the rebuildable client endpoint are the shared crate's |
 | `transport/paths.rs` | connection-path snapshot (direct/relay) + on-demand custom-relay `/healthz` health |
 | `proxy/signaling.rs` | length-prefixed `Hello`/`HelloResponse`, control frames, per-stream `Target` codec, `REP_*` codes |
 | `proxy/socks5.rs` | client-side RFC 1928: method negotiation + `CONNECT` parsing + replies |
@@ -247,8 +247,9 @@ Implemented in `ProxyClient::run` / `handle_failure`:
 
 ## Relay watchdog (server, custom relays)
 
-Implemented in `transport/relay_watchdog.rs`, driven by the serve loop in the
-CLI's `run_server`. A custom-relay server is dialable from off the LAN only
+Implemented once for every FlexAccess program in the shared
+[flexaccess-iroh](https://github.com/flexaccessdev/flexaccess-iroh) crate
+(`relay_watchdog`), driven here by the serve loop in the CLI's `run_server`. A custom-relay server is dialable from off the LAN only
 while it is **registered on its home relay** (n0 discovery is off; clients dial
 by relay hint, and a relay forwards Initials only to endpoints connected to it).
 iroh has been seen to silently lose its home relay for good after a routine
@@ -343,9 +344,9 @@ defenses.
 | `QUIC_INITIAL_MTU` | 1452 | `transport/mod.rs` |
 | `HEARTBEAT_INTERVAL` | 10s | `transport/mod.rs` |
 | `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
-| `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
-| `RELAY_OUTAGE_NUDGE` (server relay watchdog) | 60s | `transport/relay_watchdog.rs` |
-| `RELAY_OUTAGE_REBUILD` (server relay watchdog, default deadline) | 180s | `transport/relay_watchdog.rs` |
+| `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | flexaccess-iroh `relay` |
+| `RELAY_OUTAGE_NUDGE` (server relay watchdog) | 60s | flexaccess-iroh `relay_watchdog` |
+| `RELAY_OUTAGE_REBUILD` (server relay watchdog, default deadline) | 180s | flexaccess-iroh `relay_watchdog` |
 | `REBUILD_DEADLINE_MAX` (server relay watchdog, escalated deadline cap) | 30m | `flextunnel-cli/src/main.rs` |
 | `REBUILD_RETRY` (server endpoint rebuild) | 30s | `flextunnel-cli/src/main.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
@@ -359,7 +360,7 @@ defenses.
 | `MAX_CONTROL_MSG_SIZE` | 16 KiB | `proxy/signaling.rs` |
 | `MAX_HTTP_HEADER` | 64 KiB | `proxy/http.rs` |
 | `PROTOCOL_VERSION` | 13 | `proxy/signaling.rs` |
-| client key encoding | ed25519, base64url (32-byte keys, 64-byte sigs) | `auth.rs` |
+| client key encoding | ed25519, base64url (32-byte keys, 64-byte sigs) | flexaccess-keys, flexaccess-iroh `auth` |
 | `ALPN` | `flextunnel/1` | `transport/mod.rs` |
 | `BRIDGE_ALPN` | `flextunnel-bridge/1` | `transport/mod.rs` |
 | `QUICK_ALPN` | `flextunnel-quick/1` | `transport/mod.rs` |

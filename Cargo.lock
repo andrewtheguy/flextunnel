@@ -1918,6 +1918,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flexaccess-iroh"
+version = "0.0.2"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.2#c0ee93742d09a9d0aedca2ecf030c73f4d56a281"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flexaccess-keys",
+ "futures",
+ "iroh",
+ "iroh-mdns-address-lookup",
+ "log",
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "flexaccess-keys"
 version = "0.0.2"
 source = "git+https://github.com/flexaccessdev/flexaccess-keys?tag=v0.0.2#e3d700482d44f53f89b5f6210c8c24c2a4b8ea0a"
@@ -1952,16 +1968,15 @@ dependencies = [
  "base64",
  "dirs",
  "env_logger",
+ "flexaccess-iroh",
  "flexaccess-keys",
  "futures",
  "hickory-resolver",
  "ipnetwork",
  "iroh",
- "iroh-mdns-address-lookup",
  "libc",
  "log",
  "n0-future",
- "n0-watcher",
  "rand 0.9.4",
  "reqwest",
  "rustls",

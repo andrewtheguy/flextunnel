@@ -141,7 +141,16 @@ pub fn generate_iroh_key(output: PathBuf, force: bool, json: bool) -> Result<()>
 /// `flextunnel show-iroh-id`.
 pub fn resolve_secret_key(secret_file: Option<&Path>) -> Result<SecretKey> {
     match secret_file {
-        Some(path) => load_secret(path).context("Failed to load secret key"),
+        Some(path) => load_secret(path).with_context(|| {
+            if path.exists() {
+                "Failed to load secret key".to_string()
+            } else {
+                format!(
+                    "Generate one with: flextunnel generate-iroh-key --output {}",
+                    path.display()
+                )
+            }
+        }),
         None => anyhow::bail!(
             "No secret key configured.\n\
              Generate one with: flextunnel generate-iroh-key -o <FILE>\n\

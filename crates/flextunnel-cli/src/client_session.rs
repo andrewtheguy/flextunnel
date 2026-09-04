@@ -19,7 +19,9 @@ use flextunnel_core::forwards::{
 };
 use flextunnel_core::iroh::SecretKey;
 use flextunnel_core::proxy::{ClientAuth, ClientConfig, ProxyClient, reserved};
-use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig};
+use flextunnel_core::transport::endpoint::{
+    ClientEndpoint, RelayConfig, create_client_endpoint, create_quick_client_endpoint,
+};
 use flextunnel_core::transport::paths::{ConnPath, ConnPathKind};
 use flextunnel_core::{app, auth, config};
 
@@ -197,11 +199,11 @@ async fn build_session(
         .context("Invalid relay configuration")?;
     let (endpoint, auth) = match auth {
         SessionAuth::Key(client_key) => (
-            ClientEndpoint::create(&relay_config).await,
+            create_client_endpoint(&relay_config).await,
             ClientAuth::Key(Box::new(client_key)),
         ),
         SessionAuth::Quick(secret) => (
-            ClientEndpoint::create_quick(&relay_config, secret).await,
+            create_quick_client_endpoint(&relay_config, secret).await,
             ClientAuth::QuickAllowlisted,
         ),
     };
