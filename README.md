@@ -619,6 +619,13 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   connecting directly; on-list requests are held for the reconnect (up to 45s)
   and only then fail with a network-unreachable reply.
 
+A **server** with custom relays watches its own home-relay registration: if it
+has no connected home relay for 60s it re-checks the network, and if that
+has not helped by 180s it rebuilds its endpoint in place (same server id) —
+the in-process equivalent of a restart, so relay-only clients (the iOS app,
+anything off the LAN) are not stranded until someone restarts the service.
+See [`docs/architecture.md`](docs/architecture.md#relay-watchdog-server-custom-relays).
+
 ## Logging
 
 Logging uses `env_logger`. The default is `info` with iroh/tracing quieted to

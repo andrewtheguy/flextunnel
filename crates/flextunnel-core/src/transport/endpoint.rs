@@ -30,7 +30,7 @@ pub const CLOSE_NOT_ALLOWLISTED: u32 = 3;
 /// The server's per-ALPN endpoint-id allowlists, enforced natively at the TLS
 /// handshake by [`AllowlistHook`]. An empty set disables its ALPN entirely —
 /// the allowlist is the sole and mandatory credential on both.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EndpointAllowlists {
     /// Servers allowed to bridge into this server over [`BRIDGE_ALPN`].
     pub bridge_servers: HashSet<EndpointId>,
@@ -436,15 +436,7 @@ pub async fn create_server_endpoint(
     // no-op for the default relays.
     probe_custom_relays(relay_config).await?;
 
-    let builder = create_endpoint_builder(relay_config, Some(&secret))?
-        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec(), QUICK_ALPN.to_vec()])
-        .hooks(AllowlistHook::new(allowlists))
-        .secret_key(secret);
-
-    let endpoint = builder
-        .bind()
-        .await
-        .context("Failed to create iroh endpoint")?;
+    let endpoint = bind_server_endpoint(relay_config, secret, allowlists).await?;
 
     if let Err(e) = wait_online(&endpoint).await {
         // Close before propagating: dropping a bound endpoint without
@@ -453,6 +445,52 @@ pub async fn create_server_endpoint(
         return Err(e);
     }
     Ok(endpoint)
+}
+
+/// Bind a server endpoint: persistent identity, all three server ALPNs, the
+/// allowlist hook. No relay probe, no online wait — [`create_server_endpoint`]
+/// and [`server_rebuild_factory`] layer their own policy over this.
+async fn bind_server_endpoint(
+    relay_config: &RelayConfig,
+    secret: SecretKey,
+    allowlists: EndpointAllowlists,
+) -> Result<Endpoint> {
+    let builder = create_endpoint_builder(relay_config, Some(&secret))?
+        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec(), QUICK_ALPN.to_vec()])
+        .hooks(AllowlistHook::new(allowlists))
+        .secret_key(secret);
+    builder.bind().await.context("Failed to create iroh endpoint")
+}
+
+/// The rebuild recipe for the server endpoint, used when the relay watchdog
+/// (`transport::relay_watchdog`) gives up on the current one. Same identity
+/// and allowlists as the original, so the server's id — what clients dial —
+/// never changes. Differs from first creation the same way the client's
+/// rebuild does:
+///
+/// - **No per-relay probe.** Creation fails fast if *any* relay is down
+///   (configuration validation); mid-outage that strictness would block
+///   recovery through the one relay that still answers.
+/// - **The online wait is tolerated failing.** A fresh endpoint is no worse
+///   than the wedged one it replaces — LAN clients can still find it over
+///   mDNS — and the watchdog trips again if the relays stay unreachable.
+pub fn server_rebuild_factory(
+    relay_config: RelayConfig,
+    secret: SecretKey,
+    allowlists: EndpointAllowlists,
+) -> EndpointFactory {
+    Arc::new(move || {
+        let relay_config = relay_config.clone();
+        let secret = secret.clone();
+        let allowlists = allowlists.clone();
+        Box::pin(async move {
+            let endpoint = bind_server_endpoint(&relay_config, secret, allowlists).await?;
+            if let Err(e) = wait_online(&endpoint).await {
+                log::warn!("Rebuilt endpoint: {e:#}; continuing (LAN discovery still works)");
+            }
+            Ok(endpoint)
+        })
+    })
 }
 
 /// Bind a client endpoint: no relay probe, no online wait — callers layer
