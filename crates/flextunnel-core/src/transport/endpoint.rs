@@ -2,7 +2,8 @@
 //! [`flexaccess_iroh::endpoint`] builder — its three ALPNs, the native
 //! per-ALPN allowlist hook, and the client/server identity rules. Relay
 //! configuration, the per-relay startup probe, the creation-vs-rebuild
-//! policy, and the rebuildable endpoint handle all come from the shared crate.
+//! policy, and the rebuildable endpoint handle all come from the shared crate;
+//! the server's secret-key file is [`crate::secret`]'s.
 
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
 use anyhow::Result;
@@ -19,10 +20,7 @@ use iroh::{
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub use flexaccess_iroh::endpoint::{
-    EndpointFactory, RebuildableEndpoint as ClientEndpoint, load_secret, load_secret_from_string,
-    secret_to_endpoint_id,
-};
+pub use flexaccess_iroh::endpoint::{EndpointFactory, RebuildableEndpoint as ClientEndpoint};
 pub use flexaccess_iroh::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig};
 
 /// QUIC application close code sent when a connection is rejected by an
@@ -114,6 +112,7 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
         EndpointOptions {
             transport_config: build_quic_transport_config()?,
             publish_address,
+            relay_only: false,
         },
     ))
 }

@@ -6,7 +6,8 @@
 //! key format and files are
 //! [flexaccess-keys](https://github.com/flexaccessdev/flexaccess-keys). This
 //! module owns only what makes it flextunnel's: the domain-separation
-//! context, and the authorization decision in the server's handshake.
+//! context, the key-file loaders, and the authorization decision in the
+//! server's handshake.
 //!
 //! Keypairs authenticate **clients** only. Bridges (a server connecting to
 //! another server) and quick-mode clients carry no keypair: their credential is
@@ -15,12 +16,12 @@
 //!
 //! Generate client keys with `flexaccess-keys generate-auth-key`.
 
+use anyhow::Result;
 use flexaccess_keys::PublicKey;
 use iroh::EndpointId;
+use std::path::Path;
 
-pub use flexaccess_iroh::auth::{
-    AuthorizedKeys, ClientKey, load_authorized_keys, load_client_key_from_file,
-};
+pub use flexaccess_iroh::auth::{AuthorizedKeys, ClientKey};
 
 /// Domain-separation context prepended to the signed message, so a flextunnel
 /// client-auth signature can never be confused with any other ed25519
@@ -50,10 +51,48 @@ pub fn verify_endpoint_id_signature(
     )
 }
 
+/// Load a client secret key from a shared-format key file (a bare
+/// `ed25519-sec:...` token, or the token preceded by `#` header lines).
+pub fn load_client_key_from_file(path: &Path) -> Result<ClientKey> {
+    let private = flexaccess_keys::load_private_key(path).map_err(anyhow::Error::from)?;
+    Ok(private.into())
+}
+
+/// Load the server's authorized client public keys (shared authorized-keys
+/// document: one `ed25519-pub:...` per line, optional trailing comment, `#`
+/// lines and blank lines ignored).
+pub fn load_authorized_keys(path: &Path) -> Result<AuthorizedKeys> {
+    flexaccess_keys::load_authorized_keys(path).map_err(anyhow::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use iroh::SecretKey;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn key_files_load_through_the_shared_format() {
+        let key = ClientKey::generate().unwrap();
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# Public key: {} alice\n{}", key.public_str(), key.secret_str()).unwrap();
+        assert_eq!(
+            load_client_key_from_file(file.path()).unwrap().public_str(),
+            key.public_str()
+        );
+
+        let mut authorized = NamedTempFile::new().unwrap();
+        writeln!(authorized, "# clients\n{} alice laptop", key.public_str()).unwrap();
+        let keys = load_authorized_keys(authorized.path()).unwrap();
+        assert!(keys.contains(&key.public_key()));
+        assert_eq!(keys.comment(&key.public_key()), Some("alice laptop"));
+
+        // A secret key pasted into the authorized-keys file is rejected.
+        let mut wrong = NamedTempFile::new().unwrap();
+        writeln!(wrong, "{}", key.secret_str()).unwrap();
+        assert!(load_authorized_keys(wrong.path()).is_err());
+    }
 
     #[test]
     fn signature_is_bound_to_flextunnel_context() {

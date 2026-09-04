@@ -5,11 +5,48 @@
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use iroh::SecretKey;
+use iroh::{EndpointId, SecretKey};
 use log::info;
 use std::path::{Path, PathBuf};
 
-use crate::transport::endpoint::{load_secret, secret_to_endpoint_id};
+/// Load the iroh secret key from its file: the base64 secret on the first line
+/// that is neither blank nor a `#` comment (generated key files carry
+/// `# created:` / `# public key:` headers above the secret).
+pub fn load_secret(path: &Path) -> Result<SecretKey> {
+    if !path.exists() {
+        anyhow::bail!(
+            "Secret key file not found: {}\nGenerate one with: flextunnel generate-iroh-key --output {}",
+            path.display(),
+            path.display()
+        );
+    }
+
+    let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
+    let Some(line) = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+    else {
+        anyhow::bail!(
+            "No secret key found in {} (only blank lines or `#` comments)",
+            path.display()
+        );
+    };
+    load_secret_from_string(line)
+}
+
+/// Load a secret key from a base64-encoded string.
+pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
+    let bytes = BASE64
+        .decode(base64_key)
+        .context("Invalid base64 in secret key")?;
+    SecretKey::try_from(&bytes[..]).context("Invalid secret key (must be 32 bytes)")
+}
+
+/// The endpoint id (public key) a secret key gives an endpoint.
+pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
+    secret.public()
+}
 
 fn write_secret_to_output(
     output: &PathBuf,
