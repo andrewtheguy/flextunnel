@@ -2,6 +2,7 @@
 - run cargo clippy and test after rust code changes
 - to run the CI workflow's clippy + test steps on all three host platforms against the working tree, use `ci/all.sh` — see `docs/local-ci.md`. Worth doing before a release, or after touching platform-gated code (`flextunnel-desktop`'s macOS/Windows backends), which Linux-only checks never compile. If host is Linux, run linux ci on the same host.
 - no cargo fmt
+- no cargo test for flextunnel-desktop for linux because it is not available for linux
 - always use uv to run python scripts if needed
 - clients and server are expected to be trusted and error detections, for example, duplicate id detections are meant for preventing accidental misconfigurations such as running two clients or servers with the same id.
 - the desktop client (`flextunnel-desktop`) normally stores its config in the system keychain; set `FLEXTUNNEL_DEV_CONFIG=1` (or a file path) to store it as plaintext JSON instead, avoiding the macOS keychain access prompt on every unsigned rebuild. Development only — never set it for a real install (the auth secret key is stored unencrypted).

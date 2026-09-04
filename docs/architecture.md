@@ -273,6 +273,15 @@ client's reconnect loop:
    the previous `run` future (they are owned by a `JoinSet` per run). A failed
    rebuild is retried every `REBUILD_RETRY` (30s).
 
+A rebuild only helps when iroh's bookkeeping went stale; when the relay itself
+is unreachable the fresh endpoint never registers either, and rebuilding again
+every three minutes would keep dropping the LAN clients that still work. The
+watchdog therefore reports whether the endpoint held a home relay at any point
+(`RelayOutage::relay_seen`), and the serve loop doubles the rebuild deadline
+for each consecutive endpoint that never did (`rebuild_deadline`: 180s, 6m,
+12m, 24m, then capped at `REBUILD_DEADLINE_MAX`, 30m). An endpoint that
+registers resets the escalation to the usual 180s. The 60s nudge is unaffected.
+
 A reconnect at any point resets the outage clock. Non-home relays are
 connected on demand and dropped after a minute idle, which is normal and never
 counts as an outage. With the default relays the watchdog is not armed:
@@ -336,7 +345,8 @@ defenses.
 | `LIVENESS_WINDOW` | 33s | `transport/mod.rs` |
 | `RELAY_CONNECT_TIMEOUT` (`endpoint.online()`) | 10s | `transport/endpoint.rs` |
 | `RELAY_OUTAGE_NUDGE` (server relay watchdog) | 60s | `transport/relay_watchdog.rs` |
-| `RELAY_OUTAGE_REBUILD` (server relay watchdog) | 180s | `transport/relay_watchdog.rs` |
+| `RELAY_OUTAGE_REBUILD` (server relay watchdog, default deadline) | 180s | `transport/relay_watchdog.rs` |
+| `REBUILD_DEADLINE_MAX` (server relay watchdog, escalated deadline cap) | 30m | `flextunnel-cli/src/main.rs` |
 | `REBUILD_RETRY` (server endpoint rebuild) | 30s | `flextunnel-cli/src/main.rs` |
 | `CONNECT_TIMEOUT` (client server connect) | 30s | `proxy/client.rs` |
 | `HANDSHAKE_TIMEOUT` | 10s | `proxy/client.rs`, `proxy/server.rs`, `proxy/bridge.rs` |

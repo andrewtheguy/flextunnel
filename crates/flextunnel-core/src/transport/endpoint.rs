@@ -473,7 +473,9 @@ async fn bind_server_endpoint(
 ///   recovery through the one relay that still answers.
 /// - **The online wait is tolerated failing.** A fresh endpoint is no worse
 ///   than the wedged one it replaces — LAN clients can still find it over
-///   mDNS — and the watchdog trips again if the relays stay unreachable.
+///   mDNS — and the watchdog trips again if the relays stay unreachable
+///   (with a lengthening deadline, so a dead relay does not churn the endpoint
+///   every few minutes; see `run_server`).
 pub fn server_rebuild_factory(
     relay_config: RelayConfig,
     secret: SecretKey,
