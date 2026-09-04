@@ -1961,6 +1961,7 @@ dependencies = [
  "libc",
  "log",
  "n0-future",
+ "n0-watcher",
  "rand 0.9.4",
  "reqwest",
  "rustls",

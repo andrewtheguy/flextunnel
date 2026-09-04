@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -33,7 +34,9 @@ use flextunnel_core::proxy::{
 };
 use flextunnel_core::transport::endpoint::{
     EndpointAllowlists, RelayConfig, create_server_endpoint, secret_to_endpoint_id,
+    server_rebuild_factory,
 };
+use flextunnel_core::transport::relay_watchdog;
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
@@ -614,6 +617,12 @@ struct QuickServer {
 /// relay/connection teardown must never leave the process unkillable.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Pause between attempts to bind a replacement endpoint after the relay
+/// watchdog retired the old one and the rebuild itself failed (e.g. no route
+/// to bind on). The server has no endpoint at all during this wait, so it is
+/// short — there is nothing to lose by trying again soon.
+const REBUILD_RETRY: Duration = Duration::from_secs(30);
+
 /// Build the ephemeral `ServerConfig` for `server start --quick`: a full-tunnel
 /// routed set (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`)
 /// plus a freshly generated in-memory identity, returned *alongside* the config —
@@ -798,9 +807,16 @@ async fn run_server(
             .map(|q| std::collections::HashSet::from([q.client_id]))
             .unwrap_or_default(),
     };
-    let endpoint = create_server_endpoint(&relay_config, secret_key, allowlists)
+    let endpoint = create_server_endpoint(&relay_config, secret_key.clone(), allowlists.clone())
         .await
         .context("Failed to create iroh endpoint")?;
+    // The relay watchdog's remedy of last resort: a fresh endpoint with the
+    // same identity and allowlists (see the serve loop below).
+    let rebuild = server_rebuild_factory(relay_config.clone(), secret_key, allowlists);
+    // Only a custom-relay server hangs its reachability on one home-relay
+    // registration (n0 discovery is off, clients dial by relay hint), so the
+    // watchdog is armed for custom relays only.
+    let relay_watchdog_armed = relay_config.is_custom();
 
     log::info!("flextunnel server Node ID: {}", endpoint.id());
     match &quick {
@@ -844,20 +860,13 @@ async fn run_server(
         blocklist,
         first_client: first_client.clone(),
     });
-    let run = async {
-        server
-            .run(&endpoint)
-            .await
-            .map_err(|e| anyhow::anyhow!("Server error: {e}"))
-    };
-
     // Quick-mode grace window: fire after `QUICK_IDLE_TIMEOUT` unless a client
     // connects first (which resolves `notified()` and parks this future
     // forever). `first_client` is `Some` exactly in quick mode; a normal server
     // parks here immediately, so the arm never fires. `notify_one` stores a
     // permit, so a client that connects before this future is first polled is
-    // not missed.
-    let grace = async {
+    // not missed. Pinned outside the serve loop so it spans endpoint rebuilds.
+    let mut grace = pin!(async {
         match &first_client {
             Some(notify) => {
                 tokio::select! {
@@ -867,19 +876,84 @@ async fn run_server(
             }
             None => std::future::pending::<()>().await,
         }
-    };
+    });
+    // One signal listener for the whole serve loop: re-registering it per pass
+    // could drop a signal delivered while an endpoint is being rebuilt.
+    let mut shutdown = pin!(app::shutdown_signal());
 
-    let res = tokio::select! {
-        res = run => res,
-        sig = app::shutdown_signal() => {
-            sig?;
-            log::info!("Received shutdown signal, stopping server");
-            Ok(())
-        }
-        _ = grace => {
-            log::warn!("Quick mode: no client connected within 5 minutes — exiting");
-            Ok(())
-        }
+    /// How one pass of the serve loop ended.
+    enum Pass {
+        /// The server is done (clean or failed): close the endpoint and return.
+        Exit(Result<()>),
+        /// The relay watchdog gave up on the endpoint after an outage this long.
+        Rebuild(Duration),
+    }
+
+    // Serve loop. A pass serves on the current endpoint until the server ends,
+    // a shutdown signal arrives, the quick-mode grace expires, or — custom
+    // relays only — the relay watchdog reports the endpoint has lost its home
+    // relay for good. That last case is the in-process equivalent of the
+    // process restart known to fix it: close the wedged endpoint, bind a fresh
+    // one with the same identity, and serve again. The `ProxyServer` (its
+    // registries, blocklist, status state) carries over; the old endpoint's
+    // connections and bridge tasks end with it.
+    let mut endpoint = endpoint;
+    let res = loop {
+        let pass = {
+            let run = Arc::clone(&server).run(&endpoint);
+            let outage = async {
+                if relay_watchdog_armed {
+                    relay_watchdog::watch_home_relay(&endpoint).await
+                } else {
+                    std::future::pending().await
+                }
+            };
+            tokio::select! {
+                res = run => Pass::Exit(res.map_err(|e| anyhow::anyhow!("Server error: {e}"))),
+                sig = &mut shutdown => Pass::Exit(sig.map(|()| {
+                    log::info!("Received shutdown signal, stopping server");
+                })),
+                _ = &mut grace => {
+                    log::warn!("Quick mode: no client connected within 5 minutes — exiting");
+                    Pass::Exit(Ok(()))
+                }
+                outage = outage => Pass::Rebuild(outage),
+            }
+        };
+        let outage = match pass {
+            Pass::Exit(res) => break res,
+            Pass::Rebuild(outage) => outage,
+        };
+
+        log::error!(
+            "No connected home relay for {:.0}s despite a network re-check; rebuilding the \
+             endpoint from scratch (server id stays {})",
+            outage.as_secs_f64(),
+            endpoint.id()
+        );
+        close_endpoint_or_exit(&endpoint).await;
+        endpoint = loop {
+            match rebuild().await {
+                Ok(fresh) => break fresh,
+                Err(e) => {
+                    log::error!(
+                        "Endpoint rebuild failed: {e:#}; retrying in {}s",
+                        REBUILD_RETRY.as_secs()
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(REBUILD_RETRY) => {}
+                        sig = &mut shutdown => {
+                            // Nothing is bound right now, so there is no
+                            // endpoint to close on the way out.
+                            sig?;
+                            log::info!("Received shutdown signal, stopping server");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        };
+        log::warn!("Endpoint rebuilt; serving again as {}", endpoint.id());
     };
 
     close_endpoint_or_exit(&endpoint).await;

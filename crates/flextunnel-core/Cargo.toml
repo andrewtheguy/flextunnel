@@ -41,4 +41,5 @@ libc.workspace = true
 iroh-mdns-address-lookup.workspace = true
 
 [dev-dependencies]
+n0-watcher.workspace = true
 tempfile.workspace = true

@@ -307,14 +307,22 @@ impl ProxyServer {
     }
 
     /// Accept connections until the endpoint closes or the server self-blocks.
+    ///
+    /// May be called again on a *fresh* endpoint after the previous one was
+    /// closed (the relay watchdog's rebuild): the registries and blocklist
+    /// carry over, the old endpoint's connection handlers end as its
+    /// connections close, and its bridge tasks are aborted when the previous
+    /// `run` future is dropped.
     pub async fn run(self: Arc<Self>, endpoint: &Endpoint) -> ProxyResult<()> {
-        // Maintain the outbound bridge upstreams for the life of the process.
-        // The bridging side dials out on this same server endpoint, so the TLS
+        // Maintain the outbound bridge upstreams for the life of this run. The
+        // bridging side dials out on this same server endpoint, so the TLS
         // identity it presents is this server's persistent id — what the target
-        // server's allowlist matches. The tasks retry forever and die with the
-        // endpoint.
+        // server's allowlist matches. The tasks retry forever; owning them in a
+        // `JoinSet` aborts them with this future, so a rebuild never leaves
+        // bridges retrying on a closed endpoint.
+        let mut bridge_tasks = tokio::task::JoinSet::new();
         for bridge in &self.bridges {
-            tokio::spawn(bridge.clone().run(endpoint.clone()));
+            bridge_tasks.spawn(bridge.clone().run(endpoint.clone()));
         }
 
         let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
