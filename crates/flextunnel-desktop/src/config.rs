@@ -50,6 +50,10 @@ const DEV_CONFIG_ENV: &str = "FLEXTUNNEL_DEV_CONFIG";
 /// `profiles.json` with its secrets sealed under the Safe Storage master key
 /// held by the platform keychain via `keyring-core`.
 enum Backend {
+    /// Only ever built on macOS/Windows (see `init_store`); on any other host
+    /// the dev file path is the only reachable one, so the variant is dead
+    /// there and `-D warnings` would reject it.
+    #[cfg_attr(not(any(target_os = "macos", windows)), expect(dead_code))]
     Keychain,
     File(PathBuf),
 }

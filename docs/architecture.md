@@ -251,11 +251,12 @@ Implemented in `transport/relay_watchdog.rs`, driven by the serve loop in the
 CLI's `run_server`. A custom-relay server is dialable from off the LAN only
 while it is **registered on its home relay** (n0 discovery is off; clients dial
 by relay hint, and a relay forwards Initials only to endpoints connected to it).
-iroh (v1.0.3) has been observed to silently lose its home relay for good after
-a routine relay reconnect: no dial retries, no warnings, no registration on
-any relay — the server stops being reachable through the relays until the
-process restarts, while LAN clients that find it over mDNS keep working and
-hide the outage (the mac desktop reconnects, the iOS app times out).
+iroh has been seen to silently lose its home relay for good after a routine
+relay reconnect: no dial retries, no warnings, no registration on any relay —
+the server stops being reachable through the relays until the process restarts,
+while LAN clients that find it over mDNS keep working and hide the outage (the
+mac desktop reconnects, the iOS app times out). Observed on v1.0.3; no fix for
+it is called out through v1.1.0, so the watchdog stays.
 
 The watchdog observes `Endpoint::home_relay_status()` and escalates like the
 client's reconnect loop:
