@@ -957,7 +957,7 @@ impl App {
             }
             Message::KeyGenerateSecret => {
                 if let Some(form) = &mut self.key_form {
-                    form.secret = flextunnel_core::auth::ClientKey::generate().secret_str();
+                    form.secret = flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable").secret_str();
                 }
                 Task::none()
             }
@@ -1330,7 +1330,7 @@ impl App {
         let Ok(name) = validate_key_name(&name, &self.keys, None) else {
             return;
         };
-        let client_key = flextunnel_core::auth::ClientKey::generate();
+        let client_key = flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable");
         let key = AuthKey {
             id: AuthKey::new_id(),
             name,
@@ -1824,7 +1824,7 @@ mod tests {
     #[test]
     fn key_form_validates() {
         let keys = test_keys();
-        let secret = flextunnel_core::auth::ClientKey::generate().secret_str();
+        let secret = flextunnel_core::auth::ClientKey::generate().expect("system RNG unavailable").secret_str();
 
         let form = KeyForm {
             editing_id: None,

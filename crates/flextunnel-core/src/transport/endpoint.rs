@@ -1,24 +1,29 @@
-//! Common endpoint helpers for iroh proxy connections.
+//! flextunnel's endpoints: what this program layers onto the shared
+//! [`flexaccess_iroh::endpoint`] builder — its three ALPNs, the native
+//! per-ALPN allowlist hook, and the client/server identity rules. Relay
+//! configuration, the per-relay startup probe, the creation-vs-rebuild
+//! policy, and the rebuildable endpoint handle all come from the shared crate.
 
 use crate::transport::{ALPN, BRIDGE_ALPN, QUICK_ALPN, build_quic_transport_config};
-use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use futures::future::{BoxFuture, join_all};
+use anyhow::Result;
+use flexaccess_iroh::endpoint::{
+    EndpointOptions, create_endpoint, endpoint_builder, rebuild_endpoint,
+};
 use iroh::{
-    Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointId, SecretKey,
     endpoint::{
         AfterHandshakeOutcome, Builder as EndpointBuilder, Connection, EndpointHooks, Side,
-        VarInt, presets,
+        VarInt,
     },
-    address_lookup::{DnsAddressLookup, PkarrPublisher},
 };
-#[cfg(not(target_os = "ios"))]
-use iroh_mdns_address_lookup::MdnsAddressLookup;
-use log::info;
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+
+pub use flexaccess_iroh::endpoint::{
+    EndpointFactory, RebuildableEndpoint as ClientEndpoint, load_secret, load_secret_from_string,
+    secret_to_endpoint_id,
+};
+pub use flexaccess_iroh::relay::{RELAY_CONNECT_TIMEOUT, RelayConfig};
 
 /// QUIC application close code sent when a connection is rejected by an
 /// endpoint-id allowlist — a non-allowlisted bridge on [`BRIDGE_ALPN`] or a
@@ -100,318 +105,32 @@ impl EndpointHooks for AllowlistHook {
     }
 }
 
-pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Relay configuration, resolved once from the raw config strings.
-///
-/// This is the single source of the default-vs-custom distinction. It selects
-/// both which relay map iroh uses **and** whether iroh *internet* discovery is
-/// enabled: [`Default`](Self::Default) uses the n0 relays with the n0 lookup
-/// stack (pkarr publishing + DNS resolution of the peer's home relay — see
-/// <https://docs.iroh.computer/concepts/address-lookup>), while
-/// [`Custom`](Self::Custom) uses the configured relays with n0 internet discovery
-/// disabled (clients and outbound bridges use relay hints instead). mDNS
-/// local-network discovery is independent of this and stays on in both modes,
-/// except on iOS where it is compiled out (raw multicast needs a special
-/// entitlement there).
-/// The full design — shared with tunnel-rs and ezvpn — is documented in
-/// <https://github.com/flexaccessdev/iroh-common-architecture> (see
-/// `relays-and-address-lookup.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum RelayConfig {
-    /// iroh's default relay map, with n0 address lookup.
-    #[default]
-    Default,
-    /// Custom relay set (parsed, sorted, deduped). Never empty.
-    ///
-    /// `auth_token`, when set, is sent to every custom relay as an
-    /// `Authorization: Bearer <token>` header on the WebSocket upgrade (see
-    /// [`Self::relay_mode`]). It is only ever carried by custom relays — the
-    /// default relays never receive a token (see [`Self::from_urls_with_token`]).
-    Custom {
-        urls: Vec<RelayUrl>,
-        auth_token: Option<String>,
-    },
+/// The shared base builder with flextunnel's QUIC transport tuning. mDNS
+/// local-network discovery is on (the shared crate's `mdns` feature; compiled
+/// out on iOS by the crate itself).
+fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<EndpointBuilder> {
+    Ok(endpoint_builder(
+        relay_config,
+        EndpointOptions {
+            transport_config: build_quic_transport_config()?,
+            publish_address,
+        },
+    ))
 }
 
-impl RelayConfig {
-    /// Parse raw config strings with no relay auth token.
-    ///
-    /// Thin wrapper over [`Self::from_urls_with_token`]; see there for behavior.
-    pub fn from_urls(urls: &[String]) -> Result<Self> {
-        Self::from_urls_with_token(urls, None)
-    }
-
-    /// Parse raw config strings and attach an optional shared relay auth token.
-    ///
-    /// Empty input selects the default relays. Parsing fails on the first
-    /// malformed URL, so config typos surface at resolve time instead of at each
-    /// use site.
-    ///
-    /// The token is normalized (blank/whitespace-only becomes `None`) and is
-    /// **strictly gated to custom relays**: a non-empty token with no custom
-    /// relay URLs is a hard error, since the default iroh relays never take a
-    /// token. This surfaces the misconfiguration before the endpoint starts.
-    pub fn from_urls_with_token(urls: &[String], auth_token: Option<String>) -> Result<Self> {
-        let auth_token = auth_token.and_then(|token| {
-            let token = token.trim();
-            (!token.is_empty()).then(|| token.to_string())
-        });
-        if urls.is_empty() {
-            if auth_token.is_some() {
-                anyhow::bail!(
-                    "relay_auth_token requires custom relay_urls; it is not used with the default iroh relays"
-                );
-            }
-            return Ok(Self::Default);
-        }
-        let mut parsed = urls
-            .iter()
-            .map(|url| {
-                url.parse::<RelayUrl>()
-                    .with_context(|| format!("Invalid relay URL: {url}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        parsed.sort();
-        parsed.dedup();
-        Ok(Self::Custom {
-            urls: parsed,
-            auth_token,
-        })
-    }
-
-    /// The custom relay URLs; empty for [`RelayConfig::Default`].
-    pub fn custom_urls(&self) -> &[RelayUrl] {
-        match self {
-            Self::Default => &[],
-            Self::Custom { urls, .. } => urls,
-        }
-    }
-
-    /// The shared relay auth token, if configured (custom relays only).
-    pub fn relay_auth_token(&self) -> Option<&str> {
-        match self {
-            Self::Default => None,
-            Self::Custom { auth_token, .. } => auth_token.as_deref(),
-        }
-    }
-
-    pub fn is_custom(&self) -> bool {
-        matches!(self, Self::Custom { .. })
-    }
-
-    /// The corresponding iroh [`RelayMode`].
-    ///
-    /// For custom relays, an `auth_token` (when set) is applied to every relay in
-    /// the map via [`RelayMap::with_auth_token`], which iroh sends as an
-    /// `Authorization: Bearer <token>` header on the relay WebSocket upgrade.
-    pub fn relay_mode(&self) -> RelayMode {
-        match self {
-            Self::Default => RelayMode::Default,
-            Self::Custom { urls, auth_token } => {
-                let map = RelayMap::from_iter(urls.iter().cloned());
-                let map = match auth_token {
-                    Some(token) => map.with_auth_token(token.clone()),
-                    None => map,
-                };
-                RelayMode::Custom(map)
-            }
-        }
-    }
-}
-
-/// Load secret key from file (base64 encoded).
-pub fn load_secret(path: &Path) -> Result<SecretKey> {
-    if !path.exists() {
-        anyhow::bail!(
-            "Secret key file not found: {}\nGenerate one with: flextunnel generate-iroh-key --output {}",
-            path.display(),
-            path.display()
-        );
-    }
-
-    let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
-    // Key files carry `# created:` / `# public key:` comments above the secret;
-    // the first meaningful line is the base64 secret itself.
-    let Some(line) = content
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-    else {
-        anyhow::bail!(
-            "No secret key found in {} (only blank lines or `#` comments)",
-            path.display()
-        );
-    };
-    load_secret_from_string(line)
-}
-
-/// Load secret key from a base64-encoded string.
-pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
-    let bytes = BASE64
-        .decode(base64_key)
-        .context("Invalid base64 in secret key")?;
-
-    SecretKey::try_from(&bytes[..]).context("Invalid secret key (must be 32 bytes)")
-}
-
-/// Get public key (EndpointId) from secret key.
-pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
-    secret.public()
-}
-
-/// Print relay configuration status messages.
-fn print_relay_status(relay_config: &RelayConfig) {
-    match relay_config.custom_urls().len() {
-        0 => {}
-        1 => info!("Using custom relay server"),
-        n => info!("Using {n} custom relay servers (with failover)"),
-    }
-}
-
-/// Create a base endpoint builder with common configuration.
-///
-/// iroh *internet* discovery (n0 pkarr publishing + DNS-based lookup of
-/// `_iroh.<endpoint-id>.dns.iroh.link`, see
-/// <https://docs.iroh.computer/concepts/address-lookup>) follows the relay mode:
-///
-/// - [`RelayConfig::Default`]: the n0 lookup stack is enabled — DNS resolution is
-///   always on, and pkarr publishing is added only when a persistent identity
-///   (`secret_key`) is present, so an ephemeral client resolves peers but never
-///   advertises itself.
-/// - [`RelayConfig::Custom`]: n0 internet discovery is disabled — nothing is
-///   published to or resolved from n0's public infrastructure. Dialers reach
-///   peer servers through configured relay hints attached to the peer's
-///   `EndpointAddr` (clients and outbound bridges both do this): iroh sends QUIC
-///   Initials to every configured relay, so the handshake succeeds via whichever
-///   relay the server is homed on.
-///
-/// mDNS local-network discovery is independent of the relay mode and always on,
-/// except on iOS where it is compiled out (raw multicast needs the
-/// `com.apple.developer.networking.multicast` entitlement).
-fn create_endpoint_builder(
+/// A server endpoint builder: persistent identity (published on the default
+/// relays), all three server ALPNs, the allowlist hook. Binding policy is the
+/// caller's — [`create_server_endpoint`] and [`server_rebuild_factory`] each
+/// layer their own.
+fn server_builder(
     relay_config: &RelayConfig,
-    secret_key: Option<&SecretKey>,
+    secret: SecretKey,
+    allowlists: EndpointAllowlists,
 ) -> Result<EndpointBuilder> {
-    let transport_config = build_quic_transport_config()?;
-    // iroh 1.0 requires the crypto provider to be set explicitly on the
-    // builder when starting from the `Empty` preset — the `tls-ring` feature
-    // only makes the ring backend available, it does not wire it in.
-    let mut builder = Endpoint::builder(presets::Empty)
-        .relay_mode(relay_config.relay_mode())
-        .transport_config(transport_config)
-        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
-
-    if relay_config.is_custom() {
-        info!("Internet discovery disabled (custom relays configured)");
-    } else {
-        // Default n0 relays: always resolve through n0 DNS, but only publish
-        // (pkarr) when we have a persistent identity. An ephemeral endpoint (no
-        // secret) shouldn't advertise itself.
-        if secret_key.is_some() {
-            builder = builder.address_lookup(PkarrPublisher::n0_dns());
-        }
-        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
-    }
-    // mDNS local network discovery — unsupported on iOS (raw multicast needs
-    // the multicast entitlement), so it is compiled out there.
-    #[cfg(not(target_os = "ios"))]
-    {
-        builder = builder.address_lookup(MdnsAddressLookup::builder());
-    }
-
-    Ok(builder)
-}
-
-/// Build a minimal, relay-only endpoint for probing a single relay.
-///
-/// It uses an ephemeral identity (no persistent secret, no address publishing)
-/// and clears IP transports so [`Endpoint::online`] reflects *pure relay*
-/// connectivity — a holepunched direct path can never mask a dead or
-/// auth-rejecting relay. The auth token, when set, rides the WebSocket upgrade
-/// exactly as it does for the real endpoint, so the probe validates the token too.
-fn probe_endpoint_builder(relay_url: &RelayUrl, auth_token: Option<&str>) -> Result<EndpointBuilder> {
-    let transport_config = build_quic_transport_config()?;
-    let map = RelayMap::from_iter([relay_url.clone()]);
-    let map = match auth_token {
-        Some(token) => map.with_auth_token(token.to_string()),
-        None => map,
-    };
-    let builder = Endpoint::builder(presets::Empty)
-        .relay_mode(RelayMode::Custom(map))
-        .transport_config(transport_config)
-        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        // Relay-only: drop direct IP transports so `online()` is a pure relay
-        // reachability signal, independent of holepunching.
-        .clear_ip_transports();
-    Ok(builder)
-}
-
-/// Probe a single custom relay by binding a relay-only endpoint and waiting for
-/// it to come online, bounded by [`RELAY_CONNECT_TIMEOUT`]. `Ok(())` means the
-/// relay connected (and accepted the auth token, if any); otherwise the error
-/// describes the failure. The probe endpoint is always closed before returning.
-async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) -> Result<()> {
-    let endpoint = probe_endpoint_builder(relay_url, auth_token)?
-        .bind()
-        .await
-        .with_context(|| format!("Failed to bind probe endpoint for relay {relay_url}"))?;
-    let outcome = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await;
-    endpoint.close().await;
-    outcome.map_err(|_| {
-        anyhow::anyhow!(
-            "did not come online within {}s (unreachable or rejected the auth token)",
-            RELAY_CONNECT_TIMEOUT.as_secs()
-        )
-    })
-}
-
-/// Probe every configured custom relay individually (in parallel) and fail if
-/// **any** relay is unreachable.
-///
-/// This is stricter than a single endpoint-wide `online()` wait, which only
-/// proved that *one* relay in the set (the home relay) connected and so reported
-/// a misleading all-clear when a backup relay was down. Default relays are not
-/// probed (returns `Ok(())` immediately).
-async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
-    let RelayConfig::Custom { urls, auth_token } = relay_config else {
-        return Ok(());
-    };
-    let token = auth_token.as_deref();
-    info!("Probing {} custom relay(s) for reachability...", urls.len());
-    let results = join_all(
-        urls.iter()
-            .map(|url| async move { (url, probe_relay(url, token).await) }),
-    )
-    .await;
-    let failures: Vec<String> = results
-        .into_iter()
-        .filter_map(|(url, res)| res.err().map(|e| format!("{url}: {e}")))
-        .collect();
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} of {} custom relay(s) failed to come online:\n  {}",
-            failures.len(),
-            urls.len(),
-            failures.join("\n  ")
-        );
-    }
-    Ok(())
-}
-
-/// Wait for the endpoint to come online (relay/discovery ready) with a timeout.
-async fn wait_online(endpoint: &Endpoint) -> Result<()> {
-    info!(
-        "Waiting for endpoint to come online (timeout: {}s)...",
-        RELAY_CONNECT_TIMEOUT.as_secs()
-    );
-    match tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await {
-        Ok(()) => Ok(()),
-        Err(_) => anyhow::bail!(
-            "Endpoint failed to come online after {}s - check relay server connectivity",
-            RELAY_CONNECT_TIMEOUT.as_secs()
-        ),
-    }
+    Ok(base_builder(relay_config, true)?
+        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec(), QUICK_ALPN.to_vec()])
+        .hooks(AllowlistHook::new(allowlists))
+        .secret_key(secret))
 }
 
 /// Create a server endpoint with a persistent identity, accepting the client
@@ -422,60 +141,24 @@ async fn wait_online(endpoint: &Endpoint) -> Result<()> {
 /// A single endpoint serves both relay modes. With the default relays internet
 /// discovery is on, so the server publishes its current home relay and clients
 /// resolve it by endpoint ID. With custom relays discovery is off, so clients
-/// reach the server through relay hints, while outbound bridges attach
-/// those same hints to their target `EndpointAddr`
-/// (see [`create_endpoint_builder`]).
+/// reach the server through relay hints, while outbound bridges attach those
+/// same hints to their target `EndpointAddr`. Strict first-creation policy:
+/// every custom relay is probed and the endpoint must come online.
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: SecretKey,
     allowlists: EndpointAllowlists,
 ) -> Result<Endpoint> {
-    print_relay_status(relay_config);
-
-    // Validate each custom relay individually (fail if any is unreachable); a
-    // no-op for the default relays.
-    probe_custom_relays(relay_config).await?;
-
-    let endpoint = bind_server_endpoint(relay_config, secret, allowlists).await?;
-
-    if let Err(e) = wait_online(&endpoint).await {
-        // Close before propagating: dropping a bound endpoint without
-        // `close()` is fatal under the release profile's panic=abort.
-        endpoint.close().await;
-        return Err(e);
-    }
-    Ok(endpoint)
-}
-
-/// Bind a server endpoint: persistent identity, all three server ALPNs, the
-/// allowlist hook. No relay probe, no online wait — [`create_server_endpoint`]
-/// and [`server_rebuild_factory`] layer their own policy over this.
-async fn bind_server_endpoint(
-    relay_config: &RelayConfig,
-    secret: SecretKey,
-    allowlists: EndpointAllowlists,
-) -> Result<Endpoint> {
-    let builder = create_endpoint_builder(relay_config, Some(&secret))?
-        .alpns(vec![ALPN.to_vec(), BRIDGE_ALPN.to_vec(), QUICK_ALPN.to_vec()])
-        .hooks(AllowlistHook::new(allowlists))
-        .secret_key(secret);
-    builder.bind().await.context("Failed to create iroh endpoint")
+    create_endpoint(relay_config, server_builder(relay_config, secret, allowlists)?).await
 }
 
 /// The rebuild recipe for the server endpoint, used when the relay watchdog
-/// (`transport::relay_watchdog`) gives up on the current one. Same identity
-/// and allowlists as the original, so the server's id — what clients dial —
-/// never changes. Differs from first creation the same way the client's
-/// rebuild does:
-///
-/// - **No per-relay probe.** Creation fails fast if *any* relay is down
-///   (configuration validation); mid-outage that strictness would block
-///   recovery through the one relay that still answers.
-/// - **The online wait is tolerated failing.** A fresh endpoint is no worse
-///   than the wedged one it replaces — LAN clients can still find it over
-///   mDNS — and the watchdog trips again if the relays stay unreachable
-///   (with a lengthening deadline, so a dead relay does not churn the endpoint
-///   every few minutes; see `run_server`).
+/// gives up on the current one. Same identity and allowlists as the original,
+/// so the server's id — what clients dial — never changes. Tolerant rebuild
+/// policy (see [`rebuild_endpoint`]): no relay probe, and the online wait may
+/// fail — the watchdog trips again if the relays stay unreachable, with a
+/// lengthening deadline so a dead relay does not churn the endpoint every few
+/// minutes (see the CLI's serve loop).
 pub fn server_rebuild_factory(
     relay_config: RelayConfig,
     secret: SecretKey,
@@ -486,275 +169,50 @@ pub fn server_rebuild_factory(
         let secret = secret.clone();
         let allowlists = allowlists.clone();
         Box::pin(async move {
-            let endpoint = bind_server_endpoint(&relay_config, secret, allowlists).await?;
-            if let Err(e) = wait_online(&endpoint).await {
-                log::warn!("Rebuilt endpoint: {e:#}; continuing (LAN discovery still works)");
-            }
-            Ok(endpoint)
+            rebuild_endpoint(server_builder(&relay_config, secret, allowlists)?).await
         })
     })
 }
 
-/// Bind a client endpoint: no relay probe, no online wait — callers layer
-/// their own creation-vs-rebuild policy over this.
-async fn bind_client_endpoint(
-    relay_config: &RelayConfig,
-    secret: Option<SecretKey>,
-) -> Result<Endpoint> {
-    // `None` for the builder's lookup decision even with a quick secret: a
-    // client never publishes its address (it only dials out).
-    let mut builder = create_endpoint_builder(relay_config, None)?;
+/// A client endpoint builder. A client never publishes its address (it only
+/// dials out), even with a quick-mode secret bound as its identity.
+fn client_builder(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<EndpointBuilder> {
+    let mut builder = base_builder(relay_config, false)?;
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
     }
-    builder.bind().await.context("Failed to create iroh endpoint")
+    Ok(builder)
 }
 
-/// Recipe producing a fresh, fully bound client endpoint — how a
-/// [`ClientEndpoint`] rebuilds itself mid-session.
-pub type EndpointFactory = Arc<dyn Fn() -> BoxFuture<'static, Result<Endpoint>> + Send + Sync>;
-
-/// Bound wait on the old endpoint's graceful close during a rebuild. The close
-/// runs as its own task and is never cancelled (dropping a bound endpoint
-/// without `close()` is fatal under panic=abort — see the CLI's
-/// `close_endpoint_or_exit`); the bound only keeps the reconnect loop from
-/// stalling behind it, letting a slow close finish in the background.
-const REBUILD_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A client endpoint that can be **rebuilt** from scratch mid-session.
-///
-/// `Endpoint::network_change()` re-binds dead UDP transports, but a wedged
-/// endpoint can be broken beyond what a rebind repairs: a relay link lost to a
-/// ping timeout that never re-establishes, stale cached paths for the peer,
-/// dead discovery state. A process restart always recovers because it builds a
-/// brand-new endpoint; [`Self::rebuild`] gives the reconnect loop that same
-/// remedy in-process — fresh sockets, fresh relay connections, fresh discovery
-/// — without dropping the bound proxy listeners or the control socket.
-///
-/// The handle is `Clone` and shared: the reconnect loop escalates to
-/// [`Self::rebuild`] after repeated failures, while the embedder logs
-/// [`Self::id`] and [`Self::close`]s whatever endpoint is current at teardown.
-#[derive(Clone)]
-pub struct ClientEndpoint {
-    /// The live endpoint, swapped by [`Self::rebuild`]. Std lock: accessors
-    /// clone the handle out synchronously and never hold it across an await.
-    current: Arc<std::sync::RwLock<Endpoint>>,
-    factory: EndpointFactory,
+/// Create a client endpoint (ephemeral identity) that can rebuild itself
+/// mid-session. Strict first-creation policy, tolerant rebuilds.
+pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<ClientEndpoint> {
+    create_client(relay_config, None).await
 }
 
-impl ClientEndpoint {
-    /// Create a client endpoint (ephemeral identity).
-    pub async fn create(relay_config: &RelayConfig) -> Result<Self> {
-        Self::create_inner(relay_config, None).await
-    }
-
-    /// Create a **quick-mode** client endpoint: same as [`Self::create`] but
-    /// bound to the given (session-ephemeral) `secret`, so the endpoint id the
-    /// user entered on the quick server is the id this endpoint presents in the
-    /// TLS handshake — that id is the quick client's sole credential. The
-    /// identity is still never published (the client only dials), so pkarr
-    /// publishing stays off exactly as for an anonymous client.
-    pub async fn create_quick(relay_config: &RelayConfig, secret: SecretKey) -> Result<Self> {
-        Self::create_inner(relay_config, Some(secret)).await
-    }
-
-    async fn create_inner(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<Self> {
-        print_relay_status(relay_config);
-
-        // Validate each custom relay individually (fail if any is unreachable);
-        // a no-op for the default relays.
-        probe_custom_relays(relay_config).await?;
-
-        let endpoint = bind_client_endpoint(relay_config, secret.clone()).await?;
-        if let Err(e) = wait_online(&endpoint).await {
-            // Close before propagating: dropping a bound endpoint without
-            // `close()` is fatal under the release profile's panic=abort.
-            endpoint.close().await;
-            return Err(e);
-        }
-        Ok(Self::from_parts(
-            endpoint,
-            client_rebuild_factory(relay_config.clone(), secret),
-        ))
-    }
-
-    /// Wrap an externally bound endpoint with a caller-supplied rebuild recipe
-    /// (tests bind hermetic loopback endpoints and rebuild them the same way).
-    pub fn from_parts(endpoint: Endpoint, factory: EndpointFactory) -> Self {
-        Self {
-            current: Arc::new(std::sync::RwLock::new(endpoint)),
-            factory,
-        }
-    }
-
-    /// A clone of the current endpoint handle. Take it fresh per use: a handle
-    /// held across a [`Self::rebuild`] keeps pointing at the old, closed
-    /// endpoint.
-    pub fn endpoint(&self) -> Endpoint {
-        self.current.read().expect("client endpoint lock").clone()
-    }
-
-    /// The current endpoint id. Changes on rebuild for an ephemeral (keypair)
-    /// client; stable for a quick client (fixed secret).
-    pub fn id(&self) -> EndpointId {
-        self.endpoint().id()
-    }
-
-    /// Swap in a freshly built endpoint and close the old one. On error the
-    /// current endpoint stays in place, so the caller can simply retry with it.
-    pub async fn rebuild(&self) -> Result<()> {
-        let fresh = (self.factory)().await?;
-        let old = {
-            let mut current = self.current.write().expect("client endpoint lock");
-            std::mem::replace(&mut *current, fresh)
-        };
-        // Graceful close on its own task: bounded wait here, but the task is
-        // never cancelled (see [`REBUILD_CLOSE_TIMEOUT`]).
-        let mut close = tokio::task::spawn(async move { old.close().await });
-        if tokio::time::timeout(REBUILD_CLOSE_TIMEOUT, &mut close)
-            .await
-            .is_err()
-        {
-            log::warn!("Old endpoint's close is slow; leaving it to finish in the background");
-        }
-        info!("Endpoint rebuilt; client node ID: {}", self.id());
-        Ok(())
-    }
-
-    /// Close the current endpoint gracefully (session teardown).
-    pub async fn close(&self) {
-        self.endpoint().close().await;
-    }
+/// Create a **quick-mode** client endpoint: same as [`create_client_endpoint`]
+/// but bound to the given (session-ephemeral) `secret`, so the endpoint id the
+/// user entered on the quick server is the id this endpoint presents in the
+/// TLS handshake — that id is the quick client's sole credential. The
+/// identity is still never published (the client only dials), so pkarr
+/// publishing stays off exactly as for an anonymous client, and a rebuild
+/// keeps the same id.
+pub async fn create_quick_client_endpoint(
+    relay_config: &RelayConfig,
+    secret: SecretKey,
+) -> Result<ClientEndpoint> {
+    create_client(relay_config, Some(secret)).await
 }
 
-/// The rebuild recipe for a real client endpoint. Differs from first creation
-/// deliberately:
-///
-/// - **No per-relay probe.** At creation the probe validates the configuration
-///   (fail fast if *any* relay is down); during an outage that strictness
-///   would block recovery through the one relay that still answers.
-/// - **The online wait is tolerated failing.** Even fully offline, a fresh
-///   endpoint's mDNS discovery can still reach a LAN server — and the endpoint
-///   being replaced is known-bad anyway, so the swap can only help.
-fn client_rebuild_factory(relay_config: RelayConfig, secret: Option<SecretKey>) -> EndpointFactory {
-    Arc::new(move || {
+async fn create_client(relay_config: &RelayConfig, secret: Option<SecretKey>) -> Result<ClientEndpoint> {
+    let endpoint = create_endpoint(relay_config, client_builder(relay_config, secret.clone())?).await?;
+    let factory: EndpointFactory = {
         let relay_config = relay_config.clone();
-        let secret = secret.clone();
-        Box::pin(async move {
-            let endpoint = bind_client_endpoint(&relay_config, secret).await?;
-            if let Err(e) = wait_online(&endpoint).await {
-                log::warn!("Rebuilt endpoint: {e:#}; continuing (local discovery may still work)");
-            }
-            Ok(endpoint)
+        Arc::new(move || {
+            let relay_config = relay_config.clone();
+            let secret = secret.clone();
+            Box::pin(async move { rebuild_endpoint(client_builder(&relay_config, secret)?).await })
         })
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    const RELAY: &str = "https://relay.example.com./";
-
-    #[test]
-    fn load_secret_skips_comment_header() {
-        // Generated iroh key files carry `# created:` / `# public key:`
-        // comments above the base64 secret; the loader must skip them (and
-        // blank lines) and read the secret line.
-        let secret = SecretKey::generate();
-        let encoded = BASE64.encode(secret.to_bytes());
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "# created: 2026-08-13T01:02:03Z\n# public key: {}\n\n{}",
-            secret.public(),
-            encoded
-        )
-        .unwrap();
-        let loaded = load_secret(file.path()).unwrap();
-        assert_eq!(loaded.public(), secret.public());
-
-        // A bare secret with no comments still loads.
-        let mut bare = tempfile::NamedTempFile::new().unwrap();
-        writeln!(bare, "{encoded}").unwrap();
-        assert_eq!(load_secret(bare.path()).unwrap().public(), secret.public());
-
-        // Comments only — no secret line — is a hard error.
-        let mut empty = tempfile::NamedTempFile::new().unwrap();
-        writeln!(empty, "# created: 2026-08-13T01:02:03Z").unwrap();
-        let err = load_secret(empty.path()).unwrap_err();
-        assert!(err.to_string().contains("No secret key found"), "{err}");
-    }
-
-    #[test]
-    fn empty_urls_no_token_is_default() {
-        let cfg = RelayConfig::from_urls_with_token(&[], None).unwrap();
-        assert_eq!(cfg, RelayConfig::Default);
-        assert!(!cfg.is_custom());
-        assert_eq!(cfg.relay_auth_token(), None);
-    }
-
-    #[test]
-    fn blank_token_without_urls_is_default() {
-        // A whitespace-only token normalizes to None, so it is not an error.
-        let cfg = RelayConfig::from_urls_with_token(&[], Some("   ".to_string())).unwrap();
-        assert_eq!(cfg, RelayConfig::Default);
-    }
-
-    #[test]
-    fn token_without_custom_urls_is_error() {
-        let err = RelayConfig::from_urls_with_token(&[], Some("secret".to_string()))
-            .expect_err("token without custom relays must be rejected");
-        assert!(
-            err.to_string()
-                .contains("relay_auth_token requires custom relay_urls"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn malformed_custom_url_is_rejected_without_token() {
-        // Custom relays are always parse-validated, independent of any token.
-        let err = RelayConfig::from_urls_with_token(&["not a url".to_string()], None)
-            .expect_err("malformed relay URL must be rejected");
-        assert!(
-            err.to_string().contains("Invalid relay URL"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn custom_urls_without_token() {
-        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], None).unwrap();
-        assert!(cfg.is_custom());
-        assert_eq!(cfg.custom_urls().len(), 1);
-        assert_eq!(cfg.relay_auth_token(), None);
-        assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
-    }
-
-    #[test]
-    fn custom_urls_with_token_trimmed() {
-        let cfg =
-            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  secret\n".to_string()))
-                .unwrap();
-        assert!(cfg.is_custom());
-        assert_eq!(cfg.relay_auth_token(), Some("secret"));
-        assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
-    }
-
-    #[test]
-    fn token_is_trimmed_to_none_with_custom_urls() {
-        // A blank token alongside custom relays is simply no token, not an error.
-        let cfg =
-            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  ".to_string())).unwrap();
-        assert!(cfg.is_custom());
-        assert_eq!(cfg.relay_auth_token(), None);
-    }
-
-    #[test]
-    fn from_urls_carries_no_token() {
-        let cfg = RelayConfig::from_urls(&[RELAY.to_string()]).unwrap();
-        assert_eq!(cfg.relay_auth_token(), None);
-    }
+    };
+    Ok(ClientEndpoint::from_parts(endpoint, factory))
 }

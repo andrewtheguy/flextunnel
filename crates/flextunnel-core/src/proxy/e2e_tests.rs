@@ -38,7 +38,7 @@ use tokio::net::TcpListener;
 /// its public half, clients sign their handshakes with it.
 fn test_client_key() -> &'static crate::auth::ClientKey {
     static KEY: std::sync::OnceLock<crate::auth::ClientKey> = std::sync::OnceLock::new();
-    KEY.get_or_init(crate::auth::ClientKey::generate)
+    KEY.get_or_init(|| crate::auth::ClientKey::generate().unwrap())
 }
 
 /// An authorized-keys set holding only [`test_client_key`]'s public half.
@@ -56,7 +56,7 @@ fn test_auth_payload(ep: &Endpoint) -> signaling::ClientAuthPayload {
     signaling::ClientAuthPayload {
         public_key: test_client_key().public_str(),
         endpoint_id: ep.id().to_string(),
-        signature: test_client_key().sign_endpoint_id(&ep.id()),
+        signature: crate::auth::sign_endpoint_id(test_client_key(), &ep.id()),
     }
 }
 
@@ -1312,11 +1312,11 @@ async fn broken_credentials_on_client_alpn_are_rejected() {
     let cases: Vec<(&str, Option<signaling::ClientAuthPayload>)> = vec![
         ("missing credential", None),
         ("unauthorized key", {
-            let stranger = crate::auth::ClientKey::generate();
+            let stranger = crate::auth::ClientKey::generate().unwrap();
             Some(signaling::ClientAuthPayload {
                 public_key: stranger.public_str(),
                 endpoint_id: client_ep.id().to_string(),
-                signature: stranger.sign_endpoint_id(&client_ep.id()),
+                signature: crate::auth::sign_endpoint_id(&stranger, &client_ep.id()),
             })
         }),
         ("mismatched claimed endpoint id", {
@@ -1326,13 +1326,15 @@ async fn broken_credentials_on_client_alpn_are_rejected() {
             Some(signaling::ClientAuthPayload {
                 public_key: test_client_key().public_str(),
                 endpoint_id: other_id.to_string(),
-                signature: test_client_key().sign_endpoint_id(&other_id),
+                signature: crate::auth::sign_endpoint_id(test_client_key(), &other_id),
             })
         }),
         ("bad signature", {
             let mut auth = test_auth_payload(&client_ep);
-            auth.signature = crate::auth::ClientKey::generate()
-                .sign_endpoint_id(&client_ep.id());
+            auth.signature = crate::auth::sign_endpoint_id(
+                &crate::auth::ClientKey::generate().unwrap(),
+                &client_ep.id(),
+            );
             Some(auth)
         }),
     ];

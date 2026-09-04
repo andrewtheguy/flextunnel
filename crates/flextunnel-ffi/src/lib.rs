@@ -78,7 +78,7 @@ use flextunnel_core::proxy::signaling::Target;
 use flextunnel_core::proxy::{
     ClientAuth, ClientConfig, ForwardManager, ForwardSpec, ForwardState, ProxyClient, TunnelRoutes,
 };
-use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig};
+use flextunnel_core::transport::endpoint::{ClientEndpoint, RelayConfig, create_client_endpoint};
 use flextunnel_core::transport::paths::ConnPathKind;
 
 /// Process-global guard enforcing **at most one** running proxy instance. A
@@ -164,7 +164,13 @@ pub unsafe extern "C" fn flextunnel_generate_client_key(
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    let key = flextunnel_core::auth::ClientKey::generate();
+    let key = match flextunnel_core::auth::ClientKey::generate() {
+        Ok(key) => key,
+        Err(e) => {
+            write_cstr(out_buf, out_len, &format!("{e:#}"));
+            return 0;
+        }
+    };
     let json = serde_json::json!({
         "created": flextunnel_core::flexaccess_keys::rfc3339_utc(std::time::SystemTime::now()),
         "public_key": key.public_str(),
@@ -326,7 +332,7 @@ fn start_inner(json: &str) -> Result<(FlextunnelHandle, String), String> {
     let client_key = flextunnel_core::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let endpoint = runtime
-        .block_on(ClientEndpoint::create(&relay_config))
+        .block_on(create_client_endpoint(&relay_config))
         .map_err(|e| format!("failed to create iroh endpoint: {e}"))?;
 
     let client = Arc::new(ProxyClient::new(ClientConfig {

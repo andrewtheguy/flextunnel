@@ -36,7 +36,7 @@ use flextunnel_core::transport::endpoint::{
     EndpointAllowlists, RelayConfig, create_server_endpoint, secret_to_endpoint_id,
     server_rebuild_factory,
 };
-use flextunnel_core::transport::relay_watchdog::{self, RelayOutage};
+use flextunnel_core::flexaccess_iroh::relay_watchdog::{self, RelayOutage};
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
