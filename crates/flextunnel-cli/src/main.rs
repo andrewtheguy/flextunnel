@@ -36,7 +36,7 @@ use flextunnel_core::transport::endpoint::{
     EndpointAllowlists, RelayConfig, create_server_endpoint, secret_to_endpoint_id,
     server_rebuild_factory,
 };
-use flextunnel_core::transport::relay_watchdog;
+use flextunnel_core::transport::relay_watchdog::{self, RelayOutage};
 use flextunnel_core::{auth, config, secret};
 
 #[derive(Parser)]
@@ -623,6 +623,22 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// short — there is nothing to lose by trying again soon.
 const REBUILD_RETRY: Duration = Duration::from_secs(30);
 
+/// Cap on the watchdog's rebuild deadline once consecutive rebuilt endpoints
+/// keep failing to register on any home relay.
+const REBUILD_DEADLINE_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// The watchdog's rebuild deadline for the next serve pass, given how many
+/// endpoints in a row never registered on a home relay: the usual
+/// [`relay_watchdog::RELAY_OUTAGE_REBUILD`] after an endpoint that did
+/// register, doubling per unregistered endpoint up to [`REBUILD_DEADLINE_MAX`]
+/// (180s, 6m, 12m, 24m, 30m). Rebuilding while the relay itself is down
+/// gains nothing and drops every LAN client, so it is done less and less
+/// often; a relay that comes back resets the escalation.
+fn rebuild_deadline(unregistered_endpoints: u32) -> Duration {
+    let factor = 1u32 << unregistered_endpoints.min(4);
+    (relay_watchdog::RELAY_OUTAGE_REBUILD * factor).min(REBUILD_DEADLINE_MAX)
+}
+
 /// Build the ephemeral `ServerConfig` for `server start --quick`: a full-tunnel
 /// routed set (`routed_domains = ["*"]`, `routed_cidrs = ["0.0.0.0/0", "::/0"]`)
 /// plus a freshly generated in-memory identity, returned *alongside* the config —
@@ -885,8 +901,8 @@ async fn run_server(
     enum Pass {
         /// The server is done (clean or failed): close the endpoint and return.
         Exit(Result<()>),
-        /// The relay watchdog gave up on the endpoint after an outage this long.
-        Rebuild(Duration),
+        /// The relay watchdog gave up on the endpoint.
+        Rebuild(RelayOutage),
     }
 
     // Serve loop. A pass serves on the current endpoint until the server ends,
@@ -897,13 +913,22 @@ async fn run_server(
     // one with the same identity, and serve again. The `ProxyServer` (its
     // registries, blocklist, status state) carries over; the old endpoint's
     // connections and bridge tasks end with it.
+    //
+    // A rebuild only helps when iroh's relay bookkeeping went stale. When the
+    // relay itself is unreachable the fresh endpoint never registers either,
+    // and rebuilding it again every few minutes would keep dropping the LAN
+    // clients that still work. So consecutive endpoints that never saw a home
+    // relay lengthen the watchdog's deadline (`rebuild_deadline`); one that
+    // did register resets the escalation.
     let mut endpoint = endpoint;
+    let mut unregistered_endpoints: u32 = 0;
     let res = loop {
         let pass = {
             let run = Arc::clone(&server).run(&endpoint);
+            let deadline = rebuild_deadline(unregistered_endpoints);
             let outage = async {
                 if relay_watchdog_armed {
-                    relay_watchdog::watch_home_relay(&endpoint).await
+                    relay_watchdog::watch_home_relay(&endpoint, deadline).await
                 } else {
                     std::future::pending().await
                 }
@@ -925,12 +950,21 @@ async fn run_server(
             Pass::Rebuild(outage) => outage,
         };
 
+        unregistered_endpoints = if outage.relay_seen { 0 } else { unregistered_endpoints + 1 };
         log::error!(
             "No connected home relay for {:.0}s despite a network re-check; rebuilding the \
              endpoint from scratch (server id stays {})",
-            outage.as_secs_f64(),
+            outage.duration.as_secs_f64(),
             endpoint.id()
         );
+        if unregistered_endpoints > 0 {
+            log::error!(
+                "{unregistered_endpoints} endpoint(s) in a row never registered on any home \
+                 relay; the relay itself is probably unreachable. If the rebuilt endpoint does \
+                 not register either, the next rebuild waits {}s",
+                rebuild_deadline(unregistered_endpoints).as_secs()
+            );
+        }
         close_endpoint_or_exit(&endpoint).await;
         endpoint = loop {
             match rebuild().await {
@@ -990,6 +1024,17 @@ pub(crate) async fn close_endpoint_or_exit(endpoint: &flextunnel_core::iroh::End
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn rebuild_deadline_doubles_per_unregistered_endpoint_up_to_the_cap() {
+        let base = relay_watchdog::RELAY_OUTAGE_REBUILD;
+        assert_eq!(rebuild_deadline(0), base);
+        assert_eq!(rebuild_deadline(1), base * 2);
+        assert_eq!(rebuild_deadline(2), base * 4);
+        assert_eq!(rebuild_deadline(3), base * 8);
+        assert_eq!(rebuild_deadline(4), REBUILD_DEADLINE_MAX);
+        assert_eq!(rebuild_deadline(50), REBUILD_DEADLINE_MAX);
+    }
 
     fn forwarder(suffix: &str) -> DnsForwarder {
         let mut m = HashMap::new();
