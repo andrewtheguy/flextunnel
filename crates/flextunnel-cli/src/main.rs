@@ -32,9 +32,9 @@ use flextunnel_core::iroh::{EndpointId, SecretKey};
 use flextunnel_core::proxy::{
     BridgeUpstream, BridgeUpstreamConfig, DnsForwarder, ProxyServer, ProxyServerParams, RoutedSet,
 };
+use flextunnel_core::secret::secret_to_endpoint_id;
 use flextunnel_core::transport::endpoint::{
-    EndpointAllowlists, RelayConfig, create_server_endpoint, secret_to_endpoint_id,
-    server_rebuild_factory,
+    EndpointAllowlists, RelayConfig, create_server_endpoint, server_rebuild_factory,
 };
 use flextunnel_core::flexaccess_iroh::relay_watchdog::{self, RelayOutage};
 use flextunnel_core::{auth, config, secret};
