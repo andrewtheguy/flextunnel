@@ -1,10 +1,1 @@
-- strict no backward compatibility
-- run cargo clippy and test after rust code changes
-- to run the CI workflow's clippy + test steps on all three host platforms against the working tree, use `ci/all.sh` — see `docs/local-ci.md`. Worth doing before a release, or after touching platform-gated code (`flextunnel-desktop`'s macOS/Windows backends), which Linux-only checks never compile. If host is Linux, run linux ci on the same host.
-- no cargo fmt
-- no cargo test for flextunnel-desktop for linux because it is not available for linux
-- always use uv to run python scripts if needed
-- clients and server are expected to be trusted and error detections, for example, duplicate id detections are meant for preventing accidental misconfigurations such as running two clients or servers with the same id.
-- the desktop client (`flextunnel-desktop`) normally stores its config in the system keychain; set `FLEXTUNNEL_DEV_CONFIG=1` (or a file path) to store it as plaintext JSON instead, avoiding the macOS keychain access prompt on every unsigned rebuild. Development only — never set it for a real install (the auth secret key is stored unencrypted).
-- after rust changes that affect iOS (flextunnel-core or flextunnel-ffi, including the FFI config schema and `ios/flextunnel.h`), run `./build-ios.sh release` to rebuild `libflextunnel.xcframework` into `dist/ios/` (this script no longer writes into `../flextunnel-ios`). The iOS app links via its own Swift package (`../flextunnel-ios/Packages/Flextunnel`), which **defaults to the pinned GitHub release**, so it won't see local changes unless you build the app with `FLEXTUNNEL_LOCAL_XCFRAMEWORK=1` — that links this fresh `dist/ios` build through a committed symlink (set it for both `xcodegen generate` and `xcodebuild`, then clean-rebuild). This is an **extra step only needed when actively working on the iOS app side by side** (and only possible on macOS with Xcode + the iOS Rust targets); otherwise just skip it.
-- the iroh transport layer shared with tunnel-rs and ezvpn — relays and address lookup, the per-relay startup probe, relay auth tokens, relay self-hosting — is documented once in https://github.com/flexaccessdev/iroh-common-architecture. Do not duplicate it in this repo; update it there and link to it.
+@AGENTS.md
