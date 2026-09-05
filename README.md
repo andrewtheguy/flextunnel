@@ -400,7 +400,7 @@ Client auth keypairs are generated with the standalone
 | `--default-config` | Load `~/.config/flextunnel/server.toml`. |
 | `--secret-file <FILE>` | Server identity key. |
 | `--authorized-keys-file <FILE>` | File of authorized client public keys, one `ed25519-pub:…` per line (optional trailing comment, ssh `authorized_keys` style). |
-| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct relays, since the server rides out a relay outage by moving onto another one). Configuring custom relays disables n0 internet discovery: clients reach this server via relay hints, and outbound bridges attach the same hints when dialing peer servers. mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--quick` | Ephemeral one-off server: prompt for the client's EndpointId (shown by `client start --quick`) and natively allowlist it as the only allowed client — no auth keypair — then mint an in-memory identity, full-tunnel all traffic, print this server's EndpointId, and exit if the client doesn't connect within 5 minutes. Needs an interactive terminal. Takes no single-instance lock; nothing is persisted. Conflicts with `-c`/`--secret-file`/`--authorized-keys-file`. |
 
@@ -413,7 +413,7 @@ Client auth keypairs are generated with the standalone
 | `--socks-port <PORT>` | Optional SOCKS5 listener port, e.g. `1080`. Binds `127.0.0.1` only. Disabled unless set. |
 | `--http-port <PORT>` | Optional HTTP proxy listener port (CONNECT + plain-HTTP forwarding). Binds `127.0.0.1` only. |
 | `--auth-key <SECRET>` / `--auth-key-file <FILE>` | Client auth keypair (one required): the inline `ed25519-sec:…` secret, or the key file from `flexaccess-keys generate-auth-key`. |
-| `--relay-url <URL>` | Custom relay URL(s) for failover (repeatable). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
+| `--relay-url <URL>` | Custom relay URLs (repeatable; at least two distinct relays, the same set as the server). Configuring custom relays disables n0 internet discovery (the server is reached via relay hints); mDNS local discovery stays on. |
 | `--relay-auth-token <TOKEN>` | Shared bearer token sent to every custom relay's WebSocket upgrade. Only valid with `--relay-url` (rejected with the default relays). |
 | `--auto-reconnect` | Force auto-reconnect on (overrides `auto_reconnect = false` in the config). |
 | `--no-auto-reconnect` | Exit on the first disconnection instead of reconnecting. |
@@ -620,11 +620,13 @@ Auto-reconnect is **enabled by default** (`auto_reconnect = true`); pass
   and only then fail with a network-unreachable reply.
 
 A **server** with custom relays watches its own home-relay registration: if it
-has no connected home relay for 60s it re-checks the network, and if that
-has not helped by 180s it rebuilds its endpoint in place (same server id) —
-the in-process equivalent of a restart, so relay-only clients (the iOS app,
-anything off the LAN) are not stranded until someone restarts the service.
-See [`docs/architecture.md`](docs/architecture.md#relay-watchdog-server-custom-relays).
+has no connected home relay for 60s and iroh has not re-homed it on its own,
+it takes the wedged relay out of its relay map and homes on another configured
+relay in place (same server id, same sockets, nothing dropped), so clients off
+the LAN (the iOS app) are not stranded until someone restarts the service. The
+relay is put back once it is connectable again. A custom relay set is
+therefore at least two distinct relays. See
+[`docs/architecture.md`](docs/architecture.md#relay-failover-server-custom-relays).
 
 ## Logging
 

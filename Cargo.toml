@@ -31,7 +31,7 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["to
 # Shared iroh transport layer (relay config + probe, endpoint building and
 # rebuild, home-relay watchdog, endpoint-bound auth transcript). `mdns` turns on
 # local-network discovery on every endpoint (compiled out on iOS by the crate).
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.3", features = ["mdns"] }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.8", features = ["mdns"] }
 iroh = "1.1.0"
 libc = "0.2"
 log = "0.4"
