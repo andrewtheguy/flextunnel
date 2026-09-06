@@ -85,6 +85,12 @@ the server id — systemd isn't involved:
 flextunnel client control -c ~/.config/flextunnel/aws.toml
 ```
 
+The `-c` is not optional here: a bare `flextunnel client control` reads only
+`~/.config/flextunnel/client.toml`, which this layout deliberately does not
+have — each instance's profile is `<instance>.toml`. (Running it bare says so,
+and lists the profile files it found.) `-n <server EndpointId>` attaches
+without any config file.
+
 Detaching (`q`) never affects the tunnel. Port forwards edited there persist
 per server (`~/.config/flextunnel/forwards-<server id prefix>.json`) but
 always load **disabled**; enabling is a per-session action, so a unit restart

@@ -241,11 +241,18 @@ pub fn load_server_config(path: Option<&Path>, default_config: bool) -> Result<O
 pub fn load_client_config(path: Option<&Path>) -> Result<Option<ClientConfig>> {
     match path {
         Some(p) => Ok(Some(load_config(&expand_tilde(p))?)),
-        None => match default_config_path("client.toml") {
+        None => match default_client_config_path() {
             Some(p) if p.exists() => Ok(Some(load_config(&p)?)),
             _ => Ok(None),
         },
     }
+}
+
+/// Where [`load_client_config`] looks when no path is given:
+/// `~/.config/flextunnel/client.toml` (which need not exist). `None` only when
+/// the home directory is unknown. Callers use it to name the file in errors.
+pub fn default_client_config_path() -> Option<PathBuf> {
+    default_config_path("client.toml")
 }
 
 /// Merge CLI-provided values over file values over defaults for the server.
